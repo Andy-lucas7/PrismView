@@ -1,5 +1,14 @@
 #![windows_subsystem = "windows"]
 
+// Camada de plataforma nova (Fase 0); o loop legado abaixo ainda não a usa.
+// Só o modo `--native` (native.rs) usa `platform/` + `core/`.
+// `core/` vive em disco com esse nome (PLANO_NATIVO), mas o módulo se chama `engine_core`:
+// um `mod core` na raiz sombrearia a crate `core` em todos os `use super::*` dos submódulos.
+#[path = "core/mod.rs"]
+mod engine_core;
+mod native;
+#[allow(dead_code)]
+mod platform;
 mod video;
 
 use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont};
@@ -413,7 +422,8 @@ struct IpcEnvelope {
 mod ipc_server {
     use super::*;
 
-    pub fn spawn_named_pipe_server(host_hwnd_raw: isize, tx: Sender<IpcEnvelope>) {
+    /// `wake` acorda o loop do host depois de enfileirar um pedido (cada host usa o seu).
+    pub fn spawn_named_pipe_server(wake: impl Fn() + Send + 'static, tx: Sender<IpcEnvelope>) {
         thread::spawn(move || {
             let pipe_w = to_wide(IPC_PIPE_NAME);
             loop {
@@ -436,7 +446,7 @@ mod ipc_server {
                     let connected = ConnectNamedPipe(pipe, None).is_ok()
                         || GetLastError() == ERROR_PIPE_CONNECTED;
                     if connected {
-                        handle_pipe_client(pipe, host_hwnd_raw, &tx);
+                        handle_pipe_client(pipe, &wake, &tx);
                     }
                     let _ = DisconnectNamedPipe(pipe);
                     let _ = CloseHandle(pipe);
@@ -445,7 +455,7 @@ mod ipc_server {
         });
     }
 
-    unsafe fn handle_pipe_client(pipe: HANDLE, host_hwnd_raw: isize, tx: &Sender<IpcEnvelope>) {
+    unsafe fn handle_pipe_client(pipe: HANDLE, wake: &dyn Fn(), tx: &Sender<IpcEnvelope>) {
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             let mut bytes_read = 0u32;
@@ -458,8 +468,7 @@ mod ipc_server {
                 Ok(req) => {
                     let (reply_tx, reply_rx) = mpsc::channel();
                     if tx.send(IpcEnvelope { req, reply: reply_tx }).is_ok() {
-                        let hwnd = HWND(host_hwnd_raw as *mut _);
-                        let _ = PostMessageW(hwnd, WM_PRISM_WAKE, WPARAM(0), LPARAM(0));
+                        wake();
                         reply_rx
                             .recv_timeout(std::time::Duration::from_secs(3))
                             .unwrap_or(IpcResponse::Error {
@@ -2214,6 +2223,9 @@ impl EngineRuntime {
                 self.update_visibility_and_timers();
                 IpcResponse::Ok
             }
+            IpcRequest::ClearDesktop { .. } => IpcResponse::Error {
+                message: "native_mode_only: inicie o engine com --native".to_string(),
+            },
             IpcRequest::Shutdown => {
                 unsafe {
                     PostQuitMessage(0);
@@ -2444,6 +2456,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 }
 
 fn main() {
+    // Motor nativo (wgpu + platform/): `prismview-engine.exe --native`.
+    if std::env::args().skip(1).any(|a| a == "--native") {
+        std::process::exit(native::run());
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -2455,7 +2471,18 @@ fn main() {
     tray::add_tray_icon(host_hwnd);
 
     let (ipc_tx, ipc_rx) = mpsc::channel();
-    ipc_server::spawn_named_pipe_server(host_hwnd.0 as isize, ipc_tx);
+    let wake_hwnd = host_hwnd.0 as isize;
+    ipc_server::spawn_named_pipe_server(
+        move || unsafe {
+            let _ = PostMessageW(
+                HWND(wake_hwnd as *mut _),
+                WM_PRISM_WAKE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        },
+        ipc_tx,
+    );
 
     RUNTIME.with(|cell| {
         let mut rt = EngineRuntime::new(hinstance, host_hwnd, ipc_rx);

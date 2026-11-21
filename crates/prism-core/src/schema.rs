@@ -1184,6 +1184,11 @@ pub enum IpcRequest {
     SetStudioPreviewMode {
         active: bool,
     },
+    /// Modo nativo (`--native`): pinta o desktop (WorkerW) com `color` RGBA 0..1; `None` = preto.
+    ClearDesktop {
+        #[serde(default)]
+        color: Option<[f32; 4]>,
+    },
     Shutdown,
 }
 

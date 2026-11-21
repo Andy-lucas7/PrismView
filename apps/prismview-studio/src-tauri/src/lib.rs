@@ -1,4 +1,5 @@
 mod desktop_host;
+mod native_engine;
 mod reactive_sensors;
 
 use desktop_host::{GsmtcHandle, LiveMediaDto, MediaCommand, MonitorInfoDto};
@@ -2937,6 +2938,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(shared_state)
+        .manage(native_engine::new_state())
         .setup(move |app| {
             let open_item =
                 MenuItem::with_id(app, "open_studio", "Abrir PrismView", true, None::<&str>)?;
@@ -3187,6 +3189,10 @@ pub fn run() {
             get_live_telemetry,
             media_control,
             set_studio_reactive_sensors,
+            native_engine::native_engine_start,
+            native_engine::native_engine_stop,
+            native_engine::native_engine_clear,
+            native_engine::native_engine_status,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir PrismView");
