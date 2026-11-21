@@ -3,3 +3,5 @@ node_modules/
 dist/
 _backup_antes_sala3d/
 e.restoreContext()
+CLAUDE.md
+.claudeignore
