@@ -1,0 +1,31 @@
+[package]
+name = "prismview-studio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+zip.workspace = true
+windows = { workspace = true, features = [
+    "Media_Control",
+    "Foundation",
+    "Storage_Streams",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]

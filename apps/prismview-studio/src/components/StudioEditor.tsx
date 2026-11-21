@@ -1,0 +1,2078 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence } from "framer-motion";
+import {
+  ArrowDown,
+  ArrowLeft,
+  ArrowUp,
+  Box,
+  Camera,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Download,
+  Eye,
+  EyeOff,
+  Film,
+  Focus,
+  FolderPlus,
+  Gauge,
+  Grid3x3,
+  GripVertical,
+  Image as ImageIcon,
+  Keyboard,
+  Layers,
+  Lock,
+  Magnet,
+  MousePointerClick,
+  Move,
+  Redo2,
+  Rotate3d,
+  Scaling,
+  Shapes,
+  Sparkles,
+  Trash2,
+  Type,
+  Undo2,
+  Ungroup,
+  Unlock,
+  Upload,
+} from "lucide-react";
+import {
+  createLayer,
+  createScene3DObject,
+  DEFAULT_REACTIVE_SIGNAL,
+  defaultScene3D,
+  duplicateScene3DObject,
+  removeScene3DObject,
+  setScene3DObjectTransform,
+  invokeCmd,
+  isTauriRuntime,
+  LayerKind,
+  LiveTelemetry,
+  normalizeScene3DObjects,
+  PickedFileDto,
+  PrismProject,
+  ReactiveSignal,
+  Scene3DInspectInfo,
+  SceneLayer,
+} from "../types/prism";
+import { useHistory } from "../hooks/useHistory";
+import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import {
+  cloneLayerWithFreshIds,
+  collectAllLayerIds,
+  countAllLayers,
+  duplicateLayersByIds,
+  findLayerById,
+  findLayerLocation,
+  groupLayersByIds,
+  isDescendantOf,
+  LayerDropPlacement,
+  moveLayersByDrop,
+  moveLayersZByIds,
+  pruneNestedSelection,
+  removeLayersByIds,
+  ungroupLayerById,
+  updateLayerById,
+  updateLayersByIds,
+} from "../utils/layerTree";
+import { FxExpressionPopover } from "./FxExpressionPopover";
+import { Room3DEditBinding, UnifiedCompositor } from "./UnifiedCompositor";
+import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
+import { POWER_PREFERENCE_LABELS, usePowerState } from "../engine/powerGovernor";
+import {
+  createGroupChildLayer,
+  FxTargetRequest,
+  InspectorMode,
+  StudioInspector,
+} from "./StudioInspector";
+
+interface StudioEditorProps {
+  project: PrismProject;
+  availableWidgets: PrismProject[];
+  telemetry: LiveTelemetry;
+  onChangeProject: (next: PrismProject) => void;
+  onFlushSave?: () => void;
+  onBack: () => void;
+  onApply: () => void;
+  onExport: () => void;
+}
+
+interface TreeDragState {
+  dragIds: string[];
+  label: string;
+  hasNestedSource: boolean;
+  startX: number;
+  startY: number;
+  clientX: number;
+  clientY: number;
+  active: boolean;
+  targetId: string | null;
+  placement: LayerDropPlacement | null;
+}
+
+/** Uniformly scales a layer and all descendants (sizes, fonts, radii, glass px values). x/y are normalized, so they follow the box. */
+function scaleLayerTree(layer: SceneLayer, f: number): SceneLayer {
+  if (!Number.isFinite(f) || f <= 0 || Math.abs(f - 1) < 1e-6) return layer;
+  const r = (n: number) => Number((n * f).toFixed(3));
+  const o = (n: number | undefined) => (n === undefined ? undefined : r(n));
+  const next: SceneLayer = {
+    ...layer,
+    width: r(layer.width),
+    height: r(layer.height),
+    glass: {
+      ...layer.glass,
+      blurPx: r(layer.glass.blurPx),
+      borderRadius: r(layer.glass.borderRadius),
+      shadowBlur: r(layer.glass.shadowBlur),
+      bevelWidth: o(layer.glass.bevelWidth),
+    },
+  };
+  if (layer.text) {
+    next.text = {
+      ...layer.text,
+      fontSize: r(layer.text.fontSize),
+      letterSpacing: r(layer.text.letterSpacing),
+      shadowBlur: r(layer.text.shadowBlur),
+    };
+  }
+  if (layer.image) next.image = { ...layer.image, borderRadius: r(layer.image.borderRadius) };
+  if (layer.video) next.video = { ...layer.video, clipRadius: r(layer.video.clipRadius) };
+  if (layer.progress) next.progress = { ...layer.progress, borderRadius: r(layer.progress.borderRadius) };
+  if (layer.children) next.children = layer.children.map((c) => scaleLayerTree(c, f));
+  return next;
+}
+
+export const StudioEditor: React.FC<StudioEditorProps> = ({
+  project,
+  availableWidgets,
+  telemetry,
+  onChangeProject,
+  onFlushSave,
+  onBack,
+  onApply,
+  onExport,
+}) => {
+  const [selectedIds, setSelectedIds] = useState<string[]>(() =>
+    project.layers.length > 0 ? [project.layers[project.layers.length - 1].id] : []
+  );
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+  const [systemFonts, setSystemFonts] = useState<string[]>([
+    "Outfit",
+    "Inter",
+    "JetBrains Mono",
+    "Segoe UI",
+  ]);
+  const [inspectorMode, setInspectorMode] = useState<InspectorMode>("LAYER");
+  const [widgetPickerOpen, setWidgetPickerOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [fxTarget, setFxTarget] = useState<FxTargetRequest | null>(null);
+  const [statusHint, setStatusHint] = useState<string | null>(null);
+  const [treeDrag, setTreeDrag] = useState<TreeDragState | null>(null);
+  const [scene3dInspectMap, setScene3dInspectMap] = useState<Record<string, Scene3DInspectInfo>>({});
+  const [selected3dObjectId, setSelected3dObjectId] = useState<string | null>(null);
+  const selected3dObjectIdRef = useRef<string | null>(null);
+  selected3dObjectIdRef.current = selected3dObjectId;
+  const [test3dMode, setTest3dMode] = useState(false);
+  const [hoveredMesh3d, setHoveredMesh3d] = useState<string | null>(null);
+  // Sala 3D (navigable room editor): free camera + gizmos on one SCENE_3D layer
+  const [room3dMode, setRoom3dMode] = useState(false);
+  const [gizmoMode, setGizmoMode] = useState<Scene3DGizmoMode>("translate");
+  const [showGrid3d, setShowGrid3d] = useState(true);
+  const [snap3d, setSnap3d] = useState(false);
+  const editorApiRef = useRef<Scene3DEditorApi | null>(null);
+  // Performance HUD (Ctrl+Shift+P)
+  const [hudOpen, setHudOpen] = useState(false);
+  const [hudStats, setHudStats] = useState<Record<string, Scene3DStats>>({});
+  const power = usePowerState(telemetry);
+
+  const hasScene3D = useMemo(() => {
+    const walk = (list: SceneLayer[]): boolean =>
+      list.some((l) => l.kind === "SCENE_3D" || (l.children ? walk(l.children) : false));
+    return walk(project.layers);
+  }, [project.layers]);
+
+  // Live Studio WASAPI Audio & Anonymous Keyboard reactive channel (strictly on demand)
+  const studioReactiveRef = useRef<ReactiveSignal>(DEFAULT_REACTIVE_SIGNAL);
+  const studioReactiveSubsRef = useRef<Set<() => void>>(new Set());
+  const subscribeStudioReactiveTick = useCallback((cb: () => void) => {
+    studioReactiveSubsRef.current.add(cb);
+    return () => {
+      studioReactiveSubsRef.current.delete(cb);
+    };
+  }, []);
+
+  const reactiveNeeds = useMemo(() => {
+    let audio = false;
+    let keyboard = false;
+    const walk = (list: SceneLayer[]) => {
+      for (const l of list) {
+        if (l.hidden) continue;
+        if (l.kind === "SCENE_3D" && l.scene3d?.bindings) {
+          for (const b of l.scene3d.bindings) {
+            if (!b.enabled) continue;
+            if (b.source === "AUDIO_BASS" || b.source === "AUDIO_MID" || b.source === "AUDIO_TREBLE") {
+              audio = true;
+            } else if (b.source === "KEY_PULSE") {
+              keyboard = true;
+            }
+          }
+        }
+        if (l.children?.length) walk(l.children);
+      }
+    };
+    walk(project.layers);
+    return { audio, keyboard };
+  }, [project.layers]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    void invokeCmd("set_studio_reactive_sensors", {
+      audio: reactiveNeeds.audio,
+      keyboard: reactiveNeeds.keyboard,
+    }).catch(() => {});
+  }, [reactiveNeeds.audio, reactiveNeeds.keyboard]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let disposed = false;
+    let unsub: (() => void) | undefined;
+    void import("@tauri-apps/api/event")
+      .then(async ({ listen }) => {
+        const fn = await listen<ReactiveSignal>("prism://reactive", (ev) => {
+          if (disposed) return;
+          studioReactiveRef.current = ev.payload;
+          studioReactiveSubsRef.current.forEach((cb) => cb());
+        });
+        if (disposed) fn();
+        else unsub = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unsub?.();
+      void invokeCmd("set_studio_reactive_sensors", { audio: false, keyboard: false }).catch(
+        () => {}
+      );
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hasScene3D && test3dMode) {
+      setTest3dMode(false);
+      setHoveredMesh3d(null);
+    }
+    if (!hasScene3D && room3dMode) {
+      setRoom3dMode(false);
+    }
+  }, [hasScene3D, test3dMode, room3dMode]);
+
+  const clipboardRef = useRef<SceneLayer[]>([]);
+  const hintTimerRef = useRef<number | null>(null);
+  const treeDragRef = useRef<TreeDragState | null>(null);
+  treeDragRef.current = treeDrag;
+  const suppressRowClickRef = useRef(false);
+
+  const flashHint = useCallback((msg: string) => {
+    setStatusHint(msg);
+    if (hintTimerRef.current !== null) {
+      window.clearTimeout(hintTimerRef.current);
+    }
+    hintTimerRef.current = window.setTimeout(() => {
+      hintTimerRef.current = null;
+      setStatusHint(null);
+    }, 2200);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (hintTimerRef.current !== null) {
+        window.clearTimeout(hintTimerRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    void invokeCmd<string[]>("list_system_fonts")
+      .then((fonts) => {
+        if (Array.isArray(fonts) && fonts.length > 0) {
+          setSystemFonts(fonts);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  const blobUrlsRef = useRef<string[]>([]);
+
+  useEffect(() => {
+    return () => {
+      blobUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      blobUrlsRef.current = [];
+    };
+  }, []);
+
+  /**
+   * Revokes a previous `blob:` URL once a layer's source is replaced (audit 2.6).
+   * Called BEFORE the patch is applied, so the old URL still appears once in the project
+   * for the layer being replaced; if it appears more than once (duplicated layer) it is kept alive.
+   */
+  const releaseBlobUrl = (prev: string | undefined | null) => {
+    if (!prev || !prev.startsWith("blob:")) return;
+    try {
+      if (JSON.stringify(projectRef.current).split(prev).length - 1 > 1) return;
+    } catch {
+      return;
+    }
+    URL.revokeObjectURL(prev);
+    blobUrlsRef.current = blobUrlsRef.current.filter((u) => u !== prev);
+  };
+
+  const prevModelSrcOf = (layer: SceneLayer): string => {
+    if (!layer.scene3d) return "";
+    const objs = normalizeScene3DObjects(layer.scene3d);
+    const obj = objs.find((o) => o.id === selected3dObjectIdRef.current) ?? objs[0];
+    return obj?.modelSrc ?? "";
+  };
+
+  const history = useHistory<PrismProject>({ limit: 50, resetKey: project.id });
+
+  const canvasLogicalW = project.packageType === "WIDGET" ? Math.max(160, project.widget.width) : 1920;
+  const canvasLogicalH = project.packageType === "WIDGET" ? Math.max(100, project.widget.height) : 1080;
+
+  // Keep only IDs that still exist in project.layers (respects explicit empty selection)
+  const validSelectedIds = useMemo(
+    () => selectedIds.filter((id) => findLayerById(project.layers, id) !== null),
+    [project.layers, selectedIds]
+  );
+  const selectedIdSet = useMemo(() => new Set(validSelectedIds), [validSelectedIds]);
+  const primarySelectedId = validSelectedIds[validSelectedIds.length - 1] ?? null;
+
+  const selectedLocation = useMemo(
+    () => (primarySelectedId ? findLayerLocation(project.layers, primarySelectedId) : null),
+    [project.layers, primarySelectedId]
+  );
+  const selectedLayer = selectedLocation?.layer ?? null;
+  const selectedParent = selectedLocation?.parent ?? null;
+  const selectedLayerIdRef = useRef<string | null>(null);
+  selectedLayerIdRef.current = selectedLayer?.id ?? null;
+  const selectedIdsRef = useRef<string[]>([]);
+  selectedIdsRef.current = validSelectedIds;
+  const totalLayersCount = useMemo(() => countAllLayers(project.layers), [project.layers]);
+
+  const applyDiscreteChange = useCallback(
+    (next: PrismProject) => {
+      history.pushSnapshot(projectRef.current);
+      onChangeProject(next);
+    },
+    [history, onChangeProject]
+  );
+
+  const applyCoalescedChange = useCallback(
+    (next: PrismProject) => {
+      history.recordCoalesced(projectRef.current, 350);
+      onChangeProject(next);
+    },
+    [history, onChangeProject]
+  );
+
+  const patchLayerRaw = useCallback(
+    (id: string, fn: (l: SceneLayer) => SceneLayer) => {
+      const cur = projectRef.current;
+      onChangeProject({
+        ...cur,
+        layers: updateLayerById(cur.layers, id, fn),
+      });
+    },
+    [onChangeProject]
+  );
+
+  const patchMultiplePositionsRaw = useCallback(
+    (moves: Array<{ id: string; x: number; y: number }>) => {
+      if (moves.length === 0) return;
+      const map = new Map(moves.map((m) => [m.id, m]));
+      const cur = projectRef.current;
+      onChangeProject({
+        ...cur,
+        layers: updateLayersByIds(cur.layers, new Set(map.keys()), (l) => {
+          const target = map.get(l.id);
+          return target ? { ...l, x: target.x, y: target.y } : l;
+        }),
+      });
+    },
+    [onChangeProject]
+  );
+
+  const patchLayer = useCallback(
+    (
+      id: string,
+      fn: (l: SceneLayer) => SceneLayer,
+      mode: "raw" | "discrete" | "coalesced" = "raw"
+    ) => {
+      if (mode === "discrete") {
+        history.pushSnapshot(projectRef.current);
+      } else if (mode === "coalesced") {
+        history.recordCoalesced(projectRef.current, 350);
+      }
+      patchLayerRaw(id, fn);
+    },
+    [history, patchLayerRaw]
+  );
+
+  const handleSelectLayer = useCallback(
+    (
+      id: string | null,
+      modifiers?: { ctrlKey?: boolean; altKey?: boolean }
+    ) => {
+      if (id === null) {
+        setSelectedIds([]);
+        return;
+      }
+
+      setInspectorMode("LAYER");
+
+      // Alt+Click: remove this item from selection if already selected, or select child directly
+      if (modifiers?.altKey) {
+        setSelectedIds((prev) =>
+          prev.includes(id) ? prev.filter((item) => item !== id) : [id]
+        );
+        return;
+      }
+
+      // Ctrl/Cmd+Click: ONLY modifier for multi-selection (toggle item in/out of selection set)
+      if (modifiers?.ctrlKey) {
+        setSelectedIds((prev) => {
+          const valid = prev.filter((item) => findLayerById(projectRef.current.layers, item) !== null);
+          return valid.includes(id) ? valid.filter((item) => item !== id) : [...valid, id];
+        });
+        return;
+      }
+
+      setSelectedIds([id]);
+    },
+    []
+  );
+
+  const handleUndo = useCallback(() => {
+    const prev = history.undo(projectRef.current);
+    if (prev) {
+      onChangeProject(prev);
+      onFlushSave?.();
+      flashHint("Desfeito (Ctrl+Z)");
+    }
+  }, [flashHint, history, onChangeProject, onFlushSave]);
+
+  const handleRedo = useCallback(() => {
+    const next = history.redo(projectRef.current);
+    if (next) {
+      onChangeProject(next);
+      onFlushSave?.();
+      flashHint("Refeito (Ctrl+Y)");
+    }
+  }, [flashHint, history, onChangeProject, onFlushSave]);
+
+  // ── Sala 3D ─────────────────────────────────────────────────────────────────────
+  const room3dLayer = useMemo<SceneLayer | null>(() => {
+    if (selectedLayer?.kind === "SCENE_3D") return selectedLayer;
+    const walk = (list: SceneLayer[]): SceneLayer | null => {
+      for (const l of list) {
+        if (l.kind === "SCENE_3D" && !l.hidden) return l;
+        if (l.children?.length) {
+          const hit = walk(l.children);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
+    return walk(project.layers);
+  }, [project.layers, selectedLayer]);
+  const room3dLayerIdRef = useRef<string | null>(null);
+  room3dLayerIdRef.current = room3dLayer?.id ?? null;
+
+  const setViewMode = useCallback(
+    (mode: "LAYOUT" | "ROOM" | "TEST") => {
+      setTest3dMode(mode === "TEST");
+      setRoom3dMode(mode === "ROOM");
+      if (mode !== "TEST") setHoveredMesh3d(null);
+      if (mode === "ROOM" && room3dLayerIdRef.current) {
+        const layerId = room3dLayerIdRef.current;
+        setSelectedIds([layerId]);
+        setInspectorMode("LAYER");
+        const layer = findLayerById(projectRef.current.layers, layerId);
+        const objs = layer?.scene3d ? normalizeScene3DObjects(layer.scene3d) : [];
+        if (!objs.some((o) => o.id === selected3dObjectIdRef.current)) {
+          setSelected3dObjectId(objs[0]?.id ?? null);
+        }
+      }
+    },
+    []
+  );
+
+  const commitRoomTransform = useCallback(
+    (
+      layerId: string,
+      objectId: string,
+      position: [number, number, number],
+      rotation: [number, number, number],
+      scale: [number, number, number]
+    ) => {
+      const layer = findLayerById(projectRef.current.layers, layerId);
+      if (!layer?.scene3d) return;
+      const cur = normalizeScene3DObjects(layer.scene3d).find((o) => o.id === objectId);
+      if (!cur) return;
+      const same = (a: number[], b: number[]) => a.every((v, i) => Math.abs(v - (b[i] ?? 0)) < 1e-4);
+      // A click on the gizmo without moving must not create an empty undo step
+      if (same(position, cur.position) && same(rotation, cur.rotation) && same(scale, cur.scale)) {
+        return;
+      }
+      patchLayer(
+        layerId,
+        (l) => ({
+          ...l,
+          scene3d: setScene3DObjectTransform(l.scene3d ?? defaultScene3D(), objectId, position, rotation, scale),
+        }),
+        "discrete"
+      );
+      onFlushSave?.();
+    },
+    [onFlushSave, patchLayer]
+  );
+
+  const saveWallpaperCamera = useCallback(() => {
+    const layerId = room3dLayerIdRef.current;
+    const cap = editorApiRef.current?.captureCameraState();
+    if (!layerId || !cap) return;
+    patchLayer(
+      layerId,
+      (l) => {
+        const s3d = l.scene3d ?? defaultScene3D();
+        return {
+          ...l,
+          scene3d: {
+            ...s3d,
+            camera: {
+              ...s3d.camera,
+              target: cap.target,
+              targetY: cap.target[1],
+              distance: cap.distance,
+              azimuthDeg: cap.azimuthDeg,
+              elevationDeg: cap.elevationDeg,
+              fov: cap.fov,
+            },
+          },
+        };
+      },
+      "discrete"
+    );
+    onFlushSave?.();
+    flashHint("Câmera do Wallpaper salva");
+  }, [flashHint, onFlushSave, patchLayer]);
+
+  const duplicateRoomObject = useCallback(() => {
+    const layerId = room3dLayerIdRef.current;
+    const objId = selected3dObjectIdRef.current;
+    if (!layerId || !objId) return;
+    let createdId: string | null = null;
+    patchLayer(
+      layerId,
+      (l) => {
+        const res = duplicateScene3DObject(l.scene3d ?? defaultScene3D(), objId);
+        createdId = res.newId;
+        return { ...l, scene3d: res.config };
+      },
+      "discrete"
+    );
+    if (createdId) {
+      setSelected3dObjectId(createdId);
+      flashHint("Objeto 3D duplicado (Ctrl+D)");
+    }
+  }, [flashHint, patchLayer]);
+
+  const removeRoomObject = useCallback(() => {
+    const layerId = room3dLayerIdRef.current;
+    const objId = selected3dObjectIdRef.current;
+    if (!layerId || !objId) return;
+    const layer = findLayerById(projectRef.current.layers, layerId);
+    const objs = layer?.scene3d ? normalizeScene3DObjects(layer.scene3d) : [];
+    if (objs.length <= 1) {
+      flashHint("A sala precisa de ao menos 1 objeto");
+      return;
+    }
+    patchLayer(
+      layerId,
+      (l) => ({ ...l, scene3d: removeScene3DObject(l.scene3d ?? defaultScene3D(), objId) }),
+      "discrete"
+    );
+    setSelected3dObjectId(objs.find((o) => o.id !== objId)?.id ?? null);
+    flashHint("Objeto 3D removido");
+  }, [flashHint, patchLayer]);
+
+  // Sala 3D shortcuts (2D shortcuts are suspended while the room is active).
+  // While RMB is held the editor consumes W/A/S/D/Q/E first (capture phase).
+  useEffect(() => {
+    if (!room3dMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
+      const k = e.key.toLowerCase();
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && k === "z" && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      } else if (mod && (k === "y" || (k === "z" && e.shiftKey))) {
+        e.preventDefault();
+        handleRedo();
+      } else if (mod && k === "d") {
+        e.preventDefault();
+        duplicateRoomObject();
+      } else if (mod) {
+        return;
+      } else if (k === "g") {
+        setGizmoMode("translate");
+      } else if (k === "r") {
+        setGizmoMode("rotate");
+      } else if (k === "s") {
+        setGizmoMode("scale");
+      } else if (k === "f") {
+        editorApiRef.current?.focusSelected();
+      } else if (k === "delete" || k === "backspace") {
+        e.preventDefault();
+        removeRoomObject();
+      } else if (k === "escape") {
+        setViewMode("LAYOUT");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [duplicateRoomObject, handleRedo, handleUndo, removeRoomObject, room3dMode, setViewMode]);
+
+  // Performance HUD toggle (works in every Studio mode)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setHudOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const handleScene3DStats = useCallback((layerId: string, st: Scene3DStats) => {
+    setHudStats((prev) => ({ ...prev, [layerId]: st }));
+  }, []);
+
+  const room3dBinding: Room3DEditBinding | null =
+    room3dMode && room3dLayer
+      ? {
+          layerId: room3dLayer.id,
+          selectedObjectId: selected3dObjectId,
+          gizmoMode,
+          showGrid: showGrid3d,
+          snapEnabled: snap3d,
+          onSelectObject: setSelected3dObjectId,
+          onCommitObjectTransform: commitRoomTransform,
+          editorApiRef,
+        }
+      : null;
+
+  const addNewLayer = (kind: LayerKind) => {
+    const created = createLayer(kind);
+    const nextLayers =
+      kind === "VIDEO" || kind === "SCENE_3D"
+        ? [created, ...project.layers]
+        : [...project.layers, created];
+    applyDiscreteChange({ ...project, layers: nextLayers });
+    if (kind === "GROUP") {
+      setExpandedGroups((prev) => ({ ...prev, [created.id]: true }));
+    }
+    setSelectedIds([created.id]);
+    setInspectorMode("LAYER");
+  };
+
+  const addChildToGroup = (groupId: string, kind: LayerKind) => {
+    const child = createGroupChildLayer(kind);
+    patchLayer(
+      groupId,
+      (g) => ({
+        ...g,
+        children: [...(g.children ?? []), child],
+      }),
+      "discrete"
+    );
+    setExpandedGroups((prev) => ({ ...prev, [groupId]: true }));
+    setSelectedIds([child.id]);
+    setInspectorMode("LAYER");
+  };
+
+  const importWidgetAsGroup = (widget: PrismProject) => {
+    const cur = projectRef.current;
+    const clonedChildren = widget.layers.map((c) => cloneLayerWithFreshIds(c, false));
+    const group: SceneLayer = {
+      ...createLayer("GROUP", `Widget · ${widget.title}`),
+      width: widget.widget.width,
+      height: widget.widget.height,
+      children: clonedChildren,
+    };
+    applyDiscreteChange({ ...cur, layers: [...cur.layers, group] });
+    setExpandedGroups((prev) => ({ ...prev, [group.id]: true }));
+    setSelectedIds([group.id]);
+    setInspectorMode("LAYER");
+    setWidgetPickerOpen(false);
+  };
+
+  const importWidgetFromDisk = async () => {
+    try {
+      const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", { kind: "prism" });
+      if (!picked) return;
+      const imported = await invokeCmd<PrismProject>("import_prism_archive", {
+        archivePath: picked.path,
+      });
+      if (imported?.layers) {
+        importWidgetAsGroup(imported);
+      }
+    } catch {
+      /* cancelled or browser mode */
+    }
+  };
+
+  const moveZ = useCallback(
+    (ids: string[], delta: number) => {
+      if (ids.length === 0) return;
+      const cur = projectRef.current;
+      const nextLayers = moveLayersZByIds(cur.layers, new Set(ids), delta);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+      }
+    },
+    [applyDiscreteChange]
+  );
+
+  const duplicateLayers = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const cur = projectRef.current;
+      const { layers, newIds } = duplicateLayersByIds(cur.layers, ids);
+      if (newIds.length > 0) {
+        applyDiscreteChange({ ...cur, layers });
+        setSelectedIds(newIds);
+        flashHint(
+          newIds.length === 1 ? "Camada duplicada (Ctrl+D)" : `${newIds.length} camadas duplicadas`
+        );
+      }
+    },
+    [applyDiscreteChange, flashHint]
+  );
+
+  const deleteLayers = useCallback(
+    (ids: string[]) => {
+      const cur = projectRef.current;
+      const deletable = pruneNestedSelection(cur.layers, ids).filter((id) => {
+        const layer = findLayerById(cur.layers, id);
+        return layer && !layer.locked;
+      });
+      if (deletable.length === 0) return;
+      const firstLoc = findLayerLocation(cur.layers, deletable[0]);
+      const next = removeLayersByIds(cur.layers, new Set(deletable));
+      if (next === cur.layers) return;
+      applyDiscreteChange({ ...cur, layers: next });
+      const remainingSelected = selectedIdsRef.current.filter(
+        (id) => !deletable.includes(id) && findLayerById(next, id) !== null
+      );
+      if (remainingSelected.length > 0) {
+        setSelectedIds(remainingSelected);
+      } else if (firstLoc?.parent && findLayerById(next, firstLoc.parent.id)) {
+        setSelectedIds([firstLoc.parent.id]);
+      } else if (next.length > 0) {
+        setSelectedIds([next[next.length - 1].id]);
+      } else {
+        setSelectedIds([]);
+      }
+      flashHint(
+        deletable.length === 1 ? "Camada removida" : `${deletable.length} camadas removidas`
+      );
+    },
+    [applyDiscreteChange, flashHint]
+  );
+
+  const handleCopy = useCallback(() => {
+    const cur = projectRef.current;
+    const topIds = pruneNestedSelection(cur.layers, selectedIdsRef.current);
+    const copied: SceneLayer[] = [];
+    for (const id of topIds) {
+      const layer = findLayerById(cur.layers, id);
+      if (layer) copied.push(JSON.parse(JSON.stringify(layer)) as SceneLayer);
+    }
+    if (copied.length === 0) return;
+    clipboardRef.current = copied;
+    flashHint(copied.length === 1 ? "1 camada copiada (Ctrl+C)" : `${copied.length} camadas copiadas`);
+  }, [flashHint]);
+
+  const handleCut = useCallback(() => {
+    handleCopy();
+    deleteLayers(selectedIdsRef.current);
+  }, [deleteLayers, handleCopy]);
+
+  const handlePaste = useCallback(() => {
+    const items = clipboardRef.current;
+    if (items.length === 0) return;
+    const cur = projectRef.current;
+    const pasted = items.map((item) => {
+      const fresh = cloneLayerWithFreshIds(item, true);
+      return {
+        ...fresh,
+        x: Math.max(0, Math.min(1, Number((fresh.x + 0.018).toFixed(4)))),
+        y: Math.max(0, Math.min(1, Number((fresh.y + 0.018).toFixed(4)))),
+      };
+    });
+    // If primary selected layer is an expanded GROUP, paste inside it; otherwise paste into same parent or root
+    const primaryLoc = findLayerLocation(cur.layers, selectedLayerIdRef.current);
+    let nextLayers: SceneLayer[];
+    if (primaryLoc?.layer.kind === "GROUP" && expandedGroups[primaryLoc.layer.id]) {
+      nextLayers = updateLayerById(cur.layers, primaryLoc.layer.id, (g) => ({
+        ...g,
+        children: [...(g.children ?? []), ...pasted],
+      }));
+    } else if (primaryLoc?.parent) {
+      nextLayers = updateLayerById(cur.layers, primaryLoc.parent.id, (g) => ({
+        ...g,
+        children: [...(g.children ?? []), ...pasted],
+      }));
+    } else {
+      nextLayers = [...cur.layers, ...pasted];
+    }
+    applyDiscreteChange({ ...cur, layers: nextLayers });
+    const newIds = pasted.map((p) => p.id);
+    setSelectedIds(newIds);
+    flashHint(newIds.length === 1 ? "Camada colada (Ctrl+V)" : `${newIds.length} camadas coladas`);
+  }, [applyDiscreteChange, expandedGroups, flashHint]);
+
+  const handleGroupSelected = useCallback(() => {
+    const cur = projectRef.current;
+    const ids = selectedIdsRef.current;
+    if (ids.length === 0) return;
+    const w = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+    const h = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+    const { layers, groupId } = groupLayersByIds(cur.layers, ids, w, h);
+    if (!groupId) return;
+    applyDiscreteChange({ ...cur, layers });
+    setExpandedGroups((prev) => ({ ...prev, [groupId]: true }));
+    setSelectedIds([groupId]);
+    flashHint("Agrupado (Ctrl+G)");
+  }, [applyDiscreteChange, flashHint]);
+
+  const handleUngroupSelected = useCallback(() => {
+    const cur = projectRef.current;
+    const targetId = selectedLayerIdRef.current;
+    if (!targetId) return;
+    const target = findLayerById(cur.layers, targetId);
+    if (!target || target.kind !== "GROUP") return;
+    const w = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+    const h = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+    const { layers, childIds } = ungroupLayerById(cur.layers, targetId, w, h);
+    applyDiscreteChange({ ...cur, layers });
+    setSelectedIds(childIds);
+    flashHint("Grupo desfeito (Ctrl+Shift+G)");
+  }, [applyDiscreteChange, flashHint]);
+
+  const handleToggleHiddenSelected = useCallback(() => {
+    const cur = projectRef.current;
+    const ids = selectedIdsRef.current;
+    if (ids.length === 0) return;
+    const anyVisible = ids.some((id) => !findLayerById(cur.layers, id)?.hidden);
+    applyDiscreteChange({
+      ...cur,
+      layers: updateLayersByIds(cur.layers, new Set(ids), (l) => ({ ...l, hidden: anyVisible })),
+    });
+    flashHint(anyVisible ? "Camadas ocultadas" : "Camadas exibidas");
+  }, [applyDiscreteChange, flashHint]);
+
+  const handleToggleLockSelected = useCallback(() => {
+    const cur = projectRef.current;
+    const ids = selectedIdsRef.current;
+    if (ids.length === 0) return;
+    const anyUnlocked = ids.some((id) => !findLayerById(cur.layers, id)?.locked);
+    applyDiscreteChange({
+      ...cur,
+      layers: updateLayersByIds(cur.layers, new Set(ids), (l) => ({ ...l, locked: anyUnlocked })),
+    });
+    flashHint(anyUnlocked ? "Camadas travadas (Ctrl+L)" : "Camadas destravadas");
+  }, [applyDiscreteChange, flashHint]);
+
+  const nudgeSelectedLayers = useCallback(
+    (dxPx: number, dyPx: number) => {
+      const cur = projectRef.current;
+      const ids = pruneNestedSelection(cur.layers, selectedIdsRef.current);
+      if (ids.length === 0) return;
+      const moves: Array<{ id: string; x: number; y: number }> = [];
+      for (const id of ids) {
+        const loc = findLayerLocation(cur.layers, id);
+        if (!loc || loc.layer.locked) continue;
+        const refW = loc.parent
+          ? Math.max(loc.parent.width, 1)
+          : cur.packageType === "WIDGET"
+          ? Math.max(cur.widget.width, 1)
+          : 1920;
+        const refH = loc.parent
+          ? Math.max(loc.parent.height, 1)
+          : cur.packageType === "WIDGET"
+          ? Math.max(cur.widget.height, 1)
+          : 1080;
+        const nx = Math.max(0, Math.min(1, Number((loc.layer.x + dxPx / refW).toFixed(4))));
+        const ny = Math.max(0, Math.min(1, Number((loc.layer.y + dyPx / refH).toFixed(4))));
+        moves.push({ id: loc.layer.id, x: nx, y: ny });
+      }
+      if (moves.length === 0) return;
+      history.recordCoalesced(cur, 350);
+      patchMultiplePositionsRaw(moves);
+    },
+    [history, patchMultiplePositionsRaw]
+  );
+
+  useKeyboardShortcuts({
+    enabled: !fxTarget && !room3dMode,
+    onUndo: handleUndo,
+    onRedo: handleRedo,
+    onDelete: () => deleteLayers(selectedIdsRef.current),
+    onNudge: nudgeSelectedLayers,
+    onCopy: handleCopy,
+    onCut: handleCut,
+    onPaste: handlePaste,
+    onDuplicate: () => duplicateLayers(selectedIdsRef.current),
+    onSelectAll: () => {
+      const all = collectAllLayerIds(projectRef.current.layers);
+      setSelectedIds(all);
+      flashHint(`${all.length} camadas selecionadas (Ctrl+A)`);
+    },
+    onDeselect: () => {
+      if (shortcutsOpen) {
+        setShortcutsOpen(false);
+        return;
+      }
+      setSelectedIds([]);
+    },
+    onGroup: handleGroupSelected,
+    onUngroup: handleUngroupSelected,
+    onBringForward: () => moveZ(selectedIdsRef.current, 1),
+    onSendBackward: () => moveZ(selectedIdsRef.current, -1),
+    onToggleHidden: handleToggleHiddenSelected,
+    onToggleLock: handleToggleLockSelected,
+  });
+
+  // Pointer-based Drag-and-Drop for Layers panel (100% immune to Tauri WebView2 native dragDrop hooks)
+  const isTreeDragging = treeDrag !== null;
+  useEffect(() => {
+    if (!isTreeDragging) return;
+
+    const handleMove = (e: PointerEvent) => {
+      const cur = treeDragRef.current;
+      if (!cur) return;
+      const dist = Math.hypot(e.clientX - cur.startX, e.clientY - cur.startY);
+      const active = cur.active || dist >= 5;
+      if (!active) return;
+
+      let targetId: string | null = null;
+      let placement: LayerDropPlacement | null = null;
+
+      const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+      const rootZone = el?.closest<HTMLElement>("[data-layer-root-drop]");
+      if (rootZone) {
+        placement = rootZone.dataset.layerRootDrop === "top" ? "root-top" : "root-bottom";
+      } else {
+        const rowEl = el?.closest<HTMLElement>("[data-layer-drop-id]");
+        if (rowEl) {
+          const candId = rowEl.dataset.layerDropId ?? null;
+          const candIsGroup = rowEl.dataset.layerIsGroup === "1";
+          if (
+            candId &&
+            !cur.dragIds.includes(candId) &&
+            !cur.dragIds.some((dId) => isDescendantOf(projectRef.current.layers, dId, candId))
+          ) {
+            const rect = rowEl.getBoundingClientRect();
+            const ratio = (e.clientY - rect.top) / Math.max(1, rect.height);
+            targetId = candId;
+            if (candIsGroup) {
+              if (ratio < 0.28) placement = "above";
+              else if (ratio > 0.72) placement = "below";
+              else placement = "inside";
+            } else {
+              placement = ratio < 0.5 ? "above" : "below";
+            }
+          }
+        }
+      }
+
+      setTreeDrag({
+        ...cur,
+        active: true,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        targetId,
+        placement,
+      });
+    };
+
+    const handleUp = () => {
+      const cur = treeDragRef.current;
+      setTreeDrag(null);
+      if (!cur || !cur.active) return;
+      suppressRowClickRef.current = true;
+      window.setTimeout(() => {
+        suppressRowClickRef.current = false;
+      }, 60);
+
+      if (!cur.placement) return;
+      const proj = projectRef.current;
+      const w = proj.packageType === "WIDGET" ? Math.max(160, proj.widget.width) : 1920;
+      const h = proj.packageType === "WIDGET" ? Math.max(100, proj.widget.height) : 1080;
+      const nextLayers = moveLayersByDrop(
+        proj.layers,
+        cur.dragIds,
+        cur.targetId,
+        cur.placement,
+        w,
+        h
+      );
+      if (nextLayers !== proj.layers) {
+        applyDiscreteChange({ ...proj, layers: nextLayers });
+        if (cur.placement === "inside" && cur.targetId) {
+          setExpandedGroups((prev) => ({ ...prev, [cur.targetId!]: true }));
+          flashHint("Aninhado dentro do grupo");
+        } else if (cur.placement === "root-top" || cur.placement === "root-bottom") {
+          flashHint("Movido para fora do grupo");
+        } else {
+          flashHint("Ordem das camadas atualizada");
+        }
+      }
+    };
+
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+    window.addEventListener("pointercancel", handleUp);
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+      window.removeEventListener("pointercancel", handleUp);
+    };
+  }, [applyDiscreteChange, flashHint, isTreeDragging]);
+
+  const startRowPointerDrag = (e: React.PointerEvent, layer: SceneLayer) => {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
+    const dragIds = selectedIdSet.has(layer.id) ? [...validSelectedIds] : [layer.id];
+    const hasNestedSource = dragIds.some((id) => Boolean(findLayerLocation(project.layers, id)?.parent));
+    setTreeDrag({
+      dragIds,
+      label: dragIds.length === 1 ? layer.name : `${dragIds.length} camadas`,
+      hasNestedSource,
+      startX: e.clientX,
+      startY: e.clientY,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      active: false,
+      targetId: null,
+      placement: null,
+    });
+  };
+
+  const pickFileForLayer = async (kind: "video" | "image" | "svg" | "font" | "model3d") => {
+    const targetId = selectedLayerIdRef.current;
+    if (!targetId) return;
+
+    if (isTauriRuntime()) {
+      try {
+        const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", { kind });
+        if (!picked) return;
+        const freshLoc = findLayerLocation(projectRef.current.layers, targetId);
+        if (!freshLoc) return;
+        const target = freshLoc.layer;
+        if (kind === "video" && target.video) {
+          releaseBlobUrl(target.video.src);
+          patchLayer(targetId, (l) => (l.video ? { ...l, video: { ...l.video, src: picked.path } } : l), "discrete");
+        } else if (kind === "image" && target.image) {
+          releaseBlobUrl(target.image.src);
+          patchLayer(targetId, (l) => (l.image ? { ...l, image: { ...l.image, src: picked.path } } : l), "discrete");
+        } else if (kind === "svg" && target.svg) {
+          patchLayer(
+            targetId,
+            (l) => (l.svg ? { ...l, svg: { ...l.svg, customSvg: picked.text_content } } : l),
+            "discrete"
+          );
+        } else if (kind === "font" && target.text) {
+          const family = picked.file_name.replace(/\.(ttf|otf|woff2?)$/i, "");
+          patchLayer(
+            targetId,
+            (l) => (l.text ? { ...l, text: { ...l.text, fontFamily: family, fontPath: picked.path } } : l),
+            "discrete"
+          );
+        } else if (kind === "model3d" && target.kind === "SCENE_3D") {
+          const objTargetId = selected3dObjectIdRef.current;
+          const cleanName = picked.file_name.replace(/\.[^.]+$/, "") || "Modelo .glb";
+          releaseBlobUrl(prevModelSrcOf(target));
+          patchLayer(
+            targetId,
+            (l) => {
+              const prev = l.scene3d ?? defaultScene3D(picked.path);
+              const objs = normalizeScene3DObjects(prev);
+              const activeIdx = objs.findIndex((o) => o.id === objTargetId);
+              const idxToReplace = activeIdx >= 0 ? activeIdx : 0;
+              const curObj = objs[idxToReplace];
+              const replacingDefault =
+                objs.length === 1 && (!curObj || curObj.kind === "SHOWCASE" || !curObj.modelSrc);
+              const nextObjs = objs.map((o, i) =>
+                i === idxToReplace
+                  ? {
+                      ...o,
+                      kind: "GLB" as const,
+                      name: o.kind === "SHOWCASE" || !o.modelSrc ? cleanName : o.name,
+                      modelSrc: picked.path,
+                      showcaseVariant: undefined,
+                      autoRotateSpeed:
+                        o.kind === "SHOWCASE" || !o.modelSrc ? 0 : o.autoRotateSpeed,
+                      playback: { ...o.playback, clipName: "" },
+                    }
+                  : o
+              );
+              return {
+                ...l,
+                scene3d: {
+                  ...prev,
+                  modelSrc: nextObjs[0]?.modelSrc ?? "",
+                  objects: nextObjs,
+                  autoRotateSpeed: replacingDefault ? 0 : prev.autoRotateSpeed,
+                  camera: replacingDefault
+                    ? { ...prev.camera, azimuthDeg: 0, elevationDeg: 8 }
+                    : prev.camera,
+                  playback: { ...prev.playback, clipName: "" },
+                },
+              };
+            },
+            "discrete"
+          );
+          flashHint(`Modelo 3D carregado: ${picked.file_name}`);
+        }
+      } catch {
+        /* dialog cancelled or Tauri error */
+      }
+      return;
+    }
+
+    // Browser-only dev fallback (no native path available). `blob:` URLs here are TEMPORARY previews:
+    // they die with the page and are never readable from the wallpaper WebView. The real app
+    // (isTauriRuntime) always goes through the native picker above and stores a real file path.
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept =
+      kind === "video"
+        ? "video/mp4,video/webm"
+        : kind === "image"
+        ? "image/png,image/jpeg,image/webp"
+        : kind === "svg"
+        ? ".svg"
+        : kind === "model3d"
+        ? ".glb,.gltf"
+        : ".ttf,.otf,.woff2";
+    input.onchange = async () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      const freshLoc = findLayerLocation(projectRef.current.layers, targetId);
+      if (!freshLoc) return;
+      const target = freshLoc.layer;
+      if (kind === "video" && target.video) {
+        const url = URL.createObjectURL(f);
+        releaseBlobUrl(target.video.src);
+        blobUrlsRef.current.push(url);
+        patchLayer(targetId, (l) => (l.video ? { ...l, video: { ...l.video, src: url } } : l), "discrete");
+      } else if (kind === "image" && target.image) {
+        const url = URL.createObjectURL(f);
+        releaseBlobUrl(target.image.src);
+        blobUrlsRef.current.push(url);
+        patchLayer(targetId, (l) => (l.image ? { ...l, image: { ...l.image, src: url } } : l), "discrete");
+      } else if (kind === "svg" && target.svg) {
+        const txt = await f.text();
+        patchLayer(targetId, (l) => (l.svg ? { ...l, svg: { ...l.svg, customSvg: txt } } : l), "discrete");
+      } else if (kind === "font" && target.text) {
+        const family = f.name.replace(/\.(ttf|otf|woff2?)$/i, "");
+        const buf = await f.arrayBuffer();
+        const face = new FontFace(family, buf);
+        await face.load();
+        document.fonts.add(face);
+        patchLayer(
+          targetId,
+          (l) => (l.text ? { ...l, text: { ...l.text, fontFamily: family, fontPath: "" } } : l),
+          "discrete"
+        );
+      } else if (kind === "model3d" && target.kind === "SCENE_3D") {
+        const url = URL.createObjectURL(f);
+        releaseBlobUrl(prevModelSrcOf(target));
+        blobUrlsRef.current.push(url);
+        const objTargetId = selected3dObjectIdRef.current;
+        const cleanName = f.name.replace(/\.[^.]+$/, "") || "Modelo .glb";
+        patchLayer(
+          targetId,
+          (l) => {
+            const prev = l.scene3d ?? defaultScene3D(url);
+            const objs = normalizeScene3DObjects(prev);
+            const activeIdx = objs.findIndex((o) => o.id === objTargetId);
+            const idxToReplace = activeIdx >= 0 ? activeIdx : 0;
+            const curObj = objs[idxToReplace];
+            const replacingDefault =
+              objs.length === 1 && (!curObj || curObj.kind === "SHOWCASE" || !curObj.modelSrc);
+            const nextObjs = objs.map((o, i) =>
+              i === idxToReplace
+                ? {
+                    ...o,
+                    kind: "GLB" as const,
+                    name: o.kind === "SHOWCASE" || !o.modelSrc ? cleanName : o.name,
+                    modelSrc: url,
+                    showcaseVariant: undefined,
+                    autoRotateSpeed:
+                      o.kind === "SHOWCASE" || !o.modelSrc ? 0 : o.autoRotateSpeed,
+                    playback: { ...o.playback, clipName: "" },
+                  }
+                : o
+            );
+            return {
+              ...l,
+              scene3d: {
+                ...prev,
+                modelSrc: nextObjs[0]?.modelSrc ?? "",
+                objects: nextObjs,
+                autoRotateSpeed: replacingDefault ? 0 : prev.autoRotateSpeed,
+                camera: replacingDefault
+                  ? { ...prev.camera, azimuthDeg: 0, elevationDeg: 8 }
+                  : prev.camera,
+                playback: { ...prev.playback, clipName: "" },
+              },
+            };
+          },
+          "discrete"
+        );
+      }
+    };
+    input.click();
+  };
+
+  const addGlbObjectTo3DLayer = async () => {
+    const targetId = selectedLayerIdRef.current;
+    if (!targetId) return;
+
+    const appendModel = (srcPath: string, fileName: string) => {
+      const cleanName = fileName.replace(/\.[^.]+$/, "") || "Objeto .glb";
+      let createdId = "";
+      patchLayer(
+        targetId,
+        (l) => {
+          const prev = l.scene3d ?? defaultScene3D();
+          const objs = normalizeScene3DObjects(prev);
+          const nextObj = createScene3DObject("GLB", {
+            name: cleanName,
+            modelSrc: srcPath,
+            position: [Number((objs.length * 1.6).toFixed(2)), 0, 0],
+            autoRotateSpeed: 0,
+          });
+          createdId = nextObj.id;
+          const nextObjs = [...objs, nextObj];
+          return {
+            ...l,
+            scene3d: {
+              ...prev,
+              modelSrc: nextObjs[0]?.modelSrc ?? "",
+              objects: nextObjs,
+            },
+          };
+        },
+        "discrete"
+      );
+      if (createdId) setSelected3dObjectId(createdId);
+      flashHint(`Adicionado à sala 3D: ${cleanName}`);
+    };
+
+    if (isTauriRuntime()) {
+      try {
+        const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", {
+          kind: "model3d",
+        });
+        if (!picked) return;
+        appendModel(picked.path, picked.file_name);
+      } catch {
+        /* dialog cancelled */
+      }
+      return;
+    }
+
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".glb,.gltf";
+    input.onchange = () => {
+      const f = input.files?.[0];
+      if (!f) return;
+      const url = URL.createObjectURL(f);
+      blobUrlsRef.current.push(url);
+      appendModel(url, f.name);
+    };
+    input.click();
+  };
+
+  const toggleGroupExpanded = (groupId: string) => {
+    setExpandedGroups((prev) => ({ ...prev, [groupId]: !prev[groupId] }));
+  };
+
+  const renderLayerTreeRow = (
+    layer: SceneLayer,
+    realIdx: number,
+    depth: number
+  ): React.ReactNode => {
+    const isSelected = selectedIdSet.has(layer.id);
+    const isPrimary = primarySelectedId === layer.id;
+    const isGroup = layer.kind === "GROUP";
+    const children = layer.children ?? [];
+    const expanded = Boolean(expandedGroups[layer.id]);
+
+    const isBeingDragged = Boolean(treeDrag?.active && treeDrag.dragIds.includes(layer.id));
+    const isDropTarget = Boolean(treeDrag?.active && treeDrag.targetId === layer.id);
+    const dropAbove = isDropTarget && treeDrag?.placement === "above";
+    const dropBelow = isDropTarget && treeDrag?.placement === "below";
+    const dropInside = isDropTarget && treeDrag?.placement === "inside";
+
+    return (
+      <div key={layer.id} className="space-y-1">
+        <div
+          data-layer-drop-id={layer.id}
+          data-layer-is-group={isGroup ? "1" : "0"}
+          onPointerDown={(e) => startRowPointerDrag(e, layer)}
+          onClick={(e) => {
+            if (suppressRowClickRef.current) return;
+            handleSelectLayer(layer.id, {
+              ctrlKey: e.ctrlKey || e.metaKey,
+              altKey: e.altKey,
+            });
+          }}
+          style={{ marginLeft: depth > 0 ? `${depth * 14}px` : undefined }}
+          className={`group relative rounded-2xl px-2 py-2 flex items-center justify-between gap-1 cursor-grab active:cursor-grabbing border transition-colors select-none ${
+            isBeingDragged
+              ? "opacity-40 border-white/25 bg-white/5"
+              : dropInside
+              ? "bg-white/20 border-white text-white shadow-[0_0_0_1px_rgba(255,255,255,0.65)]"
+              : isPrimary
+              ? "bg-white/15 border-white/75 text-white shadow-[0_0_14px_rgba(255,255,255,0.16)]"
+              : isSelected
+              ? "bg-white/10 border-white/55 text-white shadow-[0_0_10px_rgba(255,255,255,0.12)]"
+              : "bg-white/[0.03] border-transparent text-[#A1A1AA] hover:bg-white/[0.07] hover:text-white"
+          }`}
+        >
+          {/* Visual Drop Indicators (Above / Below) */}
+          {dropAbove && (
+            <div className="pointer-events-none absolute -top-1 left-2 right-2 h-0.5 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.85)]" />
+          )}
+          {dropBelow && (
+            <div className="pointer-events-none absolute -bottom-1 left-2 right-2 h-0.5 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.85)]" />
+          )}
+
+          <div className="flex items-center gap-1 min-w-0">
+            <GripVertical className="w-3 h-3 text-white/25 shrink-0" />
+            {isGroup ? (
+              <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleGroupExpanded(layer.id);
+                }}
+                title={expanded ? "Recolher grupo" : "Expandir subcamadas"}
+                className="p-0.5 rounded hover:bg-white/10 text-[#A1A1AA] hover:text-white shrink-0"
+              >
+                {expanded ? (
+                  <ChevronDown className="w-3.5 h-3.5" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5" />
+                )}
+              </button>
+            ) : null}
+            <div className="min-w-0">
+              <span className="block text-xs font-medium truncate">{layer.name}</span>
+              <span className="block text-[10px] text-[#71717A]">
+                {dropInside
+                  ? "Soltar dentro do grupo"
+                  : `Z${realIdx} · ${layer.kind}${isGroup ? ` (${children.length})` : ""}`}
+              </span>
+            </div>
+          </div>
+
+          <div
+            className={`flex items-center gap-0.5 shrink-0 transition-opacity ${
+              isSelected || layer.hidden || layer.locked
+                ? "opacity-95"
+                : "opacity-45 group-hover:opacity-100"
+            }`}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => moveZ([layer.id], 1)}
+              title="Trazer para frente (Ctrl+])"
+              className="p-1 hover:text-white"
+            >
+              <ArrowUp className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() => moveZ([layer.id], -1)}
+              title="Enviar para trás (Ctrl+[)"
+              className="p-1 hover:text-white"
+            >
+              <ArrowDown className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() =>
+                patchLayer(layer.id, (l) => ({ ...l, hidden: !l.hidden }), "discrete")
+              }
+              title="Mostrar / Ocultar (Ctrl+Shift+H)"
+              className="p-1 hover:text-white"
+            >
+              {layer.hidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+            </button>
+            <button
+              onClick={() =>
+                patchLayer(layer.id, (l) => ({ ...l, locked: !l.locked }), "discrete")
+              }
+              title="Travar / Destravar (Ctrl+L)"
+              className="p-1 hover:text-white"
+            >
+              {layer.locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+            </button>
+            <button
+              onClick={() => duplicateLayers([layer.id])}
+              title="Duplicar (Ctrl+D)"
+              className="p-1 hover:text-white"
+            >
+              <Copy className="w-3 h-3" />
+            </button>
+            <button
+              onClick={() => deleteLayers([layer.id])}
+              title="Excluir (Del)"
+              className="p-1 hover:text-white"
+            >
+              <Trash2 className="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+        {isGroup && expanded && children.length > 0 && (
+          <div className="space-y-1 border-l border-white/15 ml-2.5 pl-1">
+            {[...children]
+              .reverse()
+              .map((child, childRevIdx) =>
+                renderLayerTreeRow(child, children.length - 1 - childRevIdx, depth + 1)
+              )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="relative w-full h-full bg-[#060608] overflow-hidden">
+      {/* Top Floating Bar (Stationary during drag) */}
+      <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
+        <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
+          <button
+            onClick={onBack}
+            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition"
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </button>
+          <input
+            value={project.title}
+            onChange={(e) => applyCoalescedChange({ ...project, title: e.target.value })}
+            className="bg-transparent text-xs font-semibold text-white outline-none px-1.5 w-48"
+          />
+          <span className="px-2.5 py-1 rounded-full bg-white/10 text-[10px] uppercase tracking-wider text-[#A1A1AA]">
+            {project.packageType === "WIDGET" ? ".widget.prism" : ".prism"}
+          </span>
+          <span className="h-4 w-px bg-white/15 mx-0.5" />
+          <button
+            type="button"
+            onClick={handleUndo}
+            disabled={!history.canUndo}
+            title="Desfazer (Ctrl+Z)"
+            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
+              history.canUndo
+                ? "text-white hover:bg-white/15"
+                : "text-[#52525B] cursor-not-allowed"
+            }`}
+          >
+            <Undo2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={handleRedo}
+            disabled={!history.canRedo}
+            title="Refazer (Ctrl+Y)"
+            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
+              history.canRedo
+                ? "text-white hover:bg-white/15"
+                : "text-[#52525B] cursor-not-allowed"
+            }`}
+          >
+            <Redo2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setShortcutsOpen((v) => !v)}
+            title="Atalhos do Estúdio"
+            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
+              shortcutsOpen
+                ? "bg-white text-black"
+                : "text-[#A1A1AA] hover:text-white hover:bg-white/15"
+            }`}
+          >
+            <Keyboard className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {statusHint && (
+            <span className="frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-white/90">
+              {statusHint}
+            </span>
+          )}
+          {power.state !== "NORMAL" && (
+            <span
+              title={`Energia: ${POWER_PREFERENCE_LABELS[power.state]} (preferência: ${POWER_PREFERENCE_LABELS[power.preference]})`}
+              className="frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-amber-100/90 border border-amber-300/25"
+            >
+              Energia · {POWER_PREFERENCE_LABELS[power.state]}
+            </span>
+          )}
+          {hasScene3D && (
+            <div className="frosted-chrome rounded-full p-1 flex items-center gap-0.5">
+              {(
+                [
+                  { id: "LAYOUT" as const, label: "Layout 2D", icon: Layers, title: "Editar camadas 2D" },
+                  {
+                    id: "ROOM" as const,
+                    label: "Sala 3D",
+                    icon: Box,
+                    title: "Navegar pela sala, mover objetos com gizmos e salvar a câmera do wallpaper",
+                  },
+                  {
+                    id: "TEST" as const,
+                    label: "Testar 3D",
+                    icon: MousePointerClick,
+                    title: "Testar órbita, olhar do modelo, hover e clique 3D direto no preview",
+                  },
+                ]
+              ).map((m) => {
+                const active =
+                  m.id === "ROOM" ? room3dMode : m.id === "TEST" ? test3dMode : !room3dMode && !test3dMode;
+                const Icon = m.icon;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setViewMode(m.id)}
+                    title={m.title}
+                    className={`rounded-full px-3 py-1.5 text-xs transition flex items-center gap-1.5 ${
+                      active ? "prism-pill-active" : "text-[#A1A1AA] hover:text-white"
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          <button
+            onClick={onExport}
+            className="frosted-chrome rounded-full px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5"
+          >
+            <Download className="w-3.5 h-3.5" />
+            Exportar
+          </button>
+          <button onClick={onApply} className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2">
+            <Sparkles className="w-3.5 h-3.5" />
+            {project.packageType === "WIDGET" ? "Fixar Widget na Tela" : "Aplicar no Desktop"}
+          </button>
+        </div>
+      </header>
+
+      {/* Shortcuts Cheat-Sheet Popover */}
+      {shortcutsOpen && (
+        <div className="fixed top-20 left-[304px] z-50 w-80 frosted-chrome frosted-chrome-panel p-4 space-y-2.5 text-xs shadow-2xl">
+          <div className="flex items-center justify-between border-b border-white/10 pb-2">
+            <span className="font-semibold text-white">Atalhos & Seleção do Estúdio</span>
+            <button
+              type="button"
+              onClick={() => setShortcutsOpen(false)}
+              className="text-[11px] text-[#A1A1AA] hover:text-white"
+            >
+              Esc
+            </button>
+          </div>
+          <div className="space-y-1.5 text-[11px] text-[#A1A1AA]">
+            {[
+              ["Ctrl+C / Ctrl+V", "Copiar / Colar camadas"],
+              ["Ctrl+X / Ctrl+D", "Recortar / Duplicar"],
+              ["Ctrl+G / Ctrl+Shift+G", "Agrupar / Desagrupar"],
+              ["Ctrl+] / Ctrl+[", "Trazer à frente / Enviar atrás"],
+              ["Ctrl+A / Esc", "Selecionar tudo / Desselecionar"],
+              ["Ctrl+Clique", "Selecionar / desmarcar vários itens"],
+              ["Alt+Clique", "Desmarcar item / entrar em grupo"],
+              ["Alt+Arrastar", "Mover livre (sem snap magnético)"],
+              ["Setas / Shift+Setas", "Mover 1px / 10px"],
+              ["Ctrl+Shift+H / Ctrl+L", "Ocultar / Travar selecionadas"],
+              ["Arrastar na lista", "Reordenar Z ou soltar dentro de Grupo"],
+              ["Sala 3D · Botão dir. + WASD/QE", "Voar pela sala (Shift acelera)"],
+              ["Sala 3D · Meio / Alt+Arrastar", "Pan · Scroll: aproximar"],
+              ["Sala 3D · G / R / S / F", "Mover / Girar / Escalar / Focar"],
+              ["Sala 3D · Ctrl+D / Delete", "Duplicar / Remover objeto"],
+              ["Ctrl+Shift+P", "HUD de desempenho"],
+            ].map(([k, desc]) => (
+              <div key={k} className="flex items-center justify-between gap-2">
+                <span className="font-mono-fx text-[10px] text-white/90 bg-white/10 px-1.5 py-0.5 rounded">
+                  {k}
+                </span>
+                <span className="text-right truncate">{desc}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* LEFT PANEL: Layer Tree (Stationary during drag) */}
+      <aside className="fixed top-20 left-4 bottom-4 z-30 w-[276px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
+        <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#A1A1AA] flex items-center gap-1.5">
+            <Layers className="w-3.5 h-3.5 text-white" />
+            Camadas ({totalLayersCount})
+          </span>
+          <span className="text-[10px] font-mono-fx text-[#71717A]">Arraste p/ Z / Grupo</span>
+        </div>
+
+        {/* Add Layer Actions */}
+        <div className="p-3 border-b border-white/10 grid grid-cols-2 gap-1.5">
+          <button
+            onClick={() => addNewLayer("VIDEO")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Film className="w-3.5 h-3.5" /> Vídeo
+          </button>
+          <button
+            onClick={() => addNewLayer("IMAGE")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <ImageIcon className="w-3.5 h-3.5" /> Imagem PNG
+          </button>
+          <button
+            onClick={() => addNewLayer("SVG")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Shapes className="w-3.5 h-3.5" /> SVG / Ícone
+          </button>
+          <button
+            onClick={() => addNewLayer("TEXT")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Type className="w-3.5 h-3.5" /> Texto / ƒx
+          </button>
+          <button
+            onClick={() => addNewLayer("GLASS")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Sparkles className="w-3.5 h-3.5" /> Vidro
+          </button>
+          <button
+            onClick={() => addNewLayer("PROGRESS")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Layers className="w-3.5 h-3.5" /> Barra
+          </button>
+          <button
+            onClick={() => addNewLayer("SCENE_3D")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <Box className="w-3.5 h-3.5" /> Cena 3D
+          </button>
+          <button
+            onClick={() => addNewLayer("GROUP")}
+            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
+          >
+            <FolderPlus className="w-3.5 h-3.5" /> Grupo
+          </button>
+          {project.packageType === "WALLPAPER" && (
+            <button
+              onClick={() => setWidgetPickerOpen((v) => !v)}
+              className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center justify-center gap-1.5 col-span-2"
+            >
+              <Box className="w-3.5 h-3.5" />
+              Importar Widget (.widget.prism)
+            </button>
+          )}
+        </div>
+
+        {/* Multi-Selection / Group Quick Action Bar */}
+        {(validSelectedIds.length > 1 || selectedLayer?.kind === "GROUP") && (
+          <div className="px-3 py-2 border-b border-white/10 bg-white/[0.04] flex items-center justify-between gap-1.5">
+            <span className="text-[10px] font-medium text-white/85 truncate">
+              {validSelectedIds.length > 1
+                ? `${validSelectedIds.length} selecionadas`
+                : "Grupo selecionado"}
+            </span>
+            <div className="flex items-center gap-1 shrink-0">
+              {validSelectedIds.length > 1 && (
+                <button
+                  type="button"
+                  onClick={handleGroupSelected}
+                  title="Agrupar selecionadas (Ctrl+G)"
+                  className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
+                >
+                  <FolderPlus className="w-3 h-3" /> Agrupar
+                </button>
+              )}
+              {selectedLayer?.kind === "GROUP" && (
+                <button
+                  type="button"
+                  onClick={handleUngroupSelected}
+                  title="Desagrupar (Ctrl+Shift+G)"
+                  className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
+                >
+                  <Ungroup className="w-3 h-3" /> Desagrupar
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Widget Importer Drawer inside Left Tree */}
+        {widgetPickerOpen && (
+          <div className="p-3 border-b border-white/10 bg-black/50 space-y-2">
+            <span className="block text-[10px] uppercase tracking-wider text-[#A1A1AA]">
+              Inserir como Grupo Editável
+            </span>
+            {availableWidgets.map((w) => (
+              <button
+                key={w.id}
+                onClick={() => importWidgetAsGroup(w)}
+                className="w-full text-left px-3 py-2 rounded-xl bg-white/5 hover:bg-white hover:text-black text-[11px] transition truncate"
+              >
+                + {w.title} ({w.layers.length} camadas)
+              </button>
+            ))}
+            <button
+              onClick={importWidgetFromDisk}
+              className="w-full px-3 py-1.5 rounded-xl border border-white/15 text-[11px] text-[#A1A1AA] hover:text-white flex items-center justify-center gap-1.5"
+            >
+              <Upload className="w-3 h-3" /> Escolher .widget.prism do Disco
+            </button>
+          </div>
+        )}
+
+        {/* Ordered Stack (Front-most on top) */}
+        <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
+          {treeDrag?.active && treeDrag.hasNestedSource && (
+            <div
+              data-layer-root-drop="top"
+              className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
+                treeDrag.placement === "root-top"
+                  ? "border-white bg-white/20 text-white"
+                  : "border-white/25 text-[#A1A1AA]"
+              }`}
+            >
+              Soltar na Raiz (Topo / Frente)
+            </div>
+          )}
+
+          {[...project.layers]
+            .reverse()
+            .map((layer, revIdx) =>
+              renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
+            )}
+
+          {treeDrag?.active && treeDrag.hasNestedSource && (
+            <div
+              data-layer-root-drop="bottom"
+              className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
+                treeDrag.placement === "root-bottom"
+                  ? "border-white bg-white/20 text-white"
+                  : "border-white/25 text-[#A1A1AA]"
+              }`}
+            >
+              Soltar na Raiz (Fundo / Atrás)
+            </div>
+          )}
+        </div>
+      </aside>
+
+      {/* Floating Drag Ghost Pill for Layer Tree Reordering */}
+      {treeDrag?.active && (
+        <div
+          style={{
+            left: `${treeDrag.clientX + 14}px`,
+            top: `${treeDrag.clientY + 12}px`,
+          }}
+          className="pointer-events-none fixed z-[90] frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-white border border-white/35 shadow-2xl flex items-center gap-1.5"
+        >
+          <Layers className="w-3 h-3" />
+          <span>{treeDrag.label}</span>
+        </div>
+      )}
+
+      {/* CENTER: 1:1 Unified GPU Compositor Canvas (Fixed frame — never reflows on drag) */}
+      <div className="absolute inset-0 flex items-center justify-center pt-20 pb-6 pl-[304px] pr-[380px]">
+        <div
+          className={`relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] ${
+            project.packageType === "WIDGET" ? "max-w-full" : "w-full max-w-5xl aspect-video"
+          }`}
+          style={
+            project.packageType === "WIDGET"
+              ? {
+                  width: `${Math.min(680, canvasLogicalW)}px`,
+                  aspectRatio: `${canvasLogicalW} / ${canvasLogicalH}`,
+                  backgroundColor: "#0e1015",
+                  backgroundImage:
+                    "radial-gradient(circle at 28% 24%, rgba(255,255,255,0.16) 0%, transparent 45%), radial-gradient(circle at 76% 78%, rgba(255,255,255,0.10) 0%, transparent 48%), linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px)",
+                  backgroundSize: "100% 100%, 100% 100%, 24px 24px, 24px 24px",
+                }
+              : undefined
+          }
+        >
+          <UnifiedCompositor
+            project={project}
+            telemetry={telemetry}
+            interactive
+            test3dMode={test3dMode}
+            reactiveSignalRef={studioReactiveRef}
+            subscribeReactiveTick={subscribeStudioReactiveTick}
+            selectedLayerId={selectedLayer?.id ?? null}
+            selectedLayerIds={validSelectedIds}
+            onSelectLayer={(id, modifiers) => handleSelectLayer(id, modifiers)}
+            onMoveLayer={(id, x, y) => patchLayerRaw(id, (l) => ({ ...l, x, y }))}
+            onMoveLayers={patchMultiplePositionsRaw}
+            onResizeLayer={(id, w, h, isText) =>
+              patchLayerRaw(id, (l) =>
+                isText && l.text
+                  ? { ...l, text: { ...l.text, fontSize: Math.max(10, Math.min(340, w)) } }
+                  : l.kind === "GROUP" && l.width > 0
+                    ? scaleLayerTree(l, w / l.width)
+                    : { ...l, width: w, height: h }
+              )
+            }
+            onDragStateChange={(dragging) => {
+              if (dragging) {
+                history.beginTransaction(projectRef.current);
+              } else {
+                history.commitTransaction(projectRef.current);
+                onFlushSave?.();
+              }
+            }}
+            onInspectScene3D={(layerId, info) => {
+              setScene3dInspectMap((prev) => ({ ...prev, [layerId]: info }));
+            }}
+            onHoverMesh3D={setHoveredMesh3d}
+            powerState={power.state}
+            room3d={room3dBinding}
+            onScene3DStats={hudOpen ? handleScene3DStats : undefined}
+          />
+          {room3dMode && room3dLayer && (
+            <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-40 frosted-chrome rounded-full px-1.5 py-1 flex items-center gap-0.5 text-[11px] text-white border border-white/20 shadow-2xl">
+              {(
+                [
+                  { mode: "translate" as const, label: "Mover", key: "G", icon: Move },
+                  { mode: "rotate" as const, label: "Girar", key: "R", icon: Rotate3d },
+                  { mode: "scale" as const, label: "Escalar", key: "S", icon: Scaling },
+                ]
+              ).map((g) => {
+                const Icon = g.icon;
+                return (
+                  <button
+                    key={g.mode}
+                    type="button"
+                    onClick={() => setGizmoMode(g.mode)}
+                    title={`${g.label} (${g.key})`}
+                    className={`rounded-full px-2.5 py-1 flex items-center gap-1 transition ${
+                      gizmoMode === g.mode ? "bg-white text-black" : "text-[#D4D4D8] hover:bg-white/15"
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {g.label}
+                  </button>
+                );
+              })}
+              <span className="h-4 w-px bg-white/15 mx-1" />
+              <button
+                type="button"
+                onClick={() => setShowGrid3d((v) => !v)}
+                title="Mostrar / ocultar grade"
+                className={`rounded-full p-1.5 transition ${showGrid3d ? "bg-white/20" : "hover:bg-white/15"}`}
+              >
+                <Grid3x3 className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setSnap3d((v) => !v)}
+                title="Snap (0,25 · 15° · 0,1×)"
+                className={`rounded-full p-1.5 transition ${snap3d ? "bg-white/20" : "hover:bg-white/15"}`}
+              >
+                <Magnet className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => editorApiRef.current?.focusSelected()}
+                title="Focar objeto selecionado (F)"
+                className="rounded-full p-1.5 hover:bg-white/15 transition"
+              >
+                <Focus className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void addGlbObjectTo3DLayer()}
+                title="Adicionar modelo .glb à sala"
+                className="rounded-full px-2.5 py-1 hover:bg-white/15 transition"
+              >
+                + .glb
+              </button>
+              <span className="h-4 w-px bg-white/15 mx-1" />
+              <button
+                type="button"
+                onClick={saveWallpaperCamera}
+                title="Grava o enquadramento atual como câmera do wallpaper no Desktop"
+                className="rounded-full px-3 py-1 bg-white text-black flex items-center gap-1.5 font-medium"
+              >
+                <Camera className="w-3.5 h-3.5" />
+                Salvar Câmera do Wallpaper
+              </button>
+            </div>
+          )}
+          {room3dMode && (
+            <div className="pointer-events-none absolute top-3 left-3 z-40 frosted-chrome rounded-xl px-2.5 py-1.5 text-[10px] text-[#D4D4D8] leading-relaxed">
+              Botão dir. + WASD/QE: voar · Meio/Alt: pan · Scroll: zoom · Clique: selecionar
+            </div>
+          )}
+          {hudOpen && (
+            <div className="pointer-events-none absolute top-3 right-3 z-40 frosted-chrome rounded-xl px-3 py-2 text-[10px] font-mono-fx text-white/90 space-y-0.5 min-w-[180px]">
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                <Gauge className="w-3.5 h-3.5" /> HUD de desempenho
+              </div>
+              <div>Energia: {POWER_PREFERENCE_LABELS[power.state]}</div>
+              {Object.keys(hudStats).length === 0 ? (
+                <div className="text-[#A1A1AA]">Sem camadas 3D ativas</div>
+              ) : (
+                Object.entries(hudStats).map(([id, st]) => (
+                  <div key={id} className="pt-1 border-t border-white/10">
+                    <div>
+                      {st.sleeping ? "Em repouso (0 FPS)" : `${st.fps} FPS`} · {st.frameMs} ms CPU
+                    </div>
+                    <div>
+                      {st.drawCalls} draws · {(st.triangles / 1000).toFixed(1)}k tris
+                    </div>
+                    <div>
+                      {st.geometries} geo · {st.textures} tex · DPR {st.pixelRatio}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+          {test3dMode && (
+            <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 z-40 frosted-chrome rounded-full px-3.5 py-1.5 text-[11px] text-white flex items-center gap-2 border border-white/25">
+              <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+              <span>Teste 3D · Mova e clique no modelo</span>
+              {hoveredMesh3d && (
+                <span className="font-mono-fx text-[10px] px-2 py-0.5 rounded-full bg-white/15 text-white">
+                  Malha: {hoveredMesh3d}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* RIGHT PANEL: Clean Tabbed Minimalist Inspector */}
+      <StudioInspector
+        project={project}
+        mode={inspectorMode}
+        onModeChange={setInspectorMode}
+        selectedLayer={selectedLayer}
+        selectedParent={selectedParent}
+        scene3dInfo={selectedLayer ? scene3dInspectMap[selectedLayer.id] ?? null : null}
+        selected3dObjectId={selected3dObjectId}
+        onSelect3dObjectId={setSelected3dObjectId}
+        onAdd3dGlbObject={() => void addGlbObjectTo3DLayer()}
+        test3dMode={test3dMode}
+        onToggleTest3d={() => setViewMode(test3dMode ? "LAYOUT" : "TEST")}
+        systemFonts={systemFonts}
+        onSelectLayer={(id) => handleSelectLayer(id)}
+        onPatchLayer={patchLayer}
+        onAddChildToGroup={addChildToGroup}
+        onApplyDiscreteProject={applyDiscreteChange}
+        onApplyCoalescedProject={applyCoalescedChange}
+        onChangeProjectRaw={onChangeProject}
+        onPickFile={pickFileForLayer}
+        onPickDynamicTexImage={async (objectId: string, texId: string) => {
+          const targetId = selectedLayerIdRef.current;
+          if (!targetId) return;
+          if (isTauriRuntime()) {
+            try {
+              const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", {
+                kind: "image",
+              });
+              if (!picked) return;
+              patchLayer(
+                targetId,
+                (l) => {
+                  const s3d = l.scene3d ?? defaultScene3D();
+                  const objs = normalizeScene3DObjects(s3d);
+                  const nextObjs = objs.map((obj) =>
+                    obj.id === objectId
+                      ? {
+                          ...obj,
+                          dynamicTextures: (obj.dynamicTextures ?? []).map((dt) =>
+                            dt.id === texId ? { ...dt, customSrc: picked.path } : dt
+                          ),
+                        }
+                      : obj
+                  );
+                  return {
+                    ...l,
+                    scene3d: {
+                      ...s3d,
+                      objects: nextObjs,
+                      dynamicTextures: nextObjs[0]?.dynamicTextures ?? [],
+                    },
+                  };
+                },
+                "discrete"
+              );
+            } catch {
+              /* cancelled */
+            }
+          }
+        }}
+        onOpenFx={setFxTarget}
+        onBeginTx={() => history.beginTransaction(projectRef.current)}
+        onCommitTx={() => {
+          history.commitTransaction(projectRef.current);
+          onFlushSave?.();
+        }}
+        onRecordStep={() => history.pushSnapshot(projectRef.current)}
+        onFlushSave={onFlushSave}
+      />
+
+      <AnimatePresence>
+        {fxTarget && (
+          <FxExpressionPopover
+            key={`${selectedLayer?.id ?? "none"}-${fxTarget.label}`}
+            label={fxTarget.label}
+            initialExpr={fxTarget.initialExpr}
+            fallbackDisplay={fxTarget.fallback}
+            telemetry={telemetry}
+            globals={project.globals}
+            onApply={fxTarget.onApply}
+            onClear={fxTarget.onClear}
+            onClose={() => setFxTarget(null)}
+          />
+        )}
+      </AnimatePresence>
+    </div>
+  );
+};

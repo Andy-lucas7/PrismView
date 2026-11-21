@@ -1,0 +1,17 @@
+[package]
+name = "prism-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+zip.workspace = true
+ttf-parser.workspace = true
+lyon_path.workspace = true
+lyon_tessellation.workspace = true
+uuid.workspace = true

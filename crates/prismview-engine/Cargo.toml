@@ -1,0 +1,34 @@
+[package]
+name = "prismview-engine"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+prism-core = { path = "../prism-core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+wgpu.workspace = true
+bytemuck = { version = "1.21", features = ["derive"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ab_glyph = "0.2"
+windows = { workspace = true, features = [
+    "Media_Control",
+    "Media_Playback",
+    "Media_Core",
+    "Graphics_Imaging",
+    "Graphics_DirectX_Direct3D11",
+    "Storage_Streams",
+    "Foundation",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+    "Win32_System_WinRT_Direct3D11",
+] }

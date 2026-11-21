@@ -1,0 +1,178 @@
+import { useEffect, useRef } from "react";
+
+function isEditableElement(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
+    return true;
+  }
+  return Boolean(target.closest("[contenteditable='true']"));
+}
+
+export interface KeyboardShortcutsConfig {
+  enabled: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  onDelete: () => void;
+  onNudge: (dxPx: number, dyPx: number) => void;
+  onCopy?: () => void;
+  onCut?: () => void;
+  onPaste?: () => void;
+  onDuplicate?: () => void;
+  onSelectAll?: () => void;
+  onDeselect?: () => void;
+  onGroup?: () => void;
+  onUngroup?: () => void;
+  onBringForward?: () => void;
+  onSendBackward?: () => void;
+  onToggleHidden?: () => void;
+  onToggleLock?: () => void;
+}
+
+export function useKeyboardShortcuts(config: KeyboardShortcutsConfig): void {
+  const ref = useRef(config);
+  ref.current = config;
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const cfg = ref.current;
+      if (!cfg.enabled) return;
+      if (isEditableElement(e.target)) return;
+
+      const mod = e.ctrlKey || e.metaKey;
+      const key = e.key.toLowerCase();
+
+      if (mod && key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        cfg.onUndo();
+        return;
+      }
+
+      if (mod && (key === "y" || (key === "z" && e.shiftKey))) {
+        e.preventDefault();
+        cfg.onRedo();
+        return;
+      }
+
+      if (mod && key === "c" && !e.shiftKey && !e.altKey) {
+        if (cfg.onCopy) {
+          e.preventDefault();
+          cfg.onCopy();
+          return;
+        }
+      }
+
+      if (mod && key === "x" && !e.shiftKey && !e.altKey) {
+        if (cfg.onCut) {
+          e.preventDefault();
+          cfg.onCut();
+          return;
+        }
+      }
+
+      if (mod && key === "v" && !e.shiftKey && !e.altKey) {
+        if (cfg.onPaste) {
+          e.preventDefault();
+          cfg.onPaste();
+          return;
+        }
+      }
+
+      if (mod && key === "d" && !e.shiftKey && !e.altKey) {
+        if (cfg.onDuplicate) {
+          e.preventDefault();
+          cfg.onDuplicate();
+          return;
+        }
+      }
+
+      if (mod && key === "a" && !e.shiftKey && !e.altKey) {
+        if (cfg.onSelectAll) {
+          e.preventDefault();
+          cfg.onSelectAll();
+          return;
+        }
+      }
+
+      if (mod && key === "g" && !e.altKey) {
+        if (e.shiftKey && cfg.onUngroup) {
+          e.preventDefault();
+          cfg.onUngroup();
+          return;
+        }
+        if (!e.shiftKey && cfg.onGroup) {
+          e.preventDefault();
+          cfg.onGroup();
+          return;
+        }
+      }
+
+      if (mod && (e.key === "]" || e.code === "BracketRight")) {
+        if (cfg.onBringForward) {
+          e.preventDefault();
+          cfg.onBringForward();
+          return;
+        }
+      }
+
+      if (mod && (e.key === "[" || e.code === "BracketLeft")) {
+        if (cfg.onSendBackward) {
+          e.preventDefault();
+          cfg.onSendBackward();
+          return;
+        }
+      }
+
+      if (mod && e.shiftKey && key === "h") {
+        if (cfg.onToggleHidden) {
+          e.preventDefault();
+          cfg.onToggleHidden();
+          return;
+        }
+      }
+
+      if (mod && !e.shiftKey && key === "l") {
+        if (cfg.onToggleLock) {
+          e.preventDefault();
+          cfg.onToggleLock();
+          return;
+        }
+      }
+
+      if (e.key === "Escape") {
+        if (cfg.onDeselect) {
+          e.preventDefault();
+          cfg.onDeselect();
+          return;
+        }
+      }
+
+      if (mod || e.altKey) return;
+
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault();
+        cfg.onDelete();
+        return;
+      }
+
+      const step = e.shiftKey ? 10 : 1;
+      if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        cfg.onNudge(-step, 0);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        cfg.onNudge(step, 0);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        cfg.onNudge(0, -step);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        cfg.onNudge(0, step);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+}
