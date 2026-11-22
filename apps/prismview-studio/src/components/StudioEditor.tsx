@@ -197,6 +197,9 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   const [showSkeleton3d, setShowSkeleton3d] = useState(false);
   const [snap3d, setSnap3d] = useState(false);
   const editorApiRef = useRef<Scene3DEditorApi | null>(null);
+  // Bumped when the Sala 3D editor API appears or a model (re)loads → outliner refetches its tree
+  const [outlinerRev, setOutlinerRev] = useState(0);
+  const bumpOutlinerRev = useCallback(() => setOutlinerRev((r) => r + 1), []);
   // Performance HUD (Ctrl+Shift+P)
   const [hudOpen, setHudOpen] = useState(false);
   const [hudStats, setHudStats] = useState<Record<string, Scene3DStats>>({});
@@ -662,6 +665,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           gizmoMode,
           showGrid: showGrid3d,
           snapEnabled: snap3d,
+          showSkeleton: showSkeleton3d,
+          onEditorSync: bumpOutlinerRev,
           onSelectObject: setSelected3dObjectId,
           onCommitObjectTransform: commitRoomTransform,
           editorApiRef,
@@ -1949,7 +1954,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               <button
                 type="button"
                 onClick={() => setShowSkeleton3d((v) => !v)}
-                title="Mostrar / ocultar esqueleto (helper chega no lote de ossos)"
+                title="Mostrar / ocultar esqueleto do objeto selecionado"
                 className={`rounded-full p-1.5 transition ${showSkeleton3d ? "bg-white/20" : "hover:bg-white/15"}`}
               >
                 <Bone className="w-3.5 h-3.5" />
@@ -2020,6 +2025,9 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         scene3dInfo={selectedLayer ? scene3dInspectMap[selectedLayer.id] ?? null : null}
         selected3dObjectId={selected3dObjectId}
         onSelect3dObjectId={setSelected3dObjectId}
+        room3dMode={room3dMode}
+        editorApiRef={editorApiRef}
+        outlinerRev={outlinerRev}
         onAdd3dGlbObject={() => void addGlbObjectTo3DLayer()}
         test3dMode={test3dMode}
         onToggleTest3d={() => setViewMode(test3dMode ? "LAYOUT" : "TEST")}

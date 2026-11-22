@@ -47,6 +47,8 @@ import {
   SceneLayer,
 } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
+import { Scene3DOutliner } from "./Scene3DOutliner";
+import type { Scene3DEditorApi } from "./Scene3DLayer";
 
 function toHexColorInput(raw?: string, fallback = "#FFFFFF"): string {
   const s = (raw || "").trim();
@@ -122,6 +124,11 @@ export interface StudioInspectorProps {
   scene3dInfo?: Scene3DInspectInfo | null;
   selected3dObjectId?: string | null;
   onSelect3dObjectId?: (id: string) => void;
+  /** Sala 3D (ROOM) active: enables the bone/part outliner */
+  room3dMode?: boolean;
+  editorApiRef?: React.MutableRefObject<Scene3DEditorApi | null>;
+  /** Bumped when the editor API appears or a model (re)loads */
+  outlinerRev?: number;
   onAdd3dGlbObject?: () => void;
   test3dMode?: boolean;
   onToggleTest3d?: () => void;
@@ -154,6 +161,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   scene3dInfo = null,
   selected3dObjectId = null,
   onSelect3dObjectId,
+  room3dMode = false,
+  editorApiRef,
+  outlinerRev = 0,
   onAdd3dGlbObject,
   test3dMode = false,
   onToggleTest3d,
@@ -1531,6 +1541,20 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         )}
                         {activeObjInfo?.error && (
                           <p className="text-[10px] text-amber-300">{activeObjInfo.error}</p>
+                        )}
+                        {activeObj.kind === "GLB" && (
+                          <div className="pt-1.5 space-y-1">
+                            <span className="block text-[11px] font-medium text-[#A1A1AA]">
+                              Ossos & Peças ({activeObj.name})
+                            </span>
+                            <Scene3DOutliner
+                              key={activeObj.id}
+                              objectId={activeObj.id}
+                              roomMode={room3dMode}
+                              editorApiRef={editorApiRef}
+                              rev={outlinerRev}
+                            />
+                          </div>
                         )}
                       </div>
                     </div>

@@ -30,6 +30,8 @@ export interface Room3DEditBinding {
   gizmoMode: Scene3DGizmoMode;
   showGrid: boolean;
   snapEnabled: boolean;
+  showSkeleton: boolean;
+  onEditorSync: () => void;
   onSelectObject: (objectId: string | null) => void;
   onCommitObjectTransform: (
     layerId: string,
@@ -566,6 +568,8 @@ const Scene3DSlot: React.FC<Scene3DSlotProps> = (p) => {
             gizmoMode: room.gizmoMode,
             showGrid: room.showGrid,
             snapEnabled: room.snapEnabled,
+            showSkeleton: room.showSkeleton,
+            onEditorSync: room.onEditorSync,
             onSelectObject: room.onSelectObject,
             onCommitObjectTransform,
             editorApiRef: room.editorApiRef,

@@ -9,6 +9,7 @@
  */
 import {
   Box3,
+  Box3Helper,
   BoxHelper,
   GridHelper,
   LineBasicMaterial,
@@ -16,6 +17,8 @@ import {
   Object3D,
   PerspectiveCamera,
   Scene,
+  SkeletonHelper,
+  Vector3,
 } from "three";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import {
@@ -23,6 +26,8 @@ import {
   type Scene3DCameraCapture,
   type Scene3DEditorView,
 } from "../engine/scene3d/editorCamera";
+import type { ModelSceneIndex } from "../engine/scene3d/modelIndex";
+import { getModelTree, getTreeNodeObject, type Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
 export type { Scene3DCameraCapture, Scene3DEditorView };
 
@@ -34,6 +39,8 @@ export interface Scene3DEditorHost {
   scene: Scene;
   initialView: Scene3DEditorView;
   getPivot: (objectId: string) => Object3D | null;
+  /** Index of the loaded model of an object (null while loading / unknown) */
+  getModelIndex: (objectId: string) => ModelSceneIndex | null;
   pickObjectAt: (nx: number, ny: number) => string | null;
   wake: () => void;
   onSelectObject: (objectId: string | null) => void;
@@ -50,6 +57,12 @@ export interface Scene3DEditorSession {
   setMode: (mode: Scene3DGizmoMode) => void;
   setGrid: (visible: boolean) => void;
   setSnap: (enabled: boolean) => void;
+  /** SkeletonHelper of the selected object's model (built lazily, disposed when hidden / deselected / on exit) */
+  setSkeleton: (visible: boolean) => void;
+  /** Outliner tree of an object's model (cached per model); null while the model is not loaded */
+  getObjectTree: (objectId: string) => Scene3DObjectTree | null;
+  /** Highlights one part (tree node id) of an object's model in the viewport; null clears it */
+  highlightNode: (objectId: string, nodeId: number | null) => void;
   /** True while the gizmo drags the object (and briefly after release, until the commit lands) */
   isDragging: (objectId: string) => boolean;
   /** Keep the render loop alive (flying, dragging, easing) */
@@ -115,6 +128,64 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   scene.add(highlight);
 
   let selectedId: string | null = null;
+
+  // ── Skeleton helper (only while toggled on) ───────────────────────────────────
+  let skeletonWanted = false;
+  let skeleton: SkeletonHelper | null = null;
+  let skeletonRoot: Object3D | null = null;
+
+  const disposeSkeleton = () => {
+    if (skeleton) {
+      scene.remove(skeleton);
+      skeleton.dispose();
+      skeleton = null;
+    }
+    skeletonRoot = null;
+  };
+
+  /** Keeps the helper bound to the selected object's CURRENT model root (reloads swap the root) */
+  const syncSkeleton = () => {
+    const root = skeletonWanted && selectedId ? host.getModelIndex(selectedId)?.holder ?? null : null;
+    if (root === skeletonRoot) return;
+    disposeSkeleton();
+    if (!root) return;
+    skeletonRoot = root; // remembered even without bones, so a bone-less model isn't rescanned every frame
+    const helper = new SkeletonHelper(root);
+    if (helper.bones.length === 0) {
+      helper.dispose();
+      return;
+    }
+    helper.renderOrder = 997;
+    skeleton = helper;
+    scene.add(helper);
+  };
+
+  // ── Part highlight (outliner click): one Box3Helper reused for every part ─────
+  const partBox = new Box3();
+  const partPos = new Vector3();
+  const partSize = new Vector3(0.08, 0.08, 0.08);
+  let partHelper: Box3Helper | null = null;
+  let partObject: Object3D | null = null;
+
+  const disposePartHelper = () => {
+    if (!partHelper) return;
+    scene.remove(partHelper);
+    partHelper.geometry.dispose();
+    (partHelper.material as Material).dispose();
+    partHelper = null;
+  };
+
+  const updatePartBox = () => {
+    if (!partHelper || !partObject) return;
+    partBox.setFromObject(partObject);
+    if (partBox.isEmpty()) {
+      // Bones / empty groups have no geometry: mark the joint with a small cube
+      partObject.getWorldPosition(partPos);
+      partBox.setFromCenterAndSize(partPos, partSize);
+    }
+    partHelper.box.copy(partBox);
+  };
+
   let attachedPivot: Object3D | null = null;
   let dragging = false;
   let holdId: string | null = null;
@@ -195,6 +266,8 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     attachSelected();
     // Follows the object (gizmo drag, bindings, spin, model load); BoxHelper.update reuses a module Box3
     if (highlight.visible) highlight.update();
+    if (skeletonWanted) syncSkeleton();
+    if (partObject) updatePartBox();
   };
 
   const focusOn = (objectId: string): boolean => {
@@ -223,6 +296,8 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     controls.detach();
     scene.remove(gizmoHelper);
     controls.dispose();
+    disposeSkeleton();
+    disposePartHelper();
     scene.remove(highlight);
     highlight.geometry.dispose();
     highlightMat.dispose();
@@ -235,6 +310,7 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     setSelected: (id) => {
       selectedId = id;
       attachSelected();
+      if (skeletonWanted) syncSkeleton();
     },
     setMode: (mode) => controls.setMode(mode),
     setGrid: (visible) => {
@@ -244,6 +320,40 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
       controls.setTranslationSnap(enabled ? 0.25 : null);
       controls.setRotationSnap(enabled ? Math.PI / 12 : null);
       controls.setScaleSnap(enabled ? 0.1 : null);
+    },
+    setSkeleton: (visible) => {
+      if (skeletonWanted === visible) return;
+      skeletonWanted = visible;
+      if (visible) syncSkeleton();
+      else disposeSkeleton();
+      host.wake();
+    },
+    getObjectTree: (id) => {
+      const idx = host.getModelIndex(id);
+      return idx ? getModelTree(idx) : null;
+    },
+    highlightNode: (id, nodeId) => {
+      const idx = nodeId === null ? null : host.getModelIndex(id);
+      const obj = idx && nodeId !== null ? getTreeNodeObject(idx, nodeId) : null;
+      if (!obj) {
+        partObject = null;
+        disposePartHelper();
+        host.wake();
+        return;
+      }
+      if (!partHelper) {
+        partHelper = new Box3Helper(partBox, 0xffb454);
+        partHelper.renderOrder = 999;
+        const mat = partHelper.material as LineBasicMaterial;
+        mat.transparent = true;
+        mat.opacity = 0.95;
+        mat.depthTest = false;
+        mat.toneMapped = false;
+        scene.add(partHelper);
+      }
+      partObject = obj;
+      updatePartBox();
+      host.wake();
     },
     isDragging: (id) =>
       (dragging && id === selectedId) || (id === holdId && performance.now() < holdUntil),

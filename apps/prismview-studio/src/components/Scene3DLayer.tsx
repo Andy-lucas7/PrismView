@@ -65,6 +65,7 @@ import {
   nodeUnitScale,
 } from "../engine/scene3d/modelIndex";
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
+import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 import type {
   Scene3DCameraCapture,
   Scene3DEditorSession,
@@ -88,6 +89,10 @@ export interface Scene3DEditorApi {
   captureCameraState: () => Scene3DCameraCapture | null;
   focusSelected: () => void;
   resetView: () => void;
+  /** Outliner tree (bones / meshes / groups, morphs, materials) of an object's loaded model; cached per model */
+  getObjectTree: (objectId: string) => Scene3DObjectTree | null;
+  /** Highlights one outliner part in the viewport (null clears) */
+  highlightNode: (objectId: string, nodeId: number | null) => void;
 }
 
 /** Lightweight performance HUD sample (emitted at most ~2×/s, Studio only) */
@@ -132,6 +137,10 @@ export interface Scene3DLayerProps {
   gizmoMode?: Scene3DGizmoMode;
   showGrid?: boolean;
   snapEnabled?: boolean;
+  /** Sala 3D: draws the selected object's SkeletonHelper (editor chunk only; removed with dispose on exit) */
+  showSkeleton?: boolean;
+  /** Sala 3D: fires when the editor API becomes available and after every model (re)load, so the outliner can refetch */
+  onEditorSync?: () => void;
   onSelectObject?: (objectId: string | null) => void;
   onCommitObjectTransform?: (
     objectId: string,
@@ -364,6 +373,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   gizmoMode = "translate",
   showGrid = true,
   snapEnabled = false,
+  showSkeleton = false,
+  onEditorSync,
   onSelectObject,
   onCommitObjectTransform,
   editorApiRef,
@@ -452,6 +463,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   onStatsRef.current = onStats;
   const onSelectObjectRef = useRef(onSelectObject);
   onSelectObjectRef.current = onSelectObject;
+  const onEditorSyncRef = useRef(onEditorSync);
+  onEditorSyncRef.current = onEditorSync;
   const onCommitTransformRef = useRef(onCommitObjectTransform);
   onCommitTransformRef.current = onCommitObjectTransform;
   // The editor only ever exists inside the interactive Studio preview
@@ -2194,6 +2207,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         scene: cur.scene,
         initialView: computeConfigCameraView(configRef.current, 0, 0),
         getPivot: (id) => engineRef.current?.objectsMap.get(id)?.pivot ?? null,
+        getModelIndex: (id) => engineRef.current?.objectsMap.get(id)?.modelIndex ?? null,
         pickObjectAt: (nx, ny) => engineRef.current?.pick(nx, ny) ?? null,
         wake: () => engineRef.current?.wake(),
         onSelectObject: (id) => onSelectObjectRef.current?.(id),
@@ -2208,9 +2222,12 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           captureCameraState: () => session?.captureCameraState() ?? null,
           focusSelected: () => session?.focusSelected(),
           resetView: () => session?.resetView(computeConfigCameraView(configRef.current, 0, 0)),
+          getObjectTree: (objectId) => session?.getObjectTree(objectId) ?? null,
+          highlightNode: (objectId, nodeId) => session?.highlightNode(objectId, nodeId),
         };
       }
       setEditorRev((r) => r + 1);
+      onEditorSyncRef.current?.();
       cur.wake();
     });
 
@@ -2233,8 +2250,14 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     ed.setMode(gizmoMode);
     ed.setGrid(showGrid);
     ed.setSnap(snapEnabled);
+    ed.setSkeleton(showSkeleton);
     engineRef.current?.wake();
-  }, [editorRev, modelLoadRev, selectedObjectId, gizmoMode, showGrid, snapEnabled]);
+  }, [editorRev, modelLoadRev, selectedObjectId, gizmoMode, showGrid, snapEnabled, showSkeleton]);
+
+  // A (re)loaded model has a new index/tree: let the outliner refetch
+  useEffect(() => {
+    if (editorRev > 0 && modelLoadRev > 0) onEditorSyncRef.current?.();
+  }, [editorRev, modelLoadRev]);
 
   if (isThumbnail && thumbUrl) {
     return (
