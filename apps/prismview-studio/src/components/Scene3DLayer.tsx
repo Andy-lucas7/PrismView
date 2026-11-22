@@ -52,6 +52,7 @@ import {
   buildProceduralEnvironment,
   computeConfigCameraView,
   ENV_SPECS,
+  sampleDayNightBackground,
 } from "../engine/scene3d/environment";
 import { buildShowcaseSculpture, type DefaultSculptureRefs } from "../engine/scene3d/sculptures";
 import {
@@ -155,6 +156,19 @@ interface LoadedObjectRuntime {
   activeClipKey: string;
   spinAngle: number;
   error: string | null;
+}
+
+function dayNightHourFor(cfg: Scene3DConfig): number {
+  if (typeof cfg.dayNightHourOverride === "number" && Number.isFinite(cfg.dayNightHourOverride)) {
+    return cfg.dayNightHourOverride;
+  }
+  const d = new Date();
+  return d.getHours() + d.getMinutes() / 60;
+}
+
+/** (Re)applies the canvas background for `cfg` (mode/colour/day-night). Never called per frame. */
+function syncSceneBackground(scene: Scene, cfg: Scene3DConfig): void {
+  applySceneBackground(scene, cfg, cfg.autoDayNight ? sampleDayNightBackground(dayNightHourFor(cfg)) : undefined);
 }
 
 function buildAggregatedInspectInfo(
@@ -1131,14 +1145,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         if (dnCfg !== cfg || nowMs - dnLastMs >= 29_000) {
           dnCfg = cfg;
           dnLastMs = nowMs;
-          const hour =
-            typeof cfg.dayNightHourOverride === "number" && Number.isFinite(cfg.dayNightHourOverride)
-              ? cfg.dayNightHourOverride
-              : (() => {
-                  const d = new Date();
-                  return d.getHours() + d.getMinutes() / 60;
-                })();
-          applyDayNightLighting(hour, eng.scene, eng.ambientLight, eng.keyLight, eng.rimLight, cfg);
+          applyDayNightLighting(dayNightHourFor(cfg), eng.scene, eng.ambientLight, eng.keyLight, eng.rimLight, cfg);
         }
       } else {
         dnCfg = null;
@@ -1414,11 +1421,13 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         eng.envTarget = target;
         eng.envPresetLoaded = preset;
         eng.scene.environment = target.texture;
-        applySceneBackground(eng.scene, cfg);
       } catch {
         // Leave envPresetLoaded = null so the env effect retries on the next preset/config change.
         eng.scene.environment = null;
       }
+      // Background mode survives the context loss (clear colour/alpha are re-applied by three on restore).
+      eng.renderer.setClearColor(0x000000, 0);
+      syncSceneBackground(eng.scene, configRef.current);
 
       // Cached dynamic textures (album cover / custom image) must be re-uploaded to the new context.
       eng.dynamicTexCache.forEach((tex) => {
@@ -1500,7 +1509,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         eng.rimLight.intensity = spec.rimIntensity;
         eng.rimLight.position.set(spec.rimPos[0], spec.rimPos[1], spec.rimPos[2]);
       }
-      applySceneBackground(eng.scene, cfg);
+      syncSceneBackground(eng.scene, cfg);
       eng.wake();
       return;
     }
@@ -1511,7 +1520,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     eng.envTarget = target;
     eng.envPresetLoaded = preset;
 
-    applySceneBackground(eng.scene, cfg);
+    syncSceneBackground(eng.scene, cfg);
     eng.scene.environment = target.texture;
     eng.ambientLight.color.set(spec.ambientHex);
     eng.ambientLight.intensity = spec.ambientIntensity;

@@ -882,7 +882,16 @@ class OpticalGlassWebGLEngine {
     try {
       gl.bindTexture(gl.TEXTURE_2D, entry.tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bg.element);
+      // Transparent 3D canvases are premultiplied: keep them premultiplied on upload so edge pixels
+      // and the blur pyramid composite over black without a un-premultiply fringe/halo
+      // (the shaders only read .rgb).
+      const premul = bg.kind === "canvas";
+      if (premul) gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1);
+      try {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bg.element);
+      } finally {
+        if (premul) gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 0);
+      }
     } catch {
       if (created) gl.deleteTexture(entry.tex);
       return false;

@@ -159,11 +159,48 @@ const dnAmbTmp = new Color();
 const dnKeyTmp = new Color();
 const dnRimTmp = new Color();
 const solidBgTmp = new Color();
+const envBgTmp = new Color();
+const dnBgTmp = new Color();
 
-export function applySceneBackground(scene: Scene, cfg: Scene3DConfig): void {
+function dayNightSegment(hourRaw: number): { k0: DayNightKeyframe; k1: DayNightKeyframe; ease: number } {
+  const h = ((hourRaw % 24) + 24) % 24;
+  let k0 = DAY_NIGHT_KEYS[0];
+  let k1 = DAY_NIGHT_KEYS[DAY_NIGHT_KEYS.length - 1];
+  for (let i = 0; i < DAY_NIGHT_KEYS.length - 1; i++) {
+    if (h >= DAY_NIGHT_KEYS[i].hour && h <= DAY_NIGHT_KEYS[i + 1].hour) {
+      k0 = DAY_NIGHT_KEYS[i];
+      k1 = DAY_NIGHT_KEYS[i + 1];
+      break;
+    }
+  }
+  const span = Math.max(0.001, k1.hour - k0.hour);
+  const t = Math.max(0, Math.min(1, (h - k0.hour) / span));
+  return { k0, k1, ease: t * t * (3 - 2 * t) };
+}
+
+/** Interpolated day/night sky colour for `hour`, written into a shared scratch Color (do not retain). */
+export function sampleDayNightBackground(hour: number): Color {
+  const { k0, k1, ease } = dayNightSegment(hour);
+  return dnBgTmp.copy(k0.bg).lerp(k1.bg, ease);
+}
+
+/**
+ * Canvas background per `cfg.backgroundMode`.
+ * TRANSPARENT → no background (cleared with alpha 0); SOLID → `backgroundColor`;
+ * ENVIRONMENT → preset colour, or the day/night sky colour when `dayNightBg` is given.
+ * `scene.environment` (IBL) is untouched. Call only when mode/colour/hour change.
+ */
+export function applySceneBackground(scene: Scene, cfg: Scene3DConfig, dayNightBg?: Color): void {
   if (cfg.backgroundMode === "SOLID") {
     solidBgTmp.set(cfg.backgroundColor || "#07080b");
     scene.background = solidBgTmp;
+  } else if (cfg.backgroundMode === "ENVIRONMENT") {
+    if (cfg.autoDayNight && dayNightBg) {
+      envBgTmp.copy(dayNightBg);
+    } else {
+      envBgTmp.set((ENV_SPECS[cfg.envPreset] ?? ENV_SPECS.STUDIO_DARK).bgHex);
+    }
+    scene.background = envBgTmp;
   } else {
     scene.background = null;
   }
@@ -178,24 +215,13 @@ export function applyDayNightLighting(
   cfg: Scene3DConfig
 ): void {
   const h = ((hourRaw % 24) + 24) % 24;
-  let k0 = DAY_NIGHT_KEYS[0];
-  let k1 = DAY_NIGHT_KEYS[DAY_NIGHT_KEYS.length - 1];
-  for (let i = 0; i < DAY_NIGHT_KEYS.length - 1; i++) {
-    if (h >= DAY_NIGHT_KEYS[i].hour && h <= DAY_NIGHT_KEYS[i + 1].hour) {
-      k0 = DAY_NIGHT_KEYS[i];
-      k1 = DAY_NIGHT_KEYS[i + 1];
-      break;
-    }
-  }
-  const span = Math.max(0.001, k1.hour - k0.hour);
-  const t = Math.max(0, Math.min(1, (h - k0.hour) / span));
-  const ease = t * t * (3 - 2 * t);
+  const { k0, k1, ease } = dayNightSegment(h);
 
   dnAmbTmp.copy(k0.amb).lerp(k1.amb, ease);
   dnKeyTmp.copy(k0.key).lerp(k1.key, ease);
   dnRimTmp.copy(k0.rim).lerp(k1.rim, ease);
 
-  applySceneBackground(scene, cfg);
+  applySceneBackground(scene, cfg, sampleDayNightBackground(h));
   ambientLight.color.copy(dnAmbTmp);
   ambientLight.intensity = k0.ambInt + (k1.ambInt - k0.ambInt) * ease;
   keyLight.color.copy(dnKeyTmp);
