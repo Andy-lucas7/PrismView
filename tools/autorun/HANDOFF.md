@@ -1,8 +1,8 @@
-E1-L6 OK (gate both: 0 erros novos). Só `src-tauri/src/lib.rs`.
-- Já existiam (lotes anteriores): export `bundle_layer_files` percorre `scene3d.objects[*].modelSrc` + `dynamicTextures[*].customSrc` (+ legado `scene3d.modelSrc`), nome `assets/{n}_{arquivo}` único + dedup por caminho; import `remap_imported_layers` reescreve tudo; `collect_layer_import_uuids` cobre objetos.
-- Novo: `import_prism_archive` chama `allow_project_media(&saved)` após salvar (libera todos os .glb extraídos no `ASSET_SCOPE`). `list_projects`/`load_project_from_disk` já varrem o JSON inteiro (liberam todos os objetos).
-- Novo teste `export_bundles_every_scene3d_object_glb_and_remap_restores_both` (2 .glb de mesmo nome em pastas distintas + dedup; não roda no gate, precisa `cargo test`).
-- Pacote antigo só com `scene3d.modelSrc` continua válido (migração TS cria `objects[0]`).
-- Arquivo fonte ausente no export é ignorado silenciosamente (caminho absoluto fica no JSON).
-- Resíduo: `tools/autorun/_splice_l5.mjs` pode ser apagado.
-- Pendente (outros lotes): `parentId` runtime/outliner; motor Rust não lê `objectId`.
+E1-L7 OK (gate rust: 0 erros novos; 11 pré-existentes do motor ignorados ⇒ motor segue sem validação real de compilação).
+- `native_scene.rs`: `scene3d()` → `migrate_scene3d_v3` (espelho de `normalizeScene3DConfig`): sai sempre schema 3 com `objects[]` ≥1 (legado → `obj-primary`, escala `modelScale`, `position[1]=modelOffsetY`, giro 0,22→0, playback/dynamicTextures globais; sem modelo = SHOWCASE), ids vazios → `obj-{i}`, `backgroundMode` (≤v2/ inválido → TRANSPARENT), `backgroundColor` padrão `#07080b`, chaves legadas removidas. Teste `project_to_scene` atualizado.
+- `config.rs`: `Scene3dBackgroundMode::Environment`, `day_night_hour_override` + `hour_override()`, `showcase_variant` legado, consts `SCENE3D_SCHEMA_VERSION/LEGACY_PRIMARY_ID/LEGACY_DEFAULT_AUTO_ROTATE`, `migrate_legacy_spin`; `effective_objects` faz a migração (compat com `active_scene.json` antigo). Testes novos.
+- `lighting.rs`: `linear_to_srgb`, `preset_background`, `day_night_background` (chaves `bg` do TS), `day_night_segment` compartilhado.
+- `renderer.rs`: `set_config` sem bloco legado duplicado; dia/noite avaliado já no set_config (usa override); `sky_background`; `write_tonemap` por modo (TRANSPARENT alpha 0 / SOLID cor / ENVIRONMENT cor do preset ou céu dia/noite, sem tonemap, IBL intacta); objetos ocultos não pedem quadro.
+- Já existiam e foram mantidos: N objetos com `ModelInstance`, YXZ+spin, normalização 2,4 por instância, diff por `id`+`modelSrc`+`kind` no `set_config`, visibilidade herdada (`SceneGraph`), `parentId`.
+- Validar em máquina: `cargo test -p prismview-engine` (config/lighting) e `cargo test` do src-tauri (`project_to_scene`); fundo ENVIRONMENT/SOLID no wallpaper; SHOWCASE continua sem render (só erro por objeto).
+- Não feito (fora do lote): câmera persistida (E2-L4), bindings novos/`objectId` no solver (E3).

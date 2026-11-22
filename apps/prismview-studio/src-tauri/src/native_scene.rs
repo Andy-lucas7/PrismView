@@ -453,10 +453,8 @@ fn scene3d(config: &Value) -> Value {
     let Some(map) = cfg.as_object_mut() else {
         return Value::Object(Map::new());
     };
-    map.entry("schemaVersion").or_insert(json!(2));
-    normalize_path_field(map, "modelSrc");
+    migrate_scene3d_v3(map);
     normalize_path_field(map, "envMapSrc");
-    normalize_dynamic_textures(map);
     if let Some(objects) = map.get_mut("objects").and_then(Value::as_array_mut) {
         for obj in objects.iter_mut().filter_map(Value::as_object_mut) {
             normalize_path_field(obj, "modelSrc");
@@ -464,6 +462,108 @@ fn scene3d(config: &Value) -> Value {
         }
     }
     cfg
+}
+
+const SCENE3D_SCHEMA_VERSION: u64 = 3;
+const LEGACY_DEFAULT_AUTO_ROTATE: f64 = 0.22;
+const LEGACY_SCENE3D_KEYS: [&str; 7] = [
+    "modelSrc",
+    "showcaseVariant",
+    "autoRotateSpeed",
+    "modelScale",
+    "modelOffsetY",
+    "playback",
+    "dynamicTextures",
+];
+
+/// v2→v3: 0,22 rad/s (giro padrão antigo) vira 0; outro valor é mantido.
+fn migrate_legacy_spin(v: Option<&Value>) -> f64 {
+    let n = v.and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0);
+    if (n - LEGACY_DEFAULT_AUTO_ROTATE).abs() < 1e-6 {
+        0.0
+    } else {
+        n
+    }
+}
+
+/// Espelho de `normalizeScene3DConfig` (prism.ts) para o motor: config sempre sai em schema v3
+/// com `objects[]` (≥1) e `backgroundMode`. Schema ≤2: modelo único legado → `obj-primary`
+/// (escala uniforme `modelScale`, `position[1] = modelOffsetY`, giro 0,22→0, playback/texturas
+/// dinâmicas globais), fundo TRANSPARENT; chaves legadas removidas.
+fn migrate_scene3d_v3(map: &mut Map<String, Value>) {
+    let version = map.get("schemaVersion").and_then(Value::as_u64).unwrap_or(0);
+    let migrating = version < SCENE3D_SCHEMA_VERSION;
+    let has_objects = map
+        .get("objects")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+
+    if has_objects {
+        if let Some(objects) = map.get_mut("objects").and_then(Value::as_array_mut) {
+            for (i, obj) in objects.iter_mut().filter_map(Value::as_object_mut).enumerate() {
+                let id_ok = obj.get("id").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
+                if !id_ok {
+                    obj.insert("id".into(), json!(format!("obj-{i}")));
+                }
+                if migrating {
+                    let spin = migrate_legacy_spin(obj.get("autoRotateSpeed"));
+                    obj.insert("autoRotateSpeed".into(), json!(spin));
+                }
+            }
+        }
+    } else {
+        let src = map.get("modelSrc").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+        let has_model = !src.is_empty();
+        let scale = map
+            .get("modelScale")
+            .and_then(Value::as_f64)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        let offset_y = map
+            .get("modelOffsetY")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0);
+        let playback = map.get("playback").and_then(Value::as_object);
+        let playback = json!({
+            "clipName": playback.and_then(|p| p.get("clipName")).and_then(Value::as_str).unwrap_or(""),
+            "speed": playback.and_then(|p| p.get("speed")).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(1.0),
+            "loop": playback.and_then(|p| p.get("loop")).and_then(Value::as_bool).unwrap_or(true),
+        });
+        let mut obj = json!({
+            "id": "obj-primary",
+            "name": "Primary",
+            "kind": if has_model { "GLB" } else { "SHOWCASE" },
+            "modelSrc": src,
+            "position": [0.0, offset_y, 0.0],
+            "rotation": [0.0, 0.0, 0.0],
+            "scale": [scale, scale, scale],
+            "visible": true,
+            "autoRotateSpeed": migrate_legacy_spin(map.get("autoRotateSpeed")),
+            "playback": playback,
+            "dynamicTextures": map.get("dynamicTextures").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])),
+        });
+        if !has_model {
+            let variant = map.get("showcaseVariant").and_then(Value::as_str).unwrap_or("MONOLITH");
+            obj["showcaseVariant"] = json!(variant);
+        }
+        map.insert("objects".into(), json!([obj]));
+    }
+
+    let mode_ok = matches!(
+        map.get("backgroundMode").and_then(Value::as_str),
+        Some("TRANSPARENT" | "SOLID" | "ENVIRONMENT")
+    );
+    if migrating || !mode_ok {
+        map.insert("backgroundMode".into(), json!("TRANSPARENT"));
+    }
+    if !map.get("backgroundColor").is_some_and(Value::is_string) {
+        map.insert("backgroundColor".into(), json!("#07080b"));
+    }
+    for key in LEGACY_SCENE3D_KEYS {
+        map.remove(key);
+    }
+    map.insert("schemaVersion".into(), json!(SCENE3D_SCHEMA_VERSION));
 }
 
 fn glass_plate(node: &mut Value, glass: &Value) {
@@ -1133,7 +1233,7 @@ mod tests {
                     "fx": { "opacity": "$gv(show)$" } })),
                 layer("room", "SCENE_3D", json!({ "width": 1920, "height": 1080,
                     "scene3d": { "modelSrc": "http://asset.localhost/D%3A%5Cm.glb", "envPreset": "SUNSET",
-                                 "objects": [{ "kind": "SHOWCASE" }] } }))
+                                 "schemaVersion": 2, "modelScale": 2, "autoRotateSpeed": 0.22 } }))
             ]
         });
         let scene = project_to_scene(&project).expect("convertível");
@@ -1145,7 +1245,15 @@ mod tests {
         assert_eq!(layers[0]["opacity"]["expr"], "$gv(show)$");
         assert_eq!(layers[1]["kind"], "SCENE3D");
         assert_eq!(layers[1]["fill_parent"], true);
-        assert_eq!(layers[1]["scene3d"]["modelSrc"], "D:\m.glb");
+        let s3d = &layers[1]["scene3d"];
+        assert_eq!(s3d["schemaVersion"], 3);
+        assert_eq!(s3d["backgroundMode"], "TRANSPARENT");
+        assert!(s3d.get("modelSrc").is_none());
+        assert_eq!(s3d["objects"][0]["id"], "obj-primary");
+        assert_eq!(s3d["objects"][0]["kind"], "GLB");
+        assert_eq!(s3d["objects"][0]["modelSrc"], "D:\m.glb");
+        assert_eq!(s3d["objects"][0]["scale"][1], 2.0);
+        assert_eq!(s3d["objects"][0]["autoRotateSpeed"], 0.0);
         let b = &scene["bindings"][0];
         assert_eq!(b["source"], "CURSOR_X");
         assert_eq!(b["layerId"], "clock");

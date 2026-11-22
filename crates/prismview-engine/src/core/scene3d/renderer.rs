@@ -36,7 +36,10 @@ use super::environment::{load_hdri, EnvBaker, EnvSource, EnvironmentMaps, Equire
 use super::gpu_model::{vertex_layouts, GpuModel, ModelUploadContext, ATTR_STRIDE};
 use super::graph::SceneGraph;
 use super::instance::{DeformKernel, ModelInstance};
-use super::lighting::{parse_hex_srgb, LightRig, ProceduralEnv, MAX_DIR_LIGHTS, MAX_POINT_LIGHTS};
+use super::lighting::{
+    day_night_background, linear_to_srgb, parse_hex_srgb, preset_background, LightRig, ProceduralEnv, MAX_DIR_LIGHTS,
+    MAX_POINT_LIGHTS,
+};
 use crate::engine_core::assets::{AssetHash, AssetLoader, LoadEvent, LoaderConfig, ModelAsset, Ticket};
 use crate::engine_core::gpu::GpuContext;
 
@@ -308,6 +311,8 @@ pub struct Scene3dRenderer {
     waker: Option<Arc<dyn Fn() + Send + Sync>>,
     lights: LightRig,
     day_night_timer: f32,
+    /// Fundo linear do modo ENVIRONMENT (cor do preset ou céu do dia/noite).
+    sky_background: Vec3,
 
     frame_buffer: wgpu::Buffer,
     frame_bind: wgpu::BindGroup,
@@ -419,6 +424,7 @@ impl Scene3dRenderer {
             waker: None,
             lights: LightRig::from_preset(preset),
             day_night_timer: 0.0,
+            sky_background: preset_background(preset),
             frame_buffer,
             frame_bind,
             draw_buffer,
@@ -483,21 +489,8 @@ impl Scene3dRenderer {
     /// (e a animação); modelos novos são pedidos ao `loader` (o resultado chega por
     /// `handle_load_event`).
     pub fn set_config(&mut self, gpu: &GpuContext, config: Scene3dConfig, loader: &mut AssetLoader) {
-        let mut objects = config.effective_objects();
-        if config.objects.is_empty() {
-            // `modelSrc` legado: escala/offset/rotação/playback globais viram do objeto sintético.
-            if let Some(obj) = objects.first_mut() {
-                let s = if config.model_scale.is_finite() && config.model_scale > 0.0 {
-                    config.model_scale
-                } else {
-                    1.0
-                };
-                obj.scale = [s; 3];
-                obj.position[1] = config.model_offset_y;
-                obj.auto_rotate_speed = config.auto_rotate_speed;
-                obj.playback = config.playback.clone();
-            }
-        }
+        // Schema ≤2 (modelo único) já vira `obj-primary` aqui, como a migração do Estúdio.
+        let objects = config.effective_objects();
 
         let mut previous: HashMap<String, ObjectSlot> = HashMap::with_capacity(self.slots.len());
         for slot in self.slots.drain(..) {
@@ -529,12 +522,17 @@ impl Scene3dRenderer {
         self.solver.set_specs(&config.bindings);
         self.hover_pointer = None;
 
-        let preset_changed = self.config.env_preset != config.env_preset;
-        let day_night_changed = self.config.auto_day_night != config.auto_day_night;
         self.config = config;
-        if preset_changed || day_night_changed || !self.config.auto_day_night {
+        if self.config.auto_day_night {
+            // Avalia já (hora fixa do Estúdio ou relógio local); o `update` reavalia a cada 30 s.
+            let hour = self.day_night_hour();
+            self.lights = LightRig::day_night(hour);
+            self.sky_background = day_night_background(hour);
+            self.day_night_timer = DAY_NIGHT_PERIOD;
+        } else {
             self.lights = LightRig::from_preset(self.config.env_preset);
-            self.day_night_timer = 0.0; // reavalia o dia/noite no próximo update
+            self.sky_background = preset_background(self.config.env_preset);
+            self.day_night_timer = 0.0;
         }
         self.update_environment(gpu);
         self.write_tonemap(gpu.queue());
@@ -733,18 +731,34 @@ impl Scene3dRenderer {
         } else {
             1.05
         };
-        let solid = self.config.background_mode == Scene3dBackgroundMode::Solid;
-        let bg = self
-            .config
-            .background_color
-            .as_deref()
-            .and_then(parse_hex_srgb)
-            .unwrap_or_else(|| parse_hex_srgb("#07080b").unwrap_or([0.0, 0.0, 0.0, 1.0]));
+        // Fundo opaco composto por baixo (sem tone mapping, como `scene.background = Color`);
+        // TRANSPARENT = alpha 0 fora dos modelos. A IBL não depende do modo.
+        let bg = match self.config.background_mode {
+            Scene3dBackgroundMode::Transparent => None,
+            Scene3dBackgroundMode::Solid => Some(
+                self.config
+                    .background_color
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                    .and_then(parse_hex_srgb)
+                    .unwrap_or_else(|| parse_hex_srgb("#07080b").unwrap_or([0.0, 0.0, 0.0, 1.0])),
+            ),
+            Scene3dBackgroundMode::Environment => {
+                let sky = self.sky_background;
+                Some([linear_to_srgb(sky.x), linear_to_srgb(sky.y), linear_to_srgb(sky.z), 1.0])
+            }
+        };
+        let bg_rgb = bg.unwrap_or([0.0; 4]);
         let uniform = TonemapUniform {
-            info: [exposure, if solid { 1.0 } else { 0.0 }, 0.0, 0.0],
-            background: [bg[0], bg[1], bg[2], 1.0],
+            info: [exposure, if bg.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
+            background: [bg_rgb[0], bg_rgb[1], bg_rgb[2], 1.0],
         };
         queue.write_buffer(&self.tonemap_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Hora do ciclo dia/noite: `dayNightHourOverride` do Estúdio ou o relógio local.
+    fn day_night_hour(&self) -> f32 {
+        self.config.hour_override().unwrap_or_else(local_hour)
     }
 
     // ── Quadro ──
@@ -758,29 +772,40 @@ impl Scene3dRenderer {
             self.day_night_timer -= dt;
             if self.day_night_timer <= 0.0 {
                 self.day_night_timer = DAY_NIGHT_PERIOD;
-                let rig = LightRig::day_night(local_hour());
+                let hour = self.day_night_hour();
+                let rig = LightRig::day_night(hour);
                 if rig != self.lights {
                     self.lights = rig;
                     self.dirty = true;
+                }
+                let sky = day_night_background(hour);
+                if sky != self.sky_background {
+                    self.sky_background = sky;
+                    if self.config.background_mode == Scene3dBackgroundMode::Environment {
+                        self.write_tonemap(gpu.queue());
+                        self.dirty = true;
+                    }
                 }
             }
         }
 
         let mut animating = false;
         for (index, slot) in self.slots.iter_mut().enumerate() {
+            // Oculto (ele ou um ancestral): o tempo anda, mas não pede quadro.
+            let shown = self.visible.get(index).copied().unwrap_or(false);
             let speed = self.objects.get(index).map_or(0.0, |o| o.auto_rotate_speed);
             if speed.is_finite() && speed.abs() > 1e-4 {
                 slot.spin = (slot.spin + speed * dt).rem_euclid(std::f32::consts::TAU);
-                animating = true;
+                animating |= shown;
             } else if slot.spin != 0.0 {
                 slot.spin = 0.0;
-                self.dirty = true;
+                self.dirty |= shown;
             }
             if let Some(instance) = &mut slot.instance {
                 if instance.advance(dt) {
-                    self.dirty = true;
+                    self.dirty |= shown;
                 }
-                animating |= instance.is_animating();
+                animating |= shown && instance.is_animating();
             }
         }
 

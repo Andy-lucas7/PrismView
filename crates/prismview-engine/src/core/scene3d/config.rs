@@ -1,9 +1,8 @@
 //! Contrato JSON da cena 3D (`Scene3DConfig` / `Scene3DObject` de
-//! `apps/prismview-studio/src/types/prism.ts`, schema v2), em camelCase como o Estúdio salva.
+//! `apps/prismview-studio/src/types/prism.ts`, schema v3), em camelCase como o Estúdio salva.
 //!
-//! Diferença em relação ao TypeScript atual: `Scene3DObject` **não tem `parentId`** hoje. O campo
-//! `parent_id` aqui é opcional e ausente = raiz, então projetos existentes carregam sem mudança;
-//! o Estúdio precisa passar a gravá-lo (ver `SceneGraph`).
+//! `parentId` ausente = raiz (ver `SceneGraph`). Schema ≤2 (modelo único legado) é migrado em
+//! `effective_objects` exatamente como `normalizeScene3DConfig` do TS (`obj-primary`, giro 0,22→0).
 //!
 //! Todos os campos têm `default` (projetos antigos/editados à mão não derrubam o parse). `bindings`
 //! e `dynamicTextures` ficam como JSON bruto até a Fase 4 (SignalBus/BindingSolver).
@@ -33,9 +32,29 @@ pub enum Scene3dEnvPreset {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Scene3dBackgroundMode {
+    /// Fora dos modelos: alpha 0 (saída pré-multiplicada).
     #[default]
     Transparent,
+    /// `backgroundColor` opaco por baixo.
     Solid,
+    /// Cor de fundo do preset de ambiente (ou céu do ciclo dia/noite), como `applySceneBackground`.
+    Environment,
+}
+
+/// Giro padrão antigo (schema ≤2) que a migração v3 zera (`LEGACY_DEFAULT_AUTO_ROTATE` no TS).
+pub const LEGACY_DEFAULT_AUTO_ROTATE: f32 = 0.22;
+/// Id do objeto sintético criado a partir do modelo único legado (igual ao TS).
+pub const LEGACY_PRIMARY_ID: &str = "obj-primary";
+/// Primeiro schema com `objects[]`/`backgroundMode`.
+pub const SCENE3D_SCHEMA_VERSION: u32 = 3;
+
+/// v2→v3: 0,22 rad/s vira 0; outro valor do usuário é mantido.
+pub fn migrate_legacy_spin(speed: f32) -> f32 {
+    if !speed.is_finite() || (speed - LEGACY_DEFAULT_AUTO_ROTATE).abs() < 1e-6 {
+        0.0
+    } else {
+        speed
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,8 +179,10 @@ impl Scene3dObject {
 #[serde(rename_all = "camelCase", default)]
 pub struct Scene3dConfig {
     pub schema_version: u32,
-    /// Modelo único legado (schema < 2); `objects` tem prioridade quando não vazio.
+    /// Modelo único legado (schema ≤2); `objects` tem prioridade quando não vazio.
     pub model_src: String,
+    /// Legado (schema ≤2): variante da escultura quando não há `modelSrc`.
+    pub showcase_variant: Option<String>,
     pub objects: Vec<Scene3dObject>,
     pub background_mode: Scene3dBackgroundMode,
     pub background_color: Option<String>,
@@ -179,6 +200,8 @@ pub struct Scene3dConfig {
     pub model_scale: f32,
     pub model_offset_y: f32,
     pub auto_day_night: bool,
+    /// Hora fixa (0..24) do ciclo dia/noite (`dayNightHourOverride`); `None` = relógio local.
+    pub day_night_hour_override: Option<f32>,
     pub camera: Scene3dCamera,
     pub playback: Scene3dPlayback,
     /// Bindings reativos e texturas dinâmicas: tratados na Fase 4.
@@ -191,6 +214,7 @@ impl Default for Scene3dConfig {
         Self {
             schema_version: 2,
             model_src: String::new(),
+            showcase_variant: None,
             objects: Vec::new(),
             background_mode: Scene3dBackgroundMode::Transparent,
             background_color: None,
@@ -205,6 +229,7 @@ impl Default for Scene3dConfig {
             model_scale: 1.0,
             model_offset_y: 0.0,
             auto_day_night: false,
+            day_night_hour_override: None,
             camera: Scene3dCamera::default(),
             playback: Scene3dPlayback::default(),
             bindings: Vec::new(),
@@ -214,21 +239,63 @@ impl Default for Scene3dConfig {
 }
 
 impl Scene3dConfig {
-    /// Objetos efetivos: `objects`, ou um objeto GLB sintético para o `modelSrc` legado.
+    /// Objetos efetivos (espelho de `normalizeScene3DObjects` + migração v3 do TS): `objects`
+    /// (schema ≤2: giro 0,22→0; id vazio → `obj-{i}`), ou o objeto sintético `obj-primary` do
+    /// modelo único legado (escala uniforme `modelScale`, `position[1] = modelOffsetY`, giro e
+    /// playback globais; sem `modelSrc` = SHOWCASE).
     pub fn effective_objects(&self) -> Vec<Scene3dObject> {
+        let legacy = self.schema_version < SCENE3D_SCHEMA_VERSION;
         if !self.objects.is_empty() {
-            return self.objects.clone();
+            let mut objects = self.objects.clone();
+            for (i, obj) in objects.iter_mut().enumerate() {
+                if obj.id.is_empty() {
+                    obj.id = format!("obj-{i}");
+                }
+                if legacy {
+                    obj.auto_rotate_speed = migrate_legacy_spin(obj.auto_rotate_speed);
+                }
+            }
+            return objects;
         }
-        if self.model_src.trim().is_empty() {
-            return Vec::new();
-        }
+        let src = self.model_src.trim();
+        let scale = if self.model_scale.is_finite() && self.model_scale > 0.0 {
+            self.model_scale
+        } else {
+            1.0
+        };
+        let has_model = !src.is_empty();
         vec![Scene3dObject {
-            id: "primary".to_owned(),
+            id: LEGACY_PRIMARY_ID.to_owned(),
             name: "Primary".to_owned(),
-            kind: Scene3dObjectKind::Glb,
-            model_src: self.model_src.clone(),
+            kind: if has_model {
+                Scene3dObjectKind::Glb
+            } else {
+                Scene3dObjectKind::Showcase
+            },
+            model_src: src.to_owned(),
+            showcase_variant: if has_model {
+                None
+            } else {
+                Some(self.showcase_variant.clone().unwrap_or_else(|| "MONOLITH".to_owned()))
+            },
+            position: [
+                0.0,
+                if self.model_offset_y.is_finite() { self.model_offset_y } else { 0.0 },
+                0.0,
+            ],
+            scale: [scale; 3],
+            auto_rotate_speed: migrate_legacy_spin(self.auto_rotate_speed),
+            playback: self.playback.clone(),
+            dynamic_textures: self.dynamic_textures.clone(),
             ..Scene3dObject::default()
         }]
+    }
+
+    /// Hora do ciclo dia/noite: override finito (0..24) ou `None` (usar o relógio local).
+    pub fn hour_override(&self) -> Option<f32> {
+        self.day_night_hour_override
+            .filter(|h| h.is_finite())
+            .map(|h| h.rem_euclid(24.0))
     }
 }
 
@@ -248,6 +315,40 @@ mod tests {
         assert_eq!(cfg.env_preset, Scene3dEnvPreset::CityNight);
         assert_eq!(cfg.objects[0].parent_id, None);
         assert_eq!(cfg.max_fps, 30);
+    }
+
+    #[test]
+    fn parses_v3_background_and_hour_override() {
+        let json = r##"{ "schemaVersion": 3, "backgroundMode": "ENVIRONMENT", "backgroundColor": "#101010",
+                        "dayNightHourOverride": 25.5,
+                        "objects": [{ "id": "a", "autoRotateSpeed": 0.22 }, { "id": "b", "parentId": "a" }] }"##;
+        let cfg: Scene3dConfig = serde_json::from_str(json).expect("json válido");
+        assert_eq!(cfg.background_mode, Scene3dBackgroundMode::Environment);
+        assert_eq!(cfg.hour_override(), Some(1.5));
+        let objects = cfg.effective_objects();
+        // v3: 0,22 escolhido pelo usuário é mantido.
+        assert!((objects[0].auto_rotate_speed - 0.22).abs() < 1e-6);
+        assert_eq!(objects[1].parent_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn legacy_single_model_becomes_obj_primary() {
+        let json = r#"{ "schemaVersion": 2, "modelSrc": " a.glb ", "modelScale": 2, "modelOffsetY": -0.5,
+                        "autoRotateSpeed": 0.22, "playback": { "clipName": "Idle", "speed": 2, "loop": false } }"#;
+        let cfg: Scene3dConfig = serde_json::from_str(json).expect("json válido");
+        let objects = cfg.effective_objects();
+        assert_eq!(objects.len(), 1);
+        let o = &objects[0];
+        assert_eq!(o.id, LEGACY_PRIMARY_ID);
+        assert_eq!(o.model_src, "a.glb");
+        assert_eq!(o.scale, [2.0; 3]);
+        assert_eq!(o.position, [0.0, -0.5, 0.0]);
+        assert_eq!(o.auto_rotate_speed, 0.0);
+        assert_eq!(o.playback.clip_name, "Idle");
+        assert!(!o.playback.looping);
+
+        let empty: Scene3dConfig = serde_json::from_str("{}").expect("json válido");
+        assert_eq!(empty.effective_objects()[0].kind, Scene3dObjectKind::Showcase);
     }
 
     #[test]

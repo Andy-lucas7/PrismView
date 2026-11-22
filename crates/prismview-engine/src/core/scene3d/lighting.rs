@@ -24,6 +24,17 @@ pub fn srgb_to_linear(c: f32) -> f32 {
     }
 }
 
+/// Linear → sRGB (0..1).
+#[inline]
+pub fn linear_to_srgb(c: f32) -> f32 {
+    let c = if c.is_finite() { c.clamp(0.0, 1.0) } else { 0.0 };
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 /// `#rgb`, `#rrggbb` ou `#rrggbbaa` → RGBA sRGB 0..1.
 pub fn parse_hex_srgb(raw: &str) -> Option<[f32; 4]> {
     let hex = raw.trim().strip_prefix('#')?;
@@ -269,18 +280,7 @@ impl LightRig {
     /// Ciclo dia/noite (`applyDayNightLighting`): `hour` local 0..24.
     pub fn day_night(hour: f32) -> Self {
         let h = hour.rem_euclid(24.0);
-        let mut k0 = &DAY_NIGHT[0];
-        let mut k1 = &DAY_NIGHT[DAY_NIGHT.len() - 1];
-        for pair in DAY_NIGHT.windows(2) {
-            if h >= pair[0].hour && h <= pair[1].hour {
-                k0 = &pair[0];
-                k1 = &pair[1];
-                break;
-            }
-        }
-        let span = (k1.hour - k0.hour).max(0.001);
-        let t = ((h - k0.hour) / span).clamp(0.0, 1.0);
-        let e = t * t * (3.0 - 2.0 * t);
+        let (k0, k1, e) = day_night_segment(h);
         let mix = |a: &str, b: &str| hex_linear(a, Vec3::ONE).lerp(hex_linear(b, Vec3::ONE), e);
         let lerp = |a: f32, b: f32| a + (b - a) * e;
 
@@ -300,8 +300,36 @@ impl LightRig {
     }
 }
 
+/// Cor de fundo linear do preset (`ENV_SPECS[preset].bgHex`).
+pub fn preset_background(preset: Scene3dEnvPreset) -> Vec3 {
+    hex_linear(spec(preset).bg, Vec3::ZERO)
+}
+
+/// Céu do ciclo dia/noite (`sampleDayNightBackground`): cor linear interpolada para `hour`.
+pub fn day_night_background(hour: f32) -> Vec3 {
+    let (k0, k1, e) = day_night_segment(hour.rem_euclid(24.0));
+    hex_linear(k0.bg, Vec3::ZERO).lerp(hex_linear(k1.bg, Vec3::ZERO), e)
+}
+
+/// Par de chaves que contém `h` (0..24) e o `smoothstep` entre elas (`dayNightSegment`).
+fn day_night_segment(h: f32) -> (&'static DayNightKey, &'static DayNightKey, f32) {
+    let mut k0 = &DAY_NIGHT[0];
+    let mut k1 = &DAY_NIGHT[DAY_NIGHT.len() - 1];
+    for pair in DAY_NIGHT.windows(2) {
+        if h >= pair[0].hour && h <= pair[1].hour {
+            k0 = &pair[0];
+            k1 = &pair[1];
+            break;
+        }
+    }
+    let span = (k1.hour - k0.hour).max(0.001);
+    let t = ((h - k0.hour) / span).clamp(0.0, 1.0);
+    (k0, k1, t * t * (3.0 - 2.0 * t))
+}
+
 struct DayNightKey {
     hour: f32,
+    bg: &'static str,
     amb: &'static str,
     amb_int: f32,
     key: &'static str,
@@ -310,9 +338,19 @@ struct DayNightKey {
     rim_int: f32,
 }
 
-const fn dn(hour: f32, amb: &'static str, amb_int: f32, key: &'static str, key_int: f32, rim: &'static str, rim_int: f32) -> DayNightKey {
+const fn dn(
+    hour: f32,
+    bg: &'static str,
+    amb: &'static str,
+    amb_int: f32,
+    key: &'static str,
+    key_int: f32,
+    rim: &'static str,
+    rim_int: f32,
+) -> DayNightKey {
     DayNightKey {
         hour,
+        bg,
         amb,
         amb_int,
         key,
@@ -323,13 +361,13 @@ const fn dn(hour: f32, amb: &'static str, amb_int: f32, key: &'static str, key_i
 }
 
 static DAY_NIGHT: [DayNightKey; 7] = [
-    dn(0.0, "#6e84b0", 0.3, "#8baae6", 1.4, "#5a6c9e", 1.5),
-    dn(5.5, "#9f8ba8", 0.38, "#ffa876", 2.0, "#7f89c4", 1.4),
-    dn(7.5, "#e6c7b2", 0.52, "#ffd4a3", 2.5, "#b8c8e8", 1.3),
-    dn(13.0, "#eef3fa", 0.68, "#fffaf0", 2.8, "#d8e6fa", 1.2),
-    dn(18.0, "#df9e82", 0.48, "#ff9854", 2.7, "#a482cf", 1.6),
-    dn(20.5, "#788db8", 0.34, "#9ab4e8", 1.6, "#6d7db8", 1.6),
-    dn(24.0, "#6e84b0", 0.3, "#8baae6", 1.4, "#5a6c9e", 1.5),
+    dn(0.0, "#05070e", "#6e84b0", 0.3, "#8baae6", 1.4, "#5a6c9e", 1.5),
+    dn(5.5, "#0d0c14", "#9f8ba8", 0.38, "#ffa876", 2.0, "#7f89c4", 1.4),
+    dn(7.5, "#16151c", "#e6c7b2", 0.52, "#ffd4a3", 2.5, "#b8c8e8", 1.3),
+    dn(13.0, "#161a22", "#eef3fa", 0.68, "#fffaf0", 2.8, "#d8e6fa", 1.2),
+    dn(18.0, "#140b0e", "#df9e82", 0.48, "#ff9854", 2.7, "#a482cf", 1.6),
+    dn(20.5, "#070812", "#788db8", 0.34, "#9ab4e8", 1.6, "#6d7db8", 1.6),
+    dn(24.0, "#05070e", "#6e84b0", 0.3, "#8baae6", 1.4, "#5a6c9e", 1.5),
 ];
 
 #[cfg(test)]
@@ -357,5 +395,14 @@ mod tests {
         let a = LightRig::day_night(0.0);
         let b = LightRig::day_night(23.999);
         assert!((a.ambient - b.ambient).length() < 1e-2);
+        assert!((day_night_background(0.0) - day_night_background(23.999)).length() < 1e-3);
+    }
+
+    #[test]
+    fn srgb_round_trip() {
+        for v in [0.0_f32, 0.002, 0.2, 0.5, 1.0] {
+            assert!((srgb_to_linear(linear_to_srgb(v)) - v).abs() < 1e-4);
+        }
+        assert_eq!(preset_background(Scene3dEnvPreset::StudioDark), hex_linear("#07080b", Vec3::ZERO));
     }
 }
