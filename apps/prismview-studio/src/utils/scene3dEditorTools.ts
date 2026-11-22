@@ -7,7 +7,16 @@
  *   LMB click ............. select object (gizmo attaches to it)
  *   Gizmo drag ............ move / rotate / scale; ONE commit on release
  */
-import { Box3, GridHelper, Material, Object3D, PerspectiveCamera, Scene } from "three";
+import {
+  Box3,
+  BoxHelper,
+  GridHelper,
+  LineBasicMaterial,
+  Material,
+  Object3D,
+  PerspectiveCamera,
+  Scene,
+} from "three";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import {
   createEditorCamera,
@@ -71,6 +80,10 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     camera,
     initialView: host.initialView,
     wake: host.wake,
+    // Camera drag (Alt+LMB pan, RMB...) owns the pointer: the gizmo must not start a drag too
+    onNavigate: (active) => {
+      controls.enabled = !active;
+    },
   });
   const focusBox = new Box3();
 
@@ -90,6 +103,17 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   }
   scene.add(grid);
 
+  // Selection highlight: one BoxHelper reused for every selection (retargeted, never recreated)
+  const highlight = new BoxHelper(new Object3D(), 0x7cc4ff);
+  highlight.visible = false;
+  highlight.renderOrder = 998;
+  const highlightMat = highlight.material as LineBasicMaterial;
+  highlightMat.transparent = true;
+  highlightMat.opacity = 0.85;
+  highlightMat.depthTest = false;
+  highlightMat.toneMapped = false;
+  scene.add(highlight);
+
   let selectedId: string | null = null;
   let attachedPivot: Object3D | null = null;
   let dragging = false;
@@ -102,10 +126,14 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     if (pivot) controls.attach(pivot);
     else controls.detach();
     attachedPivot = pivot;
+    if (pivot) highlight.setFromObject(pivot);
+    highlight.visible = pivot !== null;
   };
 
   const onDraggingChanged = (ev: { value: boolean }) => {
     dragging = Boolean(ev.value);
+    // Free camera is off while the gizmo owns the pointer
+    cam.setEnabled(!dragging);
     if (!dragging && selectedId && attachedPivot) {
       const p = attachedPivot.position;
       attachedPivot.rotation.reorder("YXZ");
@@ -165,6 +193,8 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     cam.update(dt);
     // Selection may point at a pivot that was (re)created after a model reload
     attachSelected();
+    // Follows the object (gizmo drag, bindings, spin, model load); BoxHelper.update reuses a module Box3
+    if (highlight.visible) highlight.update();
   };
 
   const focusOn = (objectId: string): boolean => {
@@ -193,6 +223,9 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     controls.detach();
     scene.remove(gizmoHelper);
     controls.dispose();
+    scene.remove(highlight);
+    highlight.geometry.dispose();
+    highlightMat.dispose();
     scene.remove(grid);
     grid.geometry.dispose();
     for (const m of gridMats) m.dispose();

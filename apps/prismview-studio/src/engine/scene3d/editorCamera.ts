@@ -33,9 +33,13 @@ export interface EditorCameraHost {
   camera: PerspectiveCamera;
   initialView: Scene3DEditorView;
   wake: () => void;
+  /** Fires when a camera drag (look/orbit/pan) starts or ends */
+  onNavigate?: (active: boolean) => void;
 }
 
 export interface EditorCameraController {
+  /** Disables every camera input (drag, wheel, fly keys); aborts an active drag */
+  setEnabled: (enabled: boolean) => void;
   /** Integrates fly/easing and writes the camera transform. No allocations. */
   update: (dt: number) => void;
   /** Continuous frames needed (fly keys held or easing in progress) */
@@ -129,6 +133,7 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
   let kQ = false;
   let kE = false;
   let shiftHeld = false;
+  let enabled = true;
 
   const clearKeys = () => {
     kW = kA = kS = kD = kQ = kE = false;
@@ -137,7 +142,7 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
   const anyFlyKey = () => kW || kA || kS || kD || kQ || kE;
 
   const onPointerDown = (e: PointerEvent) => {
-    if (activePointer !== null) return;
+    if (!enabled || activePointer !== null) return;
     let kind: DragKind = null;
     if (e.button === 2) kind = e.altKey ? "orbit" : "look";
     else if (e.button === 1 || (e.button === 0 && e.altKey)) kind = "pan";
@@ -153,6 +158,7 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
     }
     e.preventDefault();
     easing = false;
+    host.onNavigate?.(true);
     host.wake();
   };
 
@@ -193,12 +199,13 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
       /* not captured */
     }
     if (kind === "look" || kind === "orbit") clearKeys();
+    host.onNavigate?.(false);
     host.wake();
   };
 
   const onWheel = (e: WheelEvent) => {
     e.preventDefault();
-    if (e.deltaY === 0) return;
+    if (!enabled || e.deltaY === 0) return;
     computeBasis();
     const step = Math.max(0.08, focusDistance * 0.12) * -Math.sign(e.deltaY);
     // Dolly: never push through the focus point
@@ -241,7 +248,7 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
 
   // Capture phase on window: while RMB is held, fly keys never reach Studio shortcuts
   const onKeyDown = (e: KeyboardEvent) => {
-    if (dragKind !== "look" && dragKind !== "orbit") return;
+    if (!enabled || (dragKind !== "look" && dragKind !== "orbit")) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     if (!setKey(e.key.toLowerCase(), true)) return;
     shiftHeld = e.shiftKey;
@@ -265,10 +272,25 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
       e.stopPropagation();
     }
   };
-  const onBlur = () => {
+  const releaseNavigation = () => {
+    const wasNavigating = dragKind !== null;
+    if (activePointer !== null) {
+      try {
+        canvas.releasePointerCapture(activePointer);
+      } catch {
+        /* not captured */
+      }
+    }
     clearKeys();
     dragKind = null;
     activePointer = null;
+    if (wasNavigating) host.onNavigate?.(false);
+  };
+  const onBlur = releaseNavigation;
+  const setEnabled = (on: boolean) => {
+    if (enabled === on) return;
+    enabled = on;
+    if (!on) releaseNavigation();
   };
 
   canvas.addEventListener("pointerdown", onPointerDown);
@@ -393,6 +415,7 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
   };
 
   return {
+    setEnabled,
     update,
     needsFrames: () => easing || anyFlyKey(),
     isNavigating: () => dragKind !== null,

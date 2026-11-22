@@ -1,8 +1,7 @@
-E2-L1 OK (gate ts: 0 erros novos).
-- Novo `src/engine/scene3d/editorCamera.ts`: `createEditorCamera(host)` → `EditorCameraController` {update, needsFrames, isNavigating, getState, setState, setView, focusBox, dispose}. RMB=olhar, Alt+RMB=orbitar em torno do ponto focal, RMB+WASD/QE=voar (Shift ×3), MMB/Alt+LMB=pan, scroll=dolly (não atravessa o foco). Vetores/flags pré-alocados (zero alocação por quadro); `contextmenu`/teclas (captura no window) só enquanto montado; dispose remove tudo.
-- Tipos `Scene3DCameraCapture`/`Scene3DEditorView` movidos para editorCamera.ts (re-exportados por `scene3dEditorTools`). Só importado por `scene3dEditorTools` (import dinâmico ⇒ chunk do editor, nunca desktop/widget).
-- `scene3dEditorTools.ts`: sessão delega câmera ao controlador; ficou só com clique-seleção LMB + gizmo + grade. Sessão ganhou `setCameraState`, `focusOn(id)` (Box3 pré-alocada); `needsFrames` = gizmo arrastando | câmera voando/animando | hold do commit.
-- `Scene3DLayer.tsx`: `Scene3DEditorApi` += `getCameraState`, `setCameraState(state, animate?)`, `focusOn(objectId)`; `captureCameraState` mantido como alias deprecated (StudioEditor usa). Editor agora respeita `fpsCap` do governador (piso 15 fps) e `dprCap` (FROZEN → NORMAL só no editor).
-- `setCameraState` ignora `fov` (o loop reaplica `cfg.camera.fov` todo quadro). Convenção orbital = `computeConfigCameraView`.
-- Fora do ROOM nada mudou (montagem continua `editMode3d && interactive && !isThumbnail`, `room3d` só passado em ROOM).
-- Próximos: E2-L2 seleção/gizmo, E2-L3 toolbar, E2-L4 persistir câmera (usar `getCameraState`).
+E2-L2 OK (gate ts: 0 erros novos).
+- Seleção por clique (Box3 broad-phase `performRaycastAt`), gizmo, commit único (`commitRoomTransform` → 1 undo, sem passo vazio) e sync Inspetor↔viewport já existiam (E1-L5/Fase 2); mantidos.
+- `editorCamera.ts`: host ganhou `onNavigate(active)`; controlador ganhou `setEnabled(bool)` (aborta drag, bloqueia pointer/wheel/teclas WASD). Blur/disable usam `releaseNavigation`.
+- `scene3dEditorTools.ts`: gizmo arrastando ⇒ `cam.setEnabled(false)`; câmera navegando ⇒ `controls.enabled=false` (Alt+LMB não inicia arrasto do gizmo).
+- Highlight: 1 `BoxHelper` único retargetado (`setFromObject` só ao trocar pivô, `update()` por quadro sem alocar); dispose de geometria+material em `dispose()` (ao sair do ROOM a sessão inteira é descartada).
+- Clique no vazio ⇒ `onSelectObject(null)`; Inspetor cai em `objs[0]` visualmente (selected3dObjectId=null).
+- Próximos: E2-L3 toolbar/atalhos (G/R/S/F já em StudioEditor), E2-L4 persistir câmera (`editorApiRef.getCameraState`).
