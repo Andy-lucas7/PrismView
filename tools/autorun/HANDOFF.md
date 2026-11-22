@@ -1,9 +1,8 @@
-E1-L5 OK (gate ts: 0 erros novos). Só `StudioInspector.tsx` mudou; o resto da UI de objetos (lista, +.glb via `pick_local_file`, undo) já existia de lotes anteriores.
-- Novo `Vec3Field` (inputs numéricos X/Y/Z, commit em blur/Enter, `onRecordStep`+`onCommit`+`onFlushSave`) substitui os 7 sliders de posição/rotação/escala; escala agora por eixo (min 0.01).
-- Duplicar/remover objeto no outliner usam `duplicateScene3DObject`/`removeScene3DObject` (religa filhos a raiz, apaga bindings do objeto).
-- `patchObjects` não grava mais o campo legado `cfg.modelSrc`.
-- Fundo: 3 botões TRANSPARENT/SOLID/ENVIRONMENT (antes faltava ENVIRONMENT) + cor para SOLID.
-- "+ Escultura" nasce com `autoRotateSpeed` 0 (era 0.22).
-- Não revogamos `blob:` ao excluir objeto (quebraria undo; só existe no fallback sem Tauri; limpeza geral em `blobUrlsRef`).
-- Resíduo: `tools/autorun/_splice_l5.mjs` (script não usado, pode apagar).
-- Pendente: `parentId` no runtime/outliner (UI sem hierarquia); motor Rust não lê `objectId`.
+E1-L6 OK (gate both: 0 erros novos). Só `src-tauri/src/lib.rs`.
+- Já existiam (lotes anteriores): export `bundle_layer_files` percorre `scene3d.objects[*].modelSrc` + `dynamicTextures[*].customSrc` (+ legado `scene3d.modelSrc`), nome `assets/{n}_{arquivo}` único + dedup por caminho; import `remap_imported_layers` reescreve tudo; `collect_layer_import_uuids` cobre objetos.
+- Novo: `import_prism_archive` chama `allow_project_media(&saved)` após salvar (libera todos os .glb extraídos no `ASSET_SCOPE`). `list_projects`/`load_project_from_disk` já varrem o JSON inteiro (liberam todos os objetos).
+- Novo teste `export_bundles_every_scene3d_object_glb_and_remap_restores_both` (2 .glb de mesmo nome em pastas distintas + dedup; não roda no gate, precisa `cargo test`).
+- Pacote antigo só com `scene3d.modelSrc` continua válido (migração TS cria `objects[0]`).
+- Arquivo fonte ausente no export é ignorado silenciosamente (caminho absoluto fica no JSON).
+- Resíduo: `tools/autorun/_splice_l5.mjs` pode ser apagado.
+- Pendente (outros lotes): `parentId` runtime/outliner; motor Rust não lê `objectId`.

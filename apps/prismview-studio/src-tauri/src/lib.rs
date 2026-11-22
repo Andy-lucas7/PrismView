@@ -2205,6 +2205,8 @@ async fn import_prism_archive(archive_path: String) -> Result<Value, String> {
             Ok(saved) => {
                 // Only remove old import folders if NO other project in projects/ references them
                 cleanup_unreferenced_import_uuids(&old_uuids);
+                // Libera no asset protocol todos os arquivos extraídos (.glb de cada objeto 3D etc.).
+                allow_project_media(&saved);
                 Ok(saved)
             }
             Err(err) => {
@@ -3164,6 +3166,64 @@ mod tests {
         assert!(has_cursor);
         assert!(!has_audio);
         assert!(!has_kbd);
+    }
+
+    #[test]
+    fn export_bundles_every_scene3d_object_glb_and_remap_restores_both() {
+        let base = std::env::temp_dir().join(format!("prismview-test-{}", Uuid::new_v4()));
+        let src_dir = base.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let a = src_dir.join("hero.glb");
+        // mesmo nome de arquivo em pastas diferentes não pode colidir
+        let sub = src_dir.join("other");
+        fs::create_dir_all(&sub).unwrap();
+        let b2 = sub.join("hero.glb");
+        fs::write(&a, b"AAAA").unwrap();
+        fs::write(&b2, b"BBBBBB").unwrap();
+        let project = serde_json::json!({
+            "id": "p1",
+            "title": "T",
+            "layers": [{ "scene3d": { "objects": [
+                { "id": "o1", "modelSrc": a.to_string_lossy() },
+                { "id": "o2", "modelSrc": b2.to_string_lossy() },
+                { "id": "o3", "modelSrc": a.to_string_lossy() }
+            ] } }]
+        });
+        let dest = base.join("out.prism");
+        export_prism_archive_sync(project, Some(dest.to_string_lossy().to_string())).unwrap();
+
+        let mut zip = ZipArchive::new(File::open(&dest).unwrap()).unwrap();
+        let mut raw = String::new();
+        zip.by_name("project.json")
+            .unwrap()
+            .read_to_string(&mut raw)
+            .unwrap();
+        let exported: Value = serde_json::from_str(&raw).unwrap();
+        let objs = exported.pointer("/layers/0/scene3d/objects").unwrap().as_array().unwrap();
+        let r1 = objs[0]["modelSrc"].as_str().unwrap().to_string();
+        let r2 = objs[1]["modelSrc"].as_str().unwrap().to_string();
+        let r3 = objs[2]["modelSrc"].as_str().unwrap().to_string();
+        assert!(r1.starts_with("assets/") && r2.starts_with("assets/"));
+        assert_ne!(r1, r2);
+        assert_eq!(r1, r3);
+
+        let extract = base.join("extract");
+        for rel in [&r1, &r2] {
+            let safe = safe_relative_subpath(rel).unwrap();
+            let out = extract.join(safe);
+            fs::create_dir_all(out.parent().unwrap()).unwrap();
+            let mut data = Vec::new();
+            zip.by_name(rel).unwrap().read_to_end(&mut data).unwrap();
+            fs::write(out, data).unwrap();
+        }
+        let mut layers = exported["layers"].as_array().unwrap().clone();
+        remap_imported_layers(&mut layers, &extract);
+        let objs = layers[0].pointer("/scene3d/objects").unwrap().as_array().unwrap();
+        let p1 = PathBuf::from(objs[0]["modelSrc"].as_str().unwrap());
+        let p2 = PathBuf::from(objs[1]["modelSrc"].as_str().unwrap());
+        assert_eq!(fs::read(&p1).unwrap(), b"AAAA");
+        assert_eq!(fs::read(&p2).unwrap(), b"BBBBBB");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
