@@ -160,6 +160,28 @@ interface LoadedObjectRuntime {
   error: string | null;
 }
 
+/**
+ * Binding target resolved by `objectId` + `targetName` against the owning object's index.
+ * Rebuilt only when the config or a model index changes (`targetsRev`), never per frame.
+ * `rt === null` ⇒ owner object not loaded yet: the binding is skipped (never falls onto another object).
+ */
+interface ResolvedBindingTarget {
+  rt: LoadedObjectRuntime | null;
+  node: Object3D | null;
+  mats: readonly EmissiveMatEntry[];
+}
+
+const EMPTY_MATS: readonly EmissiveMatEntry[] = [];
+const UNRESOLVED_TARGET: ResolvedBindingTarget = { rt: null, node: null, mats: EMPTY_MATS };
+
+/** Owner of a binding: its `objectId` when that object exists, otherwise the first object (≤v2 compat). */
+function bindingOwnerId(objs: readonly Scene3DObject[], objectId: string | undefined): string | null {
+  if (objectId) {
+    for (const o of objs) if (o.id === objectId) return objectId;
+  }
+  return objs[0]?.id ?? null;
+}
+
 function dayNightHourFor(cfg: Scene3DConfig): number {
   if (typeof cfg.dayNightHourOverride === "number" && Number.isFinite(cfg.dayNightHourOverride)) {
     return cfg.dayNightHourOverride;
@@ -448,6 +470,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     hoveredObjectId: string | null;
     lastHoveredName: string | null;
     bindingStates: Map<string, BindingRuntimeState>;
+    /** Bumped whenever an object's model index appears/changes/disappears: re-resolves binding targets */
+    targetsRev: number;
     appliedNodeQuats: Map<Object3D, Quaternion>;
     /** NODE_MOVE_OFFSET deltas, undone before mixer.update() exactly like appliedNodeQuats */
     appliedNodePosOffsets: Map<Object3D, Vector3>;
@@ -571,6 +595,10 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     let cachedCursorBindings: ReactiveBinding3D[] = EMPTY_BINDINGS;
     let cachedSignalBindings: ReactiveBinding3D[] = EMPTY_BINDINGS;
     let cachedHasHoverBinding = false;
+    // Targets resolved by objectId + targetName (parallel to the cached binding lists)
+    let cachedTargetsRev = -1;
+    let cachedSignalTargets: ResolvedBindingTarget[] = [];
+    let cachedCursorTargets: ResolvedBindingTarget[] = [];
     // Last-applied camera / exposure state
     let viewCfg: Scene3DConfig | null = null;
     let viewAz = NaN;
@@ -668,13 +696,15 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
 
     const applyScalarTarget = (
       b: ReactiveBinding3D,
-      targetRt: LoadedObjectRuntime,
+      target: ResolvedBindingTarget,
       st: BindingRuntimeState,
       rawVal: number,
       bAlpha: number
     ) => {
-      const idx = targetRt.modelIndex;
-      if (!idx) return;
+      const targetRt = target.rt;
+      const idx = targetRt?.modelIndex;
+      if (!targetRt || !idx) return;
+      const node = target.node;
       if (b.targetType === "PLAY_CLIP") {
         const active = rawVal >= 0.35;
         if (active && !st.wasHovered) {
@@ -698,16 +728,11 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         anyBindingMoving = true;
       }
       if (b.targetType === "NODE_SCALE_PULSE") {
-        const node = idx.nodesByName.get(b.targetName || "__ROOT__");
         if (node) {
           nodeScaleAccum.set(node, (nodeScaleAccum.get(node) ?? 0) + st.weight * (b.strength || 0.16));
         }
       } else if (b.targetType === "EMISSIVE_GLOW") {
-        const mats =
-          !b.targetName || b.targetName === "*"
-            ? idx.emissiveMats
-            : idx.emissiveByName.get(b.targetName) ?? [];
-        for (const m of mats) {
+        for (const m of target.mats) {
           matGlowAccum.set(m, (matGlowAccum.get(m) ?? 0) + st.weight * (b.strength || 1.4));
         }
       } else if (b.targetType === "MORPH_WEIGHT" && b.targetName) {
@@ -722,35 +747,67 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         );
       } else if (b.targetType === "NODE_ROTATE_SPIN") {
         st.spin = (st.spin + st.weight * (b.strength || 2.0) * curDt) % (Math.PI * 2);
-        const node = idx.nodesByName.get(b.targetName || "__ROOT__");
         if (node) addAxisRotation(node, axisOf(b), st.spin * signOf(b));
       } else if (b.targetType === "NODE_ROTATE_SWING") {
-        const node = idx.nodesByName.get(b.targetName || "__ROOT__");
         if (node) {
           addAxisRotation(node, axisOf(b), st.weight * (b.strength || 25) * DEG2RAD * signOf(b));
         }
       } else if (b.targetType === "NODE_MOVE_OFFSET") {
-        const node = idx.nodesByName.get(b.targetName || "__ROOT__");
         if (node) {
           addAxisOffset(idx, node, axisOf(b), st.weight * (b.strength || 0.15) * signOf(b));
         }
       }
     };
 
-    const resolveTargetRuntime = (
+    const resolveBindingTarget = (
       eng: NonNullable<typeof engineRef.current>,
-      orderedObjs: Scene3DObject[],
-      objectId?: string
-    ): LoadedObjectRuntime | null => {
-      if (objectId) {
-        const direct = eng.objectsMap.get(objectId);
-        if (direct?.modelIndex) return direct;
+      objs: Scene3DObject[],
+      b: ReactiveBinding3D
+    ): ResolvedBindingTarget => {
+      const ownerId = bindingOwnerId(objs, b.objectId);
+      const rt = ownerId ? eng.objectsMap.get(ownerId) ?? null : null;
+      const idx = rt?.modelIndex;
+      if (!rt || !idx) return UNRESOLVED_TARGET;
+      return {
+        rt,
+        node: idx.nodesByName.get(b.targetName || "__ROOT__") ?? null,
+        mats:
+          !b.targetName || b.targetName === "*"
+            ? idx.emissiveMats
+            : idx.emissiveByName.get(b.targetName) ?? EMPTY_MATS,
+      };
+    };
+
+    /** Rebuilds binding lists on config change and re-resolves targets on load/remove (`targetsRev`). */
+    const ensureBindingCache = (eng: NonNullable<typeof engineRef.current>, cfg: Scene3DConfig) => {
+      if (cfg !== cachedCfg || cachedThumb !== isThumbRef.current) {
+        cachedCfg = cfg;
+        cachedThumb = isThumbRef.current;
+        cachedObjs = normalizeScene3DObjects(cfg);
+        const enabled = cachedThumb ? EMPTY_BINDINGS : (cfg.bindings ?? []).filter((b) => b.enabled);
+        cachedCursorBindings = enabled.filter(
+          (b) => b.source === "CURSOR_LOOK" || b.source === "HOVER_MESH" || b.source === "CLICK_MESH"
+        );
+        cachedSignalBindings = enabled.filter(
+          (b) =>
+            b.source === "AUDIO_BASS" ||
+            b.source === "AUDIO_MID" ||
+            b.source === "AUDIO_TREBLE" ||
+            b.source === "KEY_PULSE" ||
+            b.source === "MEDIA_PLAYING" ||
+            b.source === "CPU_USAGE"
+        );
+        cachedHasHoverBinding = cachedCursorBindings.some((b) => b.source === "HOVER_MESH");
+        morphAccumPerRt.clear();
+        cachedTargetsRev = -1;
       }
-      for (const o of orderedObjs) {
-        const rt = eng.objectsMap.get(o.id);
-        if (rt?.modelIndex) return rt;
+      if (cachedTargetsRev !== eng.targetsRev) {
+        cachedTargetsRev = eng.targetsRev;
+        cachedSignalTargets = cachedSignalBindings.map((b) => resolveBindingTarget(eng, cachedObjs, b));
+        cachedCursorTargets = cachedCursorBindings.map((b) => resolveBindingTarget(eng, cachedObjs, b));
+        // Runtimes may have been replaced/removed: drop their morph accumulators
+        morphAccumPerRt.clear();
       }
-      return null;
     };
 
     const getBindingState = (
@@ -807,20 +864,26 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       if (!eng || disposed || eng.contextLost || isThumbRef.current) return;
       if (interactiveRef.current && !testModeRef.current) return;
       if (!powerCapsRef.current.allowCursorBindings) return;
-      const bindings = (configRef.current.bindings ?? []).filter(
-        (b) => b.enabled && b.source === "CLICK_MESH"
-      );
-      if (bindings.length === 0) return;
+      ensureBindingCache(eng, configRef.current);
+      let hasClick = false;
+      for (const b of cachedCursorBindings) {
+        if (b.source === "CLICK_MESH") {
+          hasClick = true;
+          break;
+        }
+      }
+      if (!hasClick) return;
 
       const hit = performRaycastAt(eng, nx, ny);
       if (!hit) return;
 
-      const orderedObjs = normalizeScene3DObjects(configRef.current);
       let triggered = false;
-      for (const b of bindings) {
-        const targetRt = resolveTargetRuntime(eng, orderedObjs, b.objectId);
-        if (!targetRt) continue;
-        if (b.objectId && hit.objectId !== b.objectId) continue;
+      for (let i = 0; i < cachedCursorBindings.length; i++) {
+        const b = cachedCursorBindings[i];
+        if (b.source !== "CLICK_MESH") continue;
+        const targetRt = cachedCursorTargets[i]?.rt;
+        // The click must land on the binding's own object (objectId, or objects[0] when unset)
+        if (!targetRt || hit.objectId !== targetRt.id) continue;
         if (!matchesMeshTarget(hit.object, b.sourceNode, targetRt.modelRoot)) continue;
         const st = getBindingState(eng, b.id);
         triggered = true;
@@ -965,26 +1028,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       quatPoolUsed = 0;
       vecPoolUsed = 0;
       curDt = dt;
-      if (cfg !== cachedCfg || cachedThumb !== isThumbRef.current) {
-        cachedCfg = cfg;
-        cachedThumb = isThumbRef.current;
-        cachedObjs = normalizeScene3DObjects(cfg);
-        const enabled = cachedThumb ? EMPTY_BINDINGS : (cfg.bindings ?? []).filter((b) => b.enabled);
-        cachedCursorBindings = enabled.filter(
-          (b) => b.source === "CURSOR_LOOK" || b.source === "HOVER_MESH" || b.source === "CLICK_MESH"
-        );
-        cachedSignalBindings = enabled.filter(
-          (b) =>
-            b.source === "AUDIO_BASS" ||
-            b.source === "AUDIO_MID" ||
-            b.source === "AUDIO_TREBLE" ||
-            b.source === "KEY_PULSE" ||
-            b.source === "MEDIA_PLAYING" ||
-            b.source === "CPU_USAGE"
-        );
-        cachedHasHoverBinding = cachedCursorBindings.some((b) => b.source === "HOVER_MESH");
-        morphAccumPerRt.clear();
-      }
+      ensureBindingCache(eng, cfg);
       const orderedObjs = cachedObjs;
       let anyBasePlaying = false;
       let anyOverridePlaying = false;
@@ -1161,9 +1205,10 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       morphAccumPerRt.forEach((m) => m.clear());
       const sig = reactiveSignalRef?.current ?? DEFAULT_REACTIVE_SIGNAL;
       if (eng.objectsMap.size > 0) {
-        for (const b of signalBindings) {
-          const targetRt = resolveTargetRuntime(eng, orderedObjs, b.objectId);
-          if (!targetRt?.modelIndex) continue;
+        for (let i = 0; i < signalBindings.length; i++) {
+          const b = signalBindings[i];
+          const target = cachedSignalTargets[i];
+          if (!target?.rt) continue;
           const st = getBindingState(eng, b.id);
           const bAlpha = 1 - Math.exp(-Math.max(0.02, Math.min(0.45, b.smoothing || 0.18)) * 60 * dt);
           const rawVal =
@@ -1180,13 +1225,16 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
                 ? 1
                 : 0
               : Math.max(0, Math.min(1, (cpuPercentRef.current || 0) / 100));
-          applyScalarTarget(b, targetRt, st, rawVal, bAlpha);
+          applyScalarTarget(b, target, st, rawVal, bAlpha);
         }
 
-        for (const b of cursorBindings) {
-          const targetRt = resolveTargetRuntime(eng, orderedObjs, b.objectId);
-          if (!targetRt?.modelIndex) continue;
-          const idx = targetRt.modelIndex;
+        for (let i = 0; i < cursorBindings.length; i++) {
+          const b = cursorBindings[i];
+          const target = cachedCursorTargets[i];
+          const targetRt = target?.rt;
+          const idx = targetRt?.modelIndex;
+          if (!target || !targetRt || !idx) continue;
+          const node = target.node;
           const st = getBindingState(eng, b.id);
           const bAlpha = 1 - Math.exp(-Math.max(0.02, Math.min(0.45, b.smoothing || 0.12)) * 60 * dt);
 
@@ -1203,7 +1251,6 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
             if (st.yaw !== prevYaw || st.pitch !== prevPitch) {
               anyBindingMoving = true;
             }
-            const node = idx.nodesByName.get(b.targetName || "__ROOT__");
             if (node && (Math.abs(st.yaw) > 1e-6 || Math.abs(st.pitch) > 1e-6)) {
               tmpEuler.set(st.pitch, st.yaw, 0, "YXZ");
               tmpQuat.setFromEuler(tmpEuler);
@@ -1213,10 +1260,11 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           }
 
           if (b.source === "HOVER_MESH") {
-            const objectMatches = !b.objectId || eng.hoveredObjectId === b.objectId;
+            // Hover counts only on the binding's own object (objectId, or objects[0] when unset)
             const isHovered =
-              objectMatches && matchesMeshTarget(eng.hoveredObject, b.sourceNode, targetRt.modelRoot);
-            applyScalarTarget(b, targetRt, st, isHovered ? 1 : 0, bAlpha);
+              eng.hoveredObjectId === targetRt.id &&
+              matchesMeshTarget(eng.hoveredObject, b.sourceNode, targetRt.modelRoot);
+            applyScalarTarget(b, target, st, isHovered ? 1 : 0, bAlpha);
             continue;
           }
 
@@ -1233,7 +1281,6 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
               } else {
                 st.pulse = 0;
               }
-              const node = idx.nodesByName.get(b.targetName || "__ROOT__");
               if (node && st.pulse > 0.001) {
                 if (b.targetType === "NODE_SCALE_PULSE") {
                   nodeScaleAccum.set(node, (nodeScaleAccum.get(node) ?? 0) + st.pulse * (b.strength || 0.16));
@@ -1247,7 +1294,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
                 }
               }
             } else if (b.targetType === "EMISSIVE_GLOW" || b.targetType === "MORPH_WEIGHT") {
-              applyScalarTarget(b, targetRt, st, st.toggled ? 1 : 0, bAlpha);
+              applyScalarTarget(b, target, st, st.toggled ? 1 : 0, bAlpha);
             }
           }
         }
@@ -1374,6 +1421,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       hoveredObjectId: null,
       lastHoveredName: null,
       bindingStates: new Map(),
+      targetsRev: 0,
       appliedNodeQuats: new Map(),
       appliedNodePosOffsets: new Map(),
       rafId: null,
@@ -1590,6 +1638,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       rt.activeClipKey = "";
       rt.clips = [];
       rt.defaultRefs = null;
+      if (rt.modelIndex) eng.targetsRev++;
       rt.modelIndex = null;
       rt.spinAngle = 0;
       rt.error = null;
@@ -1680,6 +1729,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         rt!.modelRoot = sculp.group;
         rt!.defaultRefs = sculp;
         rt!.modelIndex = buildModelIndex(obj.id, sculp.group, [], true);
+        eng.targetsRev++;
         rt!.error = errMsg;
         rt!.sourceKey = nextKey;
         rt!.loadKey = "";
@@ -1744,6 +1794,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           }
 
           capturedRt.modelIndex = buildModelIndex(obj.id, holder, capturedRt.clips, false);
+          eng.targetsRev++;
           capturedRt.sourceKey = nextKey;
           capturedRt.loadKey = "";
 
@@ -1780,6 +1831,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           capturedRt.modelRoot = sculp.group;
           capturedRt.defaultRefs = sculp;
           capturedRt.modelIndex = buildModelIndex(obj.id, sculp.group, [], true);
+          eng.targetsRev++;
           capturedRt.error = msg;
           capturedRt.sourceKey = nextKey;
           capturedRt.loadKey = "";
@@ -1938,6 +1990,10 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     });
 
     const activeUrls = new Set<string>();
+    const pendingLoads = new Map<
+      string,
+      { rt: LoadedObjectRuntime; matName: string; asEmissive: boolean }[]
+    >();
 
     const applyTexToTargetRt = (
       rt: LoadedObjectRuntime,
@@ -1976,14 +2032,19 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         activeUrls.add(cacheKey);
 
         const cached = eng.dynamicTexCache.get(cacheKey);
+        const waiting = pendingLoads.get(cacheKey);
         if (cached) {
           applyTexToTargetRt(rt, rule.materialName, cached, Boolean(rule.emissiveMap));
+        } else if (waiting) {
+          // Same texture already loading for another object/rule: share it (one GPU texture per URL)
+          waiting.push({ rt, matName: rule.materialName, asEmissive: Boolean(rule.emissiveMap) });
         } else {
-          const capturedRt = rt;
+          const targets = [{ rt, matName: rule.materialName, asEmissive: Boolean(rule.emissiveMap) }];
+          pendingLoads.set(cacheKey, targets);
           eng.texLoader.load(
             url,
             (loaded) => {
-              if (cancelled || engineRef.current !== eng || !eng.objectsMap.has(obj.id)) {
+              if (cancelled || engineRef.current !== eng) {
                 loaded.dispose();
                 return;
               }
@@ -1991,7 +2052,11 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
               loaded.flipY = isProcedural;
               loaded.needsUpdate = true;
               eng.dynamicTexCache.set(cacheKey, loaded);
-              applyTexToTargetRt(capturedRt, rule.materialName, loaded, Boolean(rule.emissiveMap));
+              for (const t of targets) {
+                // Object removed or model swapped while loading: skip it (the effect re-runs on reload)
+                if (eng.objectsMap.get(t.rt.id) !== t.rt) continue;
+                applyTexToTargetRt(t.rt, t.matName, loaded, t.asEmissive);
+              }
             },
             undefined,
             () => {
