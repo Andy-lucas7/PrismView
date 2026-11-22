@@ -36,10 +36,14 @@ export function disposeObject3D(root: Object3D, skipTextures?: ReadonlySet<Textu
   const geometries = new Set<BufferGeometry>();
   const materials = new Set<Material>();
   const textures = new Set<Texture>();
+  const skeletons = new Set<{ dispose: () => void }>();
 
   root.traverse((obj) => {
     const mesh = obj as Mesh;
     if (mesh.geometry) geometries.add(mesh.geometry);
+    // SkinnedMesh: the skeleton owns a bone DataTexture (GPU) when bone textures are used
+    const skeleton = (obj as Object3D & { skeleton?: { dispose: () => void } }).skeleton;
+    if (skeleton) skeletons.add(skeleton);
     const matOrArr = mesh.material as Material | Material[] | undefined;
     if (matOrArr) {
       const list = Array.isArray(matOrArr) ? matOrArr : [matOrArr];
@@ -57,6 +61,7 @@ export function disposeObject3D(root: Object3D, skipTextures?: ReadonlySet<Textu
   textures.forEach((t) => t.dispose());
   materials.forEach((m) => m.dispose());
   geometries.forEach((g) => g.dispose());
+  skeletons.forEach((s) => s.dispose());
 }
 
 export interface EmissiveMatEntry {

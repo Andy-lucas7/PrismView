@@ -142,6 +142,8 @@ const AXIS_VECTORS: Record<Scene3DAxis, Vector3> = {
 interface LoadedObjectRuntime {
   id: string;
   sourceKey: string;
+  /** Key (`kind|modelSrc|variant`) of the load currently in flight; "" when idle (AUDITORIA 1.6). */
+  loadKey: string;
   loadToken: number;
   pivot: Group;
   modelRoot: Object3D | null;
@@ -1452,13 +1454,20 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         eng.editor = null;
         const sharedTextures = new Set(eng.dynamicTexCache.values());
         eng.objectsMap.forEach((rt) => {
+          rt.loadToken++;
+          rt.loadKey = "";
           rt.mixer?.stopAllAction();
+          if (rt.mixer) rt.mixer.uncacheRoot(rt.mixer.getRoot());
+          rt.mixer = null;
           restoreBaseMaps(rt.modelIndex);
           if (rt.modelRoot) {
             rt.pivot.remove(rt.modelRoot);
             disposeObject3D(rt.modelRoot, sharedTextures);
+            rt.modelRoot = null;
           }
           eng.stagePivot.remove(rt.pivot);
+          // per-object loader reference (taken when the runtime was created)
+          releaseSharedLoaders();
         });
         eng.objectsMap.clear();
         eng.dynamicTexCache.forEach((tex) => tex.dispose());
@@ -1602,13 +1611,18 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       }
     };
 
-    // Dispose removed objects
+    let syncChanged = false;
+
+    // Dispose removed objects (in-flight loads are invalidated by the token bump and disposed on arrival)
     Array.from(eng.objectsMap.entries()).forEach(([id, rt]) => {
       if (!keepIds.has(id)) {
         rt.loadToken++;
+        rt.loadKey = "";
         clearRuntimeModel(rt);
         eng.stagePivot.remove(rt.pivot);
         eng.objectsMap.delete(id);
+        releaseSharedLoaders();
+        syncChanged = true;
       }
     });
 
@@ -1616,8 +1630,6 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       const curObjs = normalizeScene3DObjects(configRef.current);
       onInspectRef.current?.(buildAggregatedInspectInfo(eng.objectsMap, curObjs));
     };
-
-    let syncChanged = false;
 
     for (const obj of orderedObjs) {
       let rt = eng.objectsMap.get(obj.id);
@@ -1628,6 +1640,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         rt = {
           id: obj.id,
           sourceKey: "",
+          loadKey: "",
           loadToken: 0,
           pivot,
           modelRoot: null,
@@ -1644,11 +1657,13 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           error: null,
         };
         eng.objectsMap.set(obj.id, rt);
+        // one shared-loader reference per live object runtime (released on removal / engine dispose)
+        retainSharedLoaders();
         syncChanged = true;
       }
 
       const nextKey = `${obj.kind}|${obj.modelSrc}|${obj.showcaseVariant ?? ""}`;
-      if ((rt as LoadedObjectRuntime & { loadingKey?: string }).loadingKey === nextKey) {
+      if (rt.loadKey === nextKey) {
         continue;
       }
       if (rt.sourceKey === nextKey && rt.modelRoot) {
@@ -1667,7 +1682,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         rt!.modelIndex = buildModelIndex(obj.id, sculp.group, [], true);
         rt!.error = errMsg;
         rt!.sourceKey = nextKey;
-        (rt as LoadedObjectRuntime & { loadingKey?: string }).loadingKey = "";
+        rt!.loadKey = "";
         syncChanged = true;
       };
 
@@ -1684,7 +1699,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
 
       const myToken = ++rt.loadToken;
       rt.sourceKey = "";
-      (rt as LoadedObjectRuntime & { loadingKey?: string }).loadingKey = nextKey;
+      rt.loadKey = nextKey;
+      syncChanged = true; // previous model was cleared: refresh inspect/stats while the new one loads
       const capturedRt = rt;
 
       // 1.6: this load is intentionally NOT cancelled when the effect re-runs. `loadingKey` marks it
@@ -1696,7 +1712,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           if (
             engineRef.current !== eng ||
             capturedRt.loadToken !== myToken ||
-            !eng.objectsMap.has(obj.id)
+            eng.objectsMap.get(obj.id) !== capturedRt
           ) {
             disposeObject3D(gltf.scene);
             return;
@@ -1729,7 +1745,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
 
           capturedRt.modelIndex = buildModelIndex(obj.id, holder, capturedRt.clips, false);
           capturedRt.sourceKey = nextKey;
-          (capturedRt as LoadedObjectRuntime & { loadingKey?: string }).loadingKey = "";
+          capturedRt.loadKey = "";
 
           const latestObj =
             normalizeScene3DObjects(configRef.current).find((x) => x.id === obj.id) ?? obj;
@@ -1753,7 +1769,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           if (
             engineRef.current !== eng ||
             capturedRt.loadToken !== myToken ||
-            !eng.objectsMap.has(obj.id)
+            eng.objectsMap.get(obj.id) !== capturedRt
           ) {
             return;
           }
@@ -1766,7 +1782,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           capturedRt.modelIndex = buildModelIndex(obj.id, sculp.group, [], true);
           capturedRt.error = msg;
           capturedRt.sourceKey = nextKey;
-          (capturedRt as LoadedObjectRuntime & { loadingKey?: string }).loadingKey = "";
+          capturedRt.loadKey = "";
           emitInspect();
           setModelLoadRev((r) => r + 1);
           eng.wake();
@@ -1774,7 +1790,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       );
     }
 
-    if (syncChanged || eng.objectsMap.size === orderedObjs.length) {
+    if (syncChanged) {
       emitInspect();
       setModelLoadRev((r) => r + 1);
       eng.wake();
