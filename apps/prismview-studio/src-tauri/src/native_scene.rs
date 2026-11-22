@@ -560,10 +560,54 @@ fn migrate_scene3d_v3(map: &mut Map<String, Value>) {
     if !map.get("backgroundColor").is_some_and(Value::is_string) {
         map.insert("backgroundColor".into(), json!("#07080b"));
     }
+    normalize_camera(map);
     for key in LEGACY_SCENE3D_KEYS {
         map.remove(key);
     }
     map.insert("schemaVersion".into(), json!(SCENE3D_SCHEMA_VERSION));
+}
+
+/// Espelho do ramo `camera` de `normalizeScene3DConfig`: projeto sem `camera` (ou campos
+/// ausentes) mantém o enquadramento padrão do Estúdio (`defaultScene3D`: modelo externo 0°/8°,
+/// escultura procedural 22°/14°); `target` sempre preenchido (`targetY` em sincronia).
+fn normalize_camera(map: &mut Map<String, Value>) {
+    let procedural = map
+        .get("objects")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|o| o.get("kind"))
+        .and_then(Value::as_str)
+        == Some("SHOWCASE");
+    let (az, el) = if procedural { (22.0, 14.0) } else { (0.0, 8.0) };
+    let mut cam = match map.remove("camera") {
+        Some(Value::Object(c)) => c,
+        _ => Map::new(),
+    };
+    for (key, default) in [
+        ("fov", 42.0),
+        ("distance", 4.8),
+        ("azimuthDeg", az),
+        ("elevationDeg", el),
+        ("orbitParallaxX", 12.0),
+        ("orbitParallaxY", 7.0),
+        ("damping", 0.08),
+    ] {
+        if !cam.get(key).and_then(Value::as_f64).is_some_and(f64::is_finite) {
+            cam.insert(key.into(), json!(default));
+        }
+    }
+    let target_y = number_in(&cam, "targetY", 0.0);
+    let target = match cam.get("target").and_then(Value::as_array) {
+        Some(t) if t.len() == 3 && t.iter().all(|v| v.as_f64().is_some_and(f64::is_finite)) => t.clone(),
+        _ => vec![json!(0.0), json!(target_y), json!(0.0)],
+    };
+    cam.insert("targetY".into(), target[1].clone());
+    cam.insert("target".into(), Value::Array(target));
+    map.insert("camera".into(), Value::Object(cam));
+}
+
+fn number_in(map: &Map<String, Value>, key: &str, default: f64) -> f64 {
+    map.get(key).and_then(Value::as_f64).filter(|v| v.is_finite()).unwrap_or(default)
 }
 
 fn glass_plate(node: &mut Value, glass: &Value) {

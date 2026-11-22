@@ -1,6 +1,7 @@
-E2-L3 OK (gate ts: 0 erros novos).
-- `StudioEditor`: estado único `scene3dEditMode` ("LAYOUT"|"ROOM"|"TEST", tipo `Scene3DEditMode` exportado de `Scene3DLayer.tsx`); `room3dMode`/`test3dMode` agora derivados. Seletor de 3 modos só aparece com SCENE_3D selecionada (ou fora de LAYOUT, p/ poder sair); rótulo "Testar Interações".
-- ROOM: `reactiveNeeds` vazio (sensores WASAPI/teclado off) + `Scene3DLayer` ignora `signalBindings` quando há `editor`. TEST: câmera do wallpaper travada (sem editor) + cursor/clique do preview ao vivo (já existia).
-- Atalhos: `useKeyboardShortcuts` ganhou `room?: RoomShortcuts` (G/R/S/F/Del/Ctrl+D/Esc, ignora repeat); com `room` definido os atalhos 2D não disparam, fora de ROOM os de sala não existem. Listener ad-hoc removido.
-- Toolbar ROOM: + Duplicar, Excluir (1 `patchLayer` "discrete" = 1 undo), toggle Esqueleto (`showSkeleton3d`, só estado local; E3-L3 liga o helper). Grade já era `GridHelper` só no chunk `three-editor`, `showGrid3d` local.
-- Próximo E2-L4: `editorApiRef.captureCameraState` / `saveWallpaperCamera` já existem em StudioEditor.
+E2-L4 OK (gate both: 0 erros novos; Rust NAO VALIDADO em máquina).
+- A câmera já era órbita persistida (CONTRATO FINAL: target+distance+azimuth+elevation+fov+orbitParallaxX/Y+damping = position derivada). Lotes anteriores já tinham: `saveWallpaperCamera` (1 patch "discrete" = 1 undo), `computeConfigCameraView` (preview fora de ROOM parte do enquadramento salvo + paralaxe amortecida, sem alocar), sliders FOV/Amplitude H/V/Suavidade no Inspetor, motor `camera_view` + órbita por cursor (mesma fórmula do TS).
+- Mudou: botão ROOM renomeado "Definir Câmera do Wallpaper" (StudioEditor).
+- `native_scene.rs`: `normalize_camera` (espelha normalizeScene3DConfig: projeto sem `camera`/campos ausentes → enquadramento padrão do Estúdio, 22°/14° se 1º objeto SHOWCASE, senão 0°/8°; `target` sempre preenchido) + `number_in`.
+- `config.rs` `Scene3dCamera::default` agora = padrão do Estúdio (fov 42, dist 4.8, el 8, parallax 12/7) em vez de 35/4/10/0.
+- Máquina: confirmar que reabrir projeto e wallpaper nativo coincidem com o enquadramento do preview.
+- Próximo (E3): ações de ossos; nada de câmera pendente.

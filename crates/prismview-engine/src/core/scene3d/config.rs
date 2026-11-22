@@ -93,14 +93,15 @@ pub struct Scene3dCamera {
 impl Default for Scene3dCamera {
     fn default() -> Self {
         Self {
-            fov: 35.0,
-            distance: 4.0,
+            // Mesmo enquadramento padrão do Estúdio (`defaultScene3D`, modelo externo).
+            fov: 42.0,
+            distance: 4.8,
             azimuth_deg: 0.0,
-            elevation_deg: 10.0,
+            elevation_deg: 8.0,
             target_y: 0.0,
             target: None,
-            orbit_parallax_x: 0.0,
-            orbit_parallax_y: 0.0,
+            orbit_parallax_x: 12.0,
+            orbit_parallax_y: 7.0,
             damping: 0.08,
         }
     }

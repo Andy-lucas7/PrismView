@@ -1958,11 +1958,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               <button
                 type="button"
                 onClick={saveWallpaperCamera}
-                title="Grava o enquadramento atual como câmera do wallpaper no Desktop"
+                title="Grava o enquadramento atual (posição, alvo e FOV) como câmera do wallpaper"
                 className="rounded-full px-3 py-1 bg-white text-black flex items-center gap-1.5 font-medium"
               >
                 <Camera className="w-3.5 h-3.5" />
-                Salvar Câmera do Wallpaper
+                Definir Câmera do Wallpaper
               </button>
             </div>
           )}
