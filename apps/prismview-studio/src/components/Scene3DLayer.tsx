@@ -1626,9 +1626,10 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     const orderedObjs = normalizeScene3DObjects(configRef.current);
     const keepIds = new Set(orderedObjs.map((o) => o.id));
 
+    /** Drops applied rotation AND move-offset deltas of nodes under `pivot` (model being disposed) */
     const purgeObjectQuats = (pivot: Group) => {
       const toDelete: Object3D[] = [];
-      eng.appliedNodeQuats.forEach((_, node) => {
+      const collect = (_: unknown, node: Object3D) => {
         let cur: Object3D | null = node;
         while (cur) {
           if (cur === pivot) {
@@ -1637,8 +1638,13 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           }
           cur = cur.parent;
         }
-      });
-      for (const n of toDelete) eng.appliedNodeQuats.delete(n);
+      };
+      eng.appliedNodeQuats.forEach(collect);
+      eng.appliedNodePosOffsets.forEach(collect);
+      for (const n of toDelete) {
+        eng.appliedNodeQuats.delete(n);
+        eng.appliedNodePosOffsets.delete(n);
+      }
     };
 
     const clearRuntimeModel = (rt: LoadedObjectRuntime) => {

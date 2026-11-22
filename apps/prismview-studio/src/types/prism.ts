@@ -986,6 +986,91 @@ function finiteOr(n: unknown, fallback: number): number {
   return typeof n === "number" && Number.isFinite(n) ? n : fallback;
 }
 
+/** Default `strength` per target (same fallbacks the Scene3DLayer runtime uses) */
+export const SCENE3D_BINDING_DEFAULT_STRENGTH: Record<Scene3DBindingTarget, number> = {
+  NODE_LOOK_AT: 20,
+  PLAY_CLIP: 1,
+  EMISSIVE_GLOW: 1.4,
+  NODE_SCALE_PULSE: 0.16,
+  MORPH_WEIGHT: 1,
+  NODE_ROTATE_SPIN: 2,
+  NODE_ROTATE_SWING: 25,
+  NODE_MOVE_OFFSET: 0.15,
+};
+export const SCENE3D_BINDING_SMOOTHING_MIN = 0.02;
+export const SCENE3D_BINDING_SMOOTHING_MAX = 0.45;
+
+function isScene3DAxis(v: unknown): v is Scene3DAxis {
+  return v === "X" || v === "Y" || v === "Z";
+}
+
+function usesBindingAxis(t: Scene3DBindingTarget): boolean {
+  return t === "NODE_ROTATE_SWING" || t === "NODE_MOVE_OFFSET" || t === "NODE_ROTATE_SPIN";
+}
+
+/**
+ * Binding normalizer (idempotent: same ref when already valid). Axis-driven targets
+ * (SWING / MOVE_OFFSET / SPIN) always get `axis` ("Y") and a boolean `invertAxis`;
+ * strength/smoothing are made finite and smoothing clamped to the spring range.
+ */
+export function normalizeReactiveBinding3D(b: ReactiveBinding3D): ReactiveBinding3D {
+  const fallback = SCENE3D_BINDING_DEFAULT_STRENGTH[b.targetType] ?? 1;
+  const strength = finiteOr(b.strength, fallback);
+  const smoothing = Math.max(
+    SCENE3D_BINDING_SMOOTHING_MIN,
+    Math.min(SCENE3D_BINDING_SMOOTHING_MAX, finiteOr(b.smoothing, 0.18))
+  );
+  const axisTarget = usesBindingAxis(b.targetType);
+  const axis: Scene3DAxis | undefined = isScene3DAxis(b.axis) ? b.axis : axisTarget ? "Y" : undefined;
+  const invertAxis: boolean | undefined =
+    typeof b.invertAxis === "boolean" ? b.invertAxis : axisTarget ? false : undefined;
+  const objectId = typeof b.objectId === "string" && b.objectId ? b.objectId : undefined;
+  const targetName = typeof b.targetName === "string" ? b.targetName : "";
+  const sourceNode = typeof b.sourceNode === "string" ? b.sourceNode : "";
+  if (
+    strength === b.strength &&
+    smoothing === b.smoothing &&
+    axis === b.axis &&
+    invertAxis === b.invertAxis &&
+    objectId === b.objectId &&
+    targetName === b.targetName &&
+    sourceNode === b.sourceNode &&
+    typeof b.enabled === "boolean"
+  ) {
+    return b;
+  }
+  const out: ReactiveBinding3D = {
+    ...b,
+    enabled: b.enabled !== false,
+    sourceNode,
+    targetName,
+    strength,
+    smoothing,
+  };
+  if (objectId) out.objectId = objectId;
+  else delete out.objectId;
+  if (axis) out.axis = axis;
+  else delete out.axis;
+  if (invertAxis !== undefined) out.invertAxis = invertAxis;
+  else delete out.invertAxis;
+  return out;
+}
+
+function normalizeReactiveBindings3D(list: ReactiveBinding3D[]): ReactiveBinding3D[] {
+  let changed = false;
+  const next: ReactiveBinding3D[] = [];
+  for (const b of list) {
+    if (!b || typeof b !== "object" || typeof b.id !== "string") {
+      changed = true;
+      continue;
+    }
+    const nb = normalizeReactiveBinding3D(b);
+    if (nb !== b) changed = true;
+    next.push(nb);
+  }
+  return changed ? next : list;
+}
+
 /**
  * Single migration point for Scene3DConfig (call it at the borders: project load,
  * .prism import, scene broadcast to desktop windows). Idempotent and cheap: returns
@@ -1010,7 +1095,9 @@ export function normalizeScene3DConfig(raw: Scene3DConfig | undefined | null): S
     raw.camera.targetY === raw.camera.target[1] &&
     !hasLegacyScene3DKeys(raw) &&
     raw.objects.every((o, i) => normalizeScene3DObject(o, i, false) === o) &&
-    sanitizeScene3DParents(raw.objects) === raw.objects
+    sanitizeScene3DParents(raw.objects) === raw.objects &&
+    (raw.bindings === undefined ||
+      (Array.isArray(raw.bindings) && normalizeReactiveBindings3D(raw.bindings) === raw.bindings))
   ) {
     return raw;
   }
@@ -1035,7 +1122,7 @@ export function normalizeScene3DConfig(raw: Scene3DConfig | undefined | null): S
     fpsMode,
     renderScale: Math.max(0.5, Math.min(1, finiteOr(raw.renderScale, base.renderScale))),
     camera: { ...cam, target, targetY: target[1] },
-    bindings: Array.isArray(raw.bindings) ? raw.bindings : base.bindings,
+    bindings: normalizeReactiveBindings3D(Array.isArray(raw.bindings) ? raw.bindings : base.bindings ?? []),
   };
 }
 
