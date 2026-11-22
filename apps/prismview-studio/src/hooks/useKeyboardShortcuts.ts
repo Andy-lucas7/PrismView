@@ -10,8 +10,19 @@ function isEditableElement(target: EventTarget | null): boolean {
   return Boolean(target.closest("[contenteditable='true']"));
 }
 
+/** Sala 3D shortcuts. While present, they replace every 2D shortcut except undo/redo. */
+export interface RoomShortcuts {
+  onGizmo: (mode: "translate" | "rotate" | "scale") => void;
+  onFocus: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onExit: () => void;
+}
+
 export interface KeyboardShortcutsConfig {
   enabled: boolean;
+  /** Defined only while the Sala 3D mode is active (undefined = 2D shortcuts) */
+  room?: RoomShortcuts;
   onUndo: () => void;
   onRedo: () => void;
   onDelete: () => void;
@@ -52,6 +63,30 @@ export function useKeyboardShortcuts(config: KeyboardShortcutsConfig): void {
       if (mod && (key === "y" || (key === "z" && e.shiftKey))) {
         e.preventDefault();
         cfg.onRedo();
+        return;
+      }
+
+      // Sala 3D: its own key map; 2D shortcuts (nudge, group, copy…) never fire here
+      const room = cfg.room;
+      if (room) {
+        if (mod && key === "d" && !e.shiftKey && !e.altKey) {
+          e.preventDefault();
+          if (!e.repeat) room.onDuplicate();
+          return;
+        }
+        if (mod || e.altKey) return;
+        if (e.key === "Delete" || e.key === "Backspace") {
+          e.preventDefault();
+          if (!e.repeat) room.onDelete();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          room.onExit();
+        } else if (!e.shiftKey && !e.repeat) {
+          if (key === "g") room.onGizmo("translate");
+          else if (key === "r") room.onGizmo("rotate");
+          else if (key === "s") room.onGizmo("scale");
+          else if (key === "f") room.onFocus();
+        }
         return;
       }
 

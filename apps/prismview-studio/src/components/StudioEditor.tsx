@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
+  Bone,
   Box,
   Camera,
   ChevronDown,
@@ -57,7 +58,7 @@ import {
   SceneLayer,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
-import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { friendlyError } from "../utils/friendlyError";
 import {
   cloneLayerWithFreshIds,
@@ -79,7 +80,12 @@ import {
 } from "../utils/layerTree";
 import { FxExpressionPopover } from "./FxExpressionPopover";
 import { Room3DEditBinding, UnifiedCompositor } from "./UnifiedCompositor";
-import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
+import type {
+  Scene3DEditMode,
+  Scene3DEditorApi,
+  Scene3DGizmoMode,
+  Scene3DStats,
+} from "./Scene3DLayer";
 import { POWER_PREFERENCE_LABELS, usePowerState } from "../engine/powerGovernor";
 import {
   createGroupChildLayer,
@@ -180,12 +186,15 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   const [selected3dObjectId, setSelected3dObjectId] = useState<string | null>(null);
   const selected3dObjectIdRef = useRef<string | null>(null);
   selected3dObjectIdRef.current = selected3dObjectId;
-  const [test3dMode, setTest3dMode] = useState(false);
   const [hoveredMesh3d, setHoveredMesh3d] = useState<string | null>(null);
-  // Sala 3D (navigable room editor): free camera + gizmos on one SCENE_3D layer
-  const [room3dMode, setRoom3dMode] = useState(false);
+  // LAYOUT = 2D layout · ROOM = Sala 3D (free camera + gizmos, sensors off) · TEST = live interactions (wallpaper camera locked)
+  const [scene3dEditMode, setScene3dEditMode] = useState<Scene3DEditMode>("LAYOUT");
+  const test3dMode = scene3dEditMode === "TEST";
+  const room3dMode = scene3dEditMode === "ROOM";
   const [gizmoMode, setGizmoMode] = useState<Scene3DGizmoMode>("translate");
+  // Editor-only toggles (local state, never persisted in the project)
   const [showGrid3d, setShowGrid3d] = useState(true);
+  const [showSkeleton3d, setShowSkeleton3d] = useState(false);
   const [snap3d, setSnap3d] = useState(false);
   const editorApiRef = useRef<Scene3DEditorApi | null>(null);
   // Performance HUD (Ctrl+Shift+P)
@@ -228,9 +237,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         if (l.children?.length) walk(l.children);
       }
     };
-    walk(project.layers);
+    // Sala 3D edits the room, not the reactions: sensors stay off until LAYOUT/TEST
+    if (!room3dMode) walk(project.layers);
     return { audio, keyboard };
-  }, [project.layers]);
+  }, [project.layers, room3dMode]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -265,14 +275,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   }, []);
 
   useEffect(() => {
-    if (!hasScene3D && test3dMode) {
-      setTest3dMode(false);
+    if (!hasScene3D && scene3dEditMode !== "LAYOUT") {
+      setScene3dEditMode("LAYOUT");
       setHoveredMesh3d(null);
     }
-    if (!hasScene3D && room3dMode) {
-      setRoom3dMode(false);
-    }
-  }, [hasScene3D, test3dMode, room3dMode]);
+  }, [hasScene3D, scene3dEditMode]);
 
   const clipboardRef = useRef<SceneLayer[]>([]);
   const hintTimerRef = useRef<number | null>(null);
@@ -498,9 +505,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   room3dLayerIdRef.current = room3dLayer?.id ?? null;
 
   const setViewMode = useCallback(
-    (mode: "LAYOUT" | "ROOM" | "TEST") => {
-      setTest3dMode(mode === "TEST");
-      setRoom3dMode(mode === "ROOM");
+    (mode: Scene3DEditMode) => {
+      setScene3dEditMode(mode);
       if (mode !== "TEST") setHoveredMesh3d(null);
       if (mode === "ROOM" && room3dLayerIdRef.current) {
         const layerId = room3dLayerIdRef.current;
@@ -615,44 +621,22 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     flashHint("Objeto 3D removido");
   }, [flashHint, patchLayer]);
 
-  // Sala 3D shortcuts (2D shortcuts are suspended while the room is active).
-  // While RMB is held the editor consumes W/A/S/D/Q/E first (capture phase).
-  useEffect(() => {
-    if (!room3dMode) return;
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      if (t && (t.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName))) return;
-      const k = e.key.toLowerCase();
-      const mod = e.ctrlKey || e.metaKey;
-      if (mod && k === "z" && !e.shiftKey) {
-        e.preventDefault();
-        handleUndo();
-      } else if (mod && (k === "y" || (k === "z" && e.shiftKey))) {
-        e.preventDefault();
-        handleRedo();
-      } else if (mod && k === "d") {
-        e.preventDefault();
-        duplicateRoomObject();
-      } else if (mod) {
-        return;
-      } else if (k === "g") {
-        setGizmoMode("translate");
-      } else if (k === "r") {
-        setGizmoMode("rotate");
-      } else if (k === "s") {
-        setGizmoMode("scale");
-      } else if (k === "f") {
-        editorApiRef.current?.focusSelected();
-      } else if (k === "delete" || k === "backspace") {
-        e.preventDefault();
-        removeRoomObject();
-      } else if (k === "escape") {
-        setViewMode("LAYOUT");
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [duplicateRoomObject, handleRedo, handleUndo, removeRoomObject, room3dMode, setViewMode]);
+  // Sala 3D key map, handed to useKeyboardShortcuts only while mode === ROOM (undefined otherwise,
+  // so G/R/S/F/Del/Ctrl+D never fire in LAYOUT/TEST). While RMB is held the editor camera consumes
+  // W/A/S/D/Q/E first (capture phase).
+  const roomShortcuts = useMemo<RoomShortcuts | undefined>(
+    () =>
+      room3dMode
+        ? {
+            onGizmo: setGizmoMode,
+            onFocus: () => editorApiRef.current?.focusSelected(),
+            onDuplicate: duplicateRoomObject,
+            onDelete: removeRoomObject,
+            onExit: () => setViewMode("LAYOUT"),
+          }
+        : undefined,
+    [duplicateRoomObject, removeRoomObject, room3dMode, setViewMode]
+  );
 
   // Performance HUD toggle (works in every Studio mode)
   useEffect(() => {
@@ -938,7 +922,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   );
 
   useKeyboardShortcuts({
-    enabled: !fxTarget && !room3dMode,
+    enabled: !fxTarget,
+    room: roomShortcuts,
     onUndo: handleUndo,
     onRedo: handleRedo,
     onDelete: () => deleteLayers(selectedIdsRef.current),
@@ -1543,7 +1528,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               Energia · {POWER_PREFERENCE_LABELS[power.state]}
             </span>
           )}
-          {hasScene3D && (
+          {hasScene3D && (selectedLayer?.kind === "SCENE_3D" || scene3dEditMode !== "LAYOUT") && (
             <div className="frosted-chrome rounded-full p-1 flex items-center gap-0.5">
               {(
                 [
@@ -1552,18 +1537,17 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                     id: "ROOM" as const,
                     label: "Sala 3D",
                     icon: Box,
-                    title: "Navegar pela sala, mover objetos com gizmos e salvar a câmera do wallpaper",
+                    title: "Navegar pela sala, mover objetos com gizmos e salvar a câmera do wallpaper (sensores desligados)",
                   },
                   {
                     id: "TEST" as const,
-                    label: "Testar 3D",
+                    label: "Testar Interações",
                     icon: MousePointerClick,
-                    title: "Testar órbita, olhar do modelo, hover e clique 3D direto no preview",
+                    title: "Câmera do wallpaper travada; mouse, clique, áudio e teclado ao vivo",
                   },
                 ]
               ).map((m) => {
-                const active =
-                  m.id === "ROOM" ? room3dMode : m.id === "TEST" ? test3dMode : !room3dMode && !test3dMode;
+                const active = scene3dEditMode === m.id;
                 const Icon = m.icon;
                 return (
                   <button
@@ -1943,6 +1927,32 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 className="rounded-full px-2.5 py-1 hover:bg-white/15 transition"
               >
                 + .glb
+              </button>
+              <button
+                type="button"
+                onClick={duplicateRoomObject}
+                disabled={!selected3dObjectId}
+                title="Duplicar objeto (Ctrl+D)"
+                className="rounded-full p-1.5 hover:bg-white/15 transition disabled:opacity-40"
+              >
+                <Copy className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={removeRoomObject}
+                disabled={!selected3dObjectId}
+                title="Excluir objeto (Del)"
+                className="rounded-full p-1.5 hover:bg-white/15 transition disabled:opacity-40"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSkeleton3d((v) => !v)}
+                title="Mostrar / ocultar esqueleto (helper chega no lote de ossos)"
+                className={`rounded-full p-1.5 transition ${showSkeleton3d ? "bg-white/20" : "hover:bg-white/15"}`}
+              >
+                <Bone className="w-3.5 h-3.5" />
               </button>
               <span className="h-4 w-px bg-white/15 mx-1" />
               <button

@@ -73,6 +73,9 @@ import type {
 
 export type { Scene3DCameraCapture, Scene3DGizmoMode };
 
+/** Studio view mode for SCENE_3D layers: 2D layout, Sala 3D room editor, or live interaction test */
+export type Scene3DEditMode = "LAYOUT" | "ROOM" | "TEST";
+
 /** Imperative handle the Studio uses while the Sala 3D editor is mounted */
 export interface Scene3DEditorApi {
   /** Current free-camera state in orbit form (null until the editor chunk is loaded) */
@@ -1166,7 +1169,9 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       //    - The energy governor can switch either group off (Ultra / Frozen)
       const cursorBindings =
         cursorEnabled && caps.allowCursorBindings ? cachedCursorBindings : EMPTY_BINDINGS;
-      const signalBindings = caps.allowSignalBindings ? cachedSignalBindings : EMPTY_BINDINGS;
+      // Sala 3D (editor mounted) edits the room: sensor-driven bindings stay off
+      const signalBindings =
+        caps.allowSignalBindings && !editor ? cachedSignalBindings : EMPTY_BINDINGS;
       const needHoverRay =
         cursorEnabled &&
         caps.allowCursorBindings &&
