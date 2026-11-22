@@ -165,6 +165,8 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
 
   // Mirror of `webglOk` so the hot path only calls setState on a real transition.
   const webglOkRef = useRef(webglOk);
+  const hasRenderedRef = useRef(false);
+  const rafIdRef = useRef<number | null>(null);
   const commitWebglOk = useCallback((next: boolean) => {
     if (webglOkRef.current === next) return;
     webglOkRef.current = next;
@@ -200,14 +202,52 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
         frameToken: bg.kind === "video" || bg.live ? videoFrameTokenRef.current ?? 0 : bg.frameToken,
       },
     });
+    if (ok) {
+      hasRenderedRef.current = true;
+    }
     commitWebglOk(ok);
   }, [commitWebglOk, cursorNormRef, forceCssFallback, videoFrameTokenRef]);
 
-  // Synchronous zero-lag render on any parameter, position, size, or backdrop media change
+  // Coalesce rapid slider/drag/cursor/video ticks to at most 1 WebGL2 render per animation frame.
+  const scheduleDraw = useCallback(() => {
+    if (rafIdRef.current !== null) return;
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafIdRef.current = null;
+      drawFrame();
+    });
+  }, [drawFrame]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      hasRenderedRef.current = false;
+    };
+  }, []);
+
+  // Synchronous first frame (zero mount flicker); subsequent live edits coalesce via rAF (60+ FPS).
   useLayoutEffect(() => {
-    drawFrame();
+    if (forceCssFallback) {
+      hasRenderedRef.current = false;
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
+      commitWebglOk(false);
+      return;
+    }
+    if (!hasRenderedRef.current) {
+      drawFrame();
+    } else {
+      scheduleDraw();
+    }
   }, [
+    commitWebglOk,
     drawFrame,
+    forceCssFallback,
+    scheduleDraw,
     backdrop?.key,
     backdrop?.drawLeft,
     backdrop?.drawTop,
@@ -245,11 +285,11 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
     pigmentRgba?.[3],
   ]);
 
-  // Subscribe to shared video/parallax frame ticks (zero React re-renders!)
+  // Subscribe to shared video/parallax frame ticks (coalesced via rAF, zero React re-renders!)
   useEffect(() => {
     if (forceCssFallback) return;
-    return registerFrameTick(drawFrame);
-  }, [forceCssFallback, registerFrameTick, drawFrame]);
+    return registerFrameTick(scheduleDraw);
+  }, [forceCssFallback, registerFrameTick, scheduleDraw]);
 
   const [tr, tg, tb] = tintRgb;
   const satPct = Math.round(saturation * 100);

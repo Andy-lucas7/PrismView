@@ -12,6 +12,7 @@ import {
   resolveMediaUrl,
   Scene3DConfig,
   Scene3DInspectInfo,
+  Scene3DPickedPart,
   SceneLayer,
 } from "../types/prism";
 import { getGlyphGlassMaps } from "../utils/glassLens";
@@ -30,7 +31,10 @@ export interface Room3DEditBinding {
   gizmoMode: Scene3DGizmoMode;
   showGrid: boolean;
   snapEnabled: boolean;
+  showSkeleton: boolean;
+  onEditorSync: () => void;
   onSelectObject: (objectId: string | null) => void;
+  onPickPart?: (part: Scene3DPickedPart | null) => void;
   onCommitObjectTransform: (
     layerId: string,
     objectId: string,
@@ -566,7 +570,10 @@ const Scene3DSlot: React.FC<Scene3DSlotProps> = (p) => {
             gizmoMode: room.gizmoMode,
             showGrid: room.showGrid,
             snapEnabled: room.snapEnabled,
+            showSkeleton: room.showSkeleton,
+            onEditorSync: room.onEditorSync,
             onSelectObject: room.onSelectObject,
+            onPickPart: room.onPickPart,
             onCommitObjectTransform,
             editorApiRef: room.editorApiRef,
           }
@@ -718,6 +725,22 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     wasAlreadyInMulti: boolean;
     multiPeers?: Array<{ id: string; startX: number; startY: number }>;
   } | null>(null);
+  const dragMoveRafRef = useRef<number | null>(null);
+  const pendingDragMoveRef = useRef<{
+    clientX: number;
+    clientY: number;
+    altKey: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (dragMoveRafRef.current !== null) {
+        cancelAnimationFrame(dragMoveRafRef.current);
+        dragMoveRafRef.current = null;
+      }
+      pendingDragMoveRef.current = null;
+    };
+  }, []);
 
   // Measure actual rendered viewport for exact 1:1 proportional scaling
   useEffect(() => {
@@ -895,6 +918,65 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       : 1080;
   const scale = Math.min(size.w / Math.max(logicalW, 1), size.h / Math.max(logicalH, 1));
 
+  const flushPendingDragMove = () => {
+    const drag = dragRef.current;
+    const pending = pendingDragMoveRef.current;
+    pendingDragMoveRef.current = null;
+    if (!drag || !pending) return;
+
+    if (
+      !drag.moved &&
+      Math.hypot(pending.clientX - drag.startClientX, pending.clientY - drag.startClientY) >= 3
+    ) {
+      drag.moved = true;
+    }
+
+    if (drag.mode === "MOVE" && (onMoveLayers || onMoveLayer)) {
+      const cw = Math.max(drag.containerW, 1);
+      const ch = Math.max(drag.containerH, 1);
+      const dx = (pending.clientX - drag.startClientX) / cw;
+      const dy = (pending.clientY - drag.startClientY) / ch;
+      const rawX = Math.max(0, Math.min(1, drag.startX + dx));
+      const rawY = Math.max(0, Math.min(1, drag.startY + dy));
+      const threshold = pending.altKey ? 0 : 0.012;
+      const snapX = snapCoordinate(rawX, drag.halfW, drag.snapTargetsX, threshold);
+      const snapY = snapCoordinate(rawY, drag.halfH, drag.snapTargetsY, threshold);
+      const gx = drag.isTopLevel ? snapX.guide : null;
+      const gy = drag.isTopLevel ? snapY.guide : null;
+      // 4.6: pointermove fires constantly; only re-render the tree when a guide actually changes.
+      setSnapGuide((prev) => (prev.x === gx && prev.y === gy ? prev : { x: gx, y: gy }));
+      const appliedDx = snapX.snapped - drag.startX;
+      const appliedDy = snapY.snapped - drag.startY;
+      const peers = drag.multiPeers;
+      if (peers && peers.length > 1 && onMoveLayers) {
+        onMoveLayers(
+          peers.map((p) => ({
+            id: p.id,
+            x: Math.max(0, Math.min(1, Number((p.startX + appliedDx).toFixed(4)))),
+            y: Math.max(0, Math.min(1, Number((p.startY + appliedDy).toFixed(4)))),
+          }))
+        );
+      } else if (onMoveLayer) {
+        onMoveLayer(
+          drag.id,
+          Number(snapX.snapped.toFixed(4)),
+          Number(snapY.snapped.toFixed(4))
+        );
+      }
+    } else if (drag.mode === "RESIZE" && onResizeLayer) {
+      const dxLog = (pending.clientX - drag.startClientX) / Math.max(scale, 0.05);
+      const dyLog = (pending.clientY - drag.startClientY) / Math.max(scale, 0.05);
+      if (drag.isText) {
+        const nextFont = Math.max(12, Math.min(340, Math.round(drag.startW + dxLog)));
+        onResizeLayer(drag.id, nextFont, nextFont, true);
+      } else {
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + dxLog * 2)));
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + dyLog * 2)));
+        onResizeLayer(drag.id, nw, nh, false);
+      }
+    }
+  };
+
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (paused && !interactive) return;
     if (interactive && test3dMode) {
@@ -909,71 +991,28 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     }
     if (!interactive || !dragRef.current) return;
 
-    if (
-      !dragRef.current.moved &&
-      Math.hypot(e.clientX - dragRef.current.startClientX, e.clientY - dragRef.current.startClientY) >= 3
-    ) {
-      dragRef.current.moved = true;
-    }
-
-    if (dragRef.current.mode === "MOVE" && (onMoveLayers || onMoveLayer)) {
-      const cw = Math.max(dragRef.current.containerW, 1);
-      const ch = Math.max(dragRef.current.containerH, 1);
-      const dx = (e.clientX - dragRef.current.startClientX) / cw;
-      const dy = (e.clientY - dragRef.current.startClientY) / ch;
-      const rawX = Math.max(0, Math.min(1, dragRef.current.startX + dx));
-      const rawY = Math.max(0, Math.min(1, dragRef.current.startY + dy));
-      const threshold = e.altKey ? 0 : 0.012;
-      const snapX = snapCoordinate(
-        rawX,
-        dragRef.current.halfW,
-        dragRef.current.snapTargetsX,
-        threshold
-      );
-      const snapY = snapCoordinate(
-        rawY,
-        dragRef.current.halfH,
-        dragRef.current.snapTargetsY,
-        threshold
-      );
-      const gx = dragRef.current.isTopLevel ? snapX.guide : null;
-      const gy = dragRef.current.isTopLevel ? snapY.guide : null;
-      // 4.6: pointermove fires constantly; only re-render the tree when a guide actually changes.
-      setSnapGuide((prev) => (prev.x === gx && prev.y === gy ? prev : { x: gx, y: gy }));
-      const appliedDx = snapX.snapped - dragRef.current.startX;
-      const appliedDy = snapY.snapped - dragRef.current.startY;
-      const peers = dragRef.current.multiPeers;
-      if (peers && peers.length > 1 && onMoveLayers) {
-        onMoveLayers(
-          peers.map((p) => ({
-            id: p.id,
-            x: Math.max(0, Math.min(1, Number((p.startX + appliedDx).toFixed(4)))),
-            y: Math.max(0, Math.min(1, Number((p.startY + appliedDy).toFixed(4)))),
-          }))
-        );
-      } else if (onMoveLayer) {
-        onMoveLayer(
-          dragRef.current.id,
-          Number(snapX.snapped.toFixed(4)),
-          Number(snapY.snapped.toFixed(4))
-        );
-      }
-    } else if (dragRef.current.mode === "RESIZE" && onResizeLayer) {
-      const dxLog = (e.clientX - dragRef.current.startClientX) / Math.max(scale, 0.05);
-      const dyLog = (e.clientY - dragRef.current.startClientY) / Math.max(scale, 0.05);
-      if (dragRef.current.isText) {
-        const nextFont = Math.max(12, Math.min(340, Math.round(dragRef.current.startW + dxLog)));
-        onResizeLayer(dragRef.current.id, nextFont, nextFont, true);
-      } else {
-        const nw = Math.max(24, Math.min(2400, Math.round(dragRef.current.startW + dxLog * 2)));
-        const nh = Math.max(20, Math.min(1400, Math.round(dragRef.current.startH + dyLog * 2)));
-        onResizeLayer(dragRef.current.id, nw, nh, false);
-      }
+    // Coalesce high-polling mice (500-1000 Hz) to at most 1 React update per animation frame.
+    pendingDragMoveRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      altKey: e.altKey,
+    };
+    if (dragMoveRafRef.current === null) {
+      dragMoveRafRef.current = requestAnimationFrame(() => {
+        dragMoveRafRef.current = null;
+        flushPendingDragMove();
+      });
     }
   };
 
   const endDrag = () => {
+    if (dragMoveRafRef.current !== null) {
+      cancelAnimationFrame(dragMoveRafRef.current);
+      dragMoveRafRef.current = null;
+    }
     if (dragRef.current) {
+      // Flush exact final drop coordinates synchronously before committing the drag transaction.
+      flushPendingDragMove();
       const finished = dragRef.current;
       dragRef.current = null;
       setSnapGuide((prev) => (prev.x === null && prev.y === null ? prev : { x: null, y: null }));
@@ -1063,7 +1102,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           const boxTop = full ? 0 : candidate.y * size.h - bh * 0.5;
           return {
             backdrop: {
-              key: `3d|${candidate.id}|${candidate.scene3d?.modelSrc || "default"}`,
+              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}`,
               kind: "canvas",
               live: true,
               element: el,

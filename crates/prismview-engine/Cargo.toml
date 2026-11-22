@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "prismview-engine"
 version.workspace = true
 edition.workspace = true
@@ -14,21 +14,55 @@ wgpu.workspace = true
 bytemuck = { version = "1.21", features = ["derive"] }
 pollster = "0.4"
 raw-window-handle = "0.6"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr"] }
+# Fase 3 (core/assets, core/scene3d). VERSÃ•ES/APIs NÃƒO VALIDADAS (nada compilado ainda).
+glam = "0.29"
+# `Gltf`/`Document` com JSON prÃ³prio (patch de KHR_texture_basisu); `extensions` expÃµe
+# `extension_value` (EXT_meshopt_compression em bufferViews). Sem `import`: buffers sÃ£o carregados
+# por core/assets/gltf_loader.rs (fallback buffers do meshopt nÃ£o tÃªm dados).
+gltf = { version = "1.4", default-features = false, features = ["names", "extensions", "extras"] }
+# DecodificaÃ§Ã£o EXT_meshopt_compression via `meshopt::ffi` (strides dinÃ¢micos).
+meshopt = "0.4"
+base64 = "0.22"
+# KTX2: container parseado Ã  mÃ£o; UASTC -> BC7/RGBA8 pelo transcoder do basis-universal.
+basis-universal = { version = "0.3", default-features = false, features = [] }
+# SupercompressÃ£o Zstandard dos nÃ­veis KTX2 (decoder puro Rust).
+ruzstd = "0.7"
+# Texto nativo (core/text.rs). glyphon 0.8 = wgpu 24 + cosmic-text 0.12 (verificado no crates.io).
+glyphon = "0.8"
+cosmic-text = "0.12"
+# Ícones/SVG do Estúdio rasterizados em textura (scene2d::draw_svg). Sem texto em SVG (fontdb).
+resvg = { version = "0.45", default-features = false }
 windows = { workspace = true, features = [
     "Media_Control",
-    "Media_Playback",
-    "Media_Core",
-    "Graphics_Imaging",
-    "Graphics_DirectX_Direct3D11",
     "Storage_Streams",
     "Foundation",
     "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_LibraryLoader",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
+    # VÃ­deo zero-copy (platform/windows/video.rs): MF + import D3D12 no wgpu-hal.
+    "Win32_Graphics_Direct3D12",
+    "Win32_Media_MediaFoundation",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Com",
-    "Win32_System_WinRT_Direct3D11",
+    # Fase 4 (platform/windows/sensors): WASAPI loopback (IMMDevice::Activate usa PROPVARIANT)
+    # e Raw Input. PDH/kernel32 da telemetria via FFI prÃ³pria (raw-dylib).
+    "Win32_Media_Audio",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Input",
+    # Toques OPEN_URL/OPEN_APP (platform/windows/shell.rs).
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+

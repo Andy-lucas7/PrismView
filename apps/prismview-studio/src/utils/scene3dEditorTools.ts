@@ -3,40 +3,41 @@
  * Studio when the "Sala 3D" mode is active; the Desktop runtime never imports it.
  *
  * Controls
- *   RMB + drag ............ look around
- *   RMB + W A S D / Q E ... fly (Shift = faster)
- *   MMB drag / Alt + drag . pan
- *   Wheel ................. dolly forward / back
+ *   Camera (look / orbit / fly / pan / dolly) ... see `engine/scene3d/editorCamera`
  *   LMB click ............. select object (gizmo attaches to it)
  *   Gizmo drag ............ move / rotate / scale; ONE commit on release
  */
 import {
   Box3,
-  Euler,
+  Box3Helper,
+  BoxHelper,
   GridHelper,
+  LineBasicMaterial,
   Material,
   Object3D,
   PerspectiveCamera,
   Scene,
+  SkeletonHelper,
   Vector3,
 } from "three";
 import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
+import {
+  createEditorCamera,
+  type Scene3DCameraCapture,
+  type Scene3DEditorView,
+} from "../engine/scene3d/editorCamera";
+import type { ModelSceneIndex } from "../engine/scene3d/modelIndex";
+import {
+  getModelTree,
+  getTreeNodeId,
+  getTreeNodeObject,
+  type Scene3DObjectTree,
+} from "../engine/scene3d/modelTree";
+import type { Scene3DPickedPart } from "../types/prism";
+
+export type { Scene3DCameraCapture, Scene3DEditorView };
 
 export type Scene3DGizmoMode = "translate" | "rotate" | "scale";
-
-export interface Scene3DCameraCapture {
-  target: [number, number, number];
-  distance: number;
-  azimuthDeg: number;
-  elevationDeg: number;
-  fov: number;
-}
-
-export interface Scene3DEditorView {
-  position: [number, number, number];
-  target: [number, number, number];
-  fov: number;
-}
 
 export interface Scene3DEditorHost {
   canvas: HTMLCanvasElement;
@@ -44,9 +45,14 @@ export interface Scene3DEditorHost {
   scene: Scene;
   initialView: Scene3DEditorView;
   getPivot: (objectId: string) => Object3D | null;
+  /** Index of the loaded model of an object (null while loading / unknown) */
+  getModelIndex: (objectId: string) => ModelSceneIndex | null;
   pickObjectAt: (nx: number, ny: number) => string | null;
+  /** Raycast for Alt+Click part picking: resolves the most useful named bone/group/mesh under cursor */
+  pickPartAt: (nx: number, ny: number) => { objectId: string; node: Object3D } | null;
   wake: () => void;
   onSelectObject: (objectId: string | null) => void;
+  onPickPart: (part: Scene3DPickedPart | null) => void;
   onCommitTransform: (
     objectId: string,
     position: [number, number, number],
@@ -60,19 +66,26 @@ export interface Scene3DEditorSession {
   setMode: (mode: Scene3DGizmoMode) => void;
   setGrid: (visible: boolean) => void;
   setSnap: (enabled: boolean) => void;
+  /** SkeletonHelper of the selected object's model (built lazily, disposed when hidden / deselected / on exit) */
+  setSkeleton: (visible: boolean) => void;
+  /** Outliner tree of an object's model (cached per model); null while the model is not loaded */
+  getObjectTree: (objectId: string) => Scene3DObjectTree | null;
+  /** Highlights one part (tree node id) of an object's model in the viewport; null clears it */
+  highlightNode: (objectId: string, nodeId: number | null) => void;
   /** True while the gizmo drags the object (and briefly after release, until the commit lands) */
   isDragging: (objectId: string) => boolean;
   /** Keep the render loop alive (flying, dragging, easing) */
   needsFrames: () => boolean;
   update: (dt: number) => void;
   captureCameraState: () => Scene3DCameraCapture;
+  setCameraState: (state: Scene3DCameraCapture, animate?: boolean) => void;
+  focusOn: (objectId: string) => boolean;
   focusSelected: () => void;
   resetView: (view: Scene3DEditorView) => void;
   dispose: () => void;
 }
 
 const RAD2DEG = 180 / Math.PI;
-const FLY_KEYS = new Set(["w", "a", "s", "d", "q", "e", "shift"]);
 const COMMIT_HOLD_MS = 450;
 
 function round(n: number, digits = 3): number {
@@ -83,36 +96,55 @@ function round(n: number, digits = 3): number {
 export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEditorSession {
   const { canvas, camera, scene } = host;
 
-  // ── Free camera state ─────────────────────────────────────────────────────────
-  const position = new Vector3(...host.initialView.position);
-  const focusPoint = new Vector3(...host.initialView.target);
-  let yaw = 0;
-  let pitch = 0;
-  let focusDistance = 1;
-  const forward = new Vector3();
-  const right = new Vector3();
-  const up = new Vector3(0, 1, 0);
-  const tmp = new Vector3();
-  const euler = new Euler(0, 0, 0, "YXZ");
-
-  const lookFrom = (from: Vector3, to: Vector3) => {
-    tmp.copy(to).sub(from);
-    const len = tmp.length();
-    focusDistance = Math.max(0.3, len);
-    if (len < 1e-6) return;
-    tmp.divideScalar(len);
-    yaw = Math.atan2(-tmp.x, -tmp.z);
-    pitch = Math.asin(Math.max(-1, Math.min(1, tmp.y)));
-  };
-  lookFrom(position, focusPoint);
-
-  const computeBasis = () => {
-    forward.set(-Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch));
-    right.set(Math.cos(yaw), 0, -Math.sin(yaw));
-  };
-
-  // Smooth easing toward a focus target (F key / reset)
-  let easeTarget: { pos: Vector3; look: Vector3 } | null = null;
+  // ── Free camera (look / orbit / fly / pan / dolly) ───────────────────────────────
+  const cam = createEditorCamera({
+    canvas,
+    camera,
+    initialView: host.initialView,
+    wake: host.wake,
+    // Camera drag (Alt+LMB pan, RMB...) owns the pointer: the gizmo must not start a drag too
+    onNavigate: (active) => {
+      controls.enabled = !active;
+    },
+    // Alt+LMB without drag: pick the bone/part under cursor without conflicting with Alt+drag pan
+    onAltClick: (clientX, clientY) => {
+      const rect = canvas.getBoundingClientRect();
+      const nx = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      const ny = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+      const hit = host.pickPartAt(nx, ny);
+      if (!hit) {
+        setPartHighlight(null, null);
+        host.onPickPart(null);
+        return;
+      }
+      const idx = host.getModelIndex(hit.objectId);
+      const tree = idx ? getModelTree(idx) : null;
+      const nodeId = idx ? getTreeNodeId(idx, hit.node) : null;
+      const treeNode = tree && nodeId !== null ? tree.flat[nodeId] ?? null : null;
+      const rawName = hit.node.name || treeNode?.name || "__ROOT__";
+      const name = rawName === "(sem nome)" ? "__ROOT__" : rawName;
+      const type: Scene3DPickedPart["type"] =
+        treeNode?.type ??
+        ((hit.node as Object3D & { isBone?: boolean }).isBone
+          ? "bone"
+          : (hit.node as Object3D & { isMesh?: boolean }).isMesh
+          ? "mesh"
+          : "group");
+      setPartHighlight(hit.node, hit.objectId);
+      if (hit.objectId !== selectedId) {
+        host.onSelectObject(hit.objectId);
+      }
+      host.onPickPart({
+        objectId: hit.objectId,
+        nodeId: nodeId ?? -1,
+        name,
+        type,
+        morphs: treeNode?.morphs ?? [],
+        materials: treeNode?.materials ?? [],
+      });
+    },
+  });
+  const focusBox = new Box3();
 
   // ── Gizmo & grid ──────────────────────────────────────────────────────────────
   const controls = new TransformControls(camera, canvas);
@@ -130,7 +162,101 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   }
   scene.add(grid);
 
+  // Selection highlight: one BoxHelper reused for every selection (retargeted, never recreated)
+  const highlight = new BoxHelper(new Object3D(), 0x7cc4ff);
+  highlight.visible = false;
+  highlight.renderOrder = 998;
+  const highlightMat = highlight.material as LineBasicMaterial;
+  highlightMat.transparent = true;
+  highlightMat.opacity = 0.85;
+  highlightMat.depthTest = false;
+  highlightMat.toneMapped = false;
+  scene.add(highlight);
+
   let selectedId: string | null = null;
+
+  // ── Skeleton helper (only while toggled on) ───────────────────────────────────
+  let skeletonWanted = false;
+  let skeleton: SkeletonHelper | null = null;
+  let skeletonRoot: Object3D | null = null;
+
+  const disposeSkeleton = () => {
+    if (skeleton) {
+      scene.remove(skeleton);
+      skeleton.dispose();
+      skeleton = null;
+    }
+    skeletonRoot = null;
+  };
+
+  /** Keeps the helper bound to the selected object's CURRENT model root (reloads swap the root) */
+  const syncSkeleton = () => {
+    const root = skeletonWanted && selectedId ? host.getModelIndex(selectedId)?.holder ?? null : null;
+    if (root === skeletonRoot) return;
+    disposeSkeleton();
+    if (!root) return;
+    skeletonRoot = root; // remembered even without bones, so a bone-less model isn't rescanned every frame
+    const helper = new SkeletonHelper(root);
+    if (helper.bones.length === 0) {
+      helper.dispose();
+      return;
+    }
+    helper.renderOrder = 997;
+    skeleton = helper;
+    scene.add(helper);
+  };
+
+  // ── Part highlight (outliner / Alt+Click): one Box3Helper reused for every part ──
+  const partBox = new Box3();
+  const partPos = new Vector3();
+  const partSize = new Vector3(0.08, 0.08, 0.08);
+  let partHelper: Box3Helper | null = null;
+  let partObject: Object3D | null = null;
+  let partObjectId: string | null = null;
+
+  const disposePartHelper = () => {
+    if (!partHelper) return;
+    scene.remove(partHelper);
+    partHelper.geometry.dispose();
+    (partHelper.material as Material).dispose();
+    partHelper = null;
+  };
+
+  const updatePartBox = () => {
+    if (!partHelper || !partObject) return;
+    partBox.setFromObject(partObject);
+    if (partBox.isEmpty()) {
+      // Bones / empty groups have no geometry: mark the joint with a small cube
+      partObject.getWorldPosition(partPos);
+      partBox.setFromCenterAndSize(partPos, partSize);
+    }
+    partHelper.box.copy(partBox);
+  };
+
+  const setPartHighlight = (obj: Object3D | null, ownerId: string | null) => {
+    if (!obj) {
+      partObject = null;
+      partObjectId = null;
+      disposePartHelper();
+      host.wake();
+      return;
+    }
+    if (!partHelper) {
+      partHelper = new Box3Helper(partBox, 0xffb454);
+      partHelper.renderOrder = 999;
+      const mat = partHelper.material as LineBasicMaterial;
+      mat.transparent = true;
+      mat.opacity = 0.95;
+      mat.depthTest = false;
+      mat.toneMapped = false;
+      scene.add(partHelper);
+    }
+    partObject = obj;
+    partObjectId = ownerId;
+    updatePartBox();
+    host.wake();
+  };
+
   let attachedPivot: Object3D | null = null;
   let dragging = false;
   let holdId: string | null = null;
@@ -142,10 +268,14 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     if (pivot) controls.attach(pivot);
     else controls.detach();
     attachedPivot = pivot;
+    if (pivot) highlight.setFromObject(pivot);
+    highlight.visible = pivot !== null;
   };
 
   const onDraggingChanged = (ev: { value: boolean }) => {
     dragging = Boolean(ev.value);
+    // Free camera is off while the gizmo owns the pointer
+    cam.setEnabled(!dragging);
     if (!dragging && selectedId && attachedPivot) {
       const p = attachedPivot.position;
       attachedPivot.rotation.reorder("YXZ");
@@ -166,228 +296,82 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   controls.addEventListener("dragging-changed", onDraggingChanged as never);
   controls.addEventListener("change", onGizmoChange as never);
 
-  // ── Input ─────────────────────────────────────────────────────────────────────
-  type DragKind = "look" | "pan" | "click" | null;
-  let dragKind: DragKind = null;
-  let lastX = 0;
-  let lastY = 0;
+  // ── Selection input (plain LMB click; camera buttons belong to `cam`) ─────────
+  let clickPointer: number | null = null;
   let downX = 0;
   let downY = 0;
-  let activePointer: number | null = null;
-  const keys = new Set<string>();
-  let shiftHeld = false;
-
-  const ndcFromEvent = (e: PointerEvent): [number, number] => {
-    const rect = canvas.getBoundingClientRect();
-    return [
-      Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))),
-      Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height))),
-    ];
-  };
 
   const onPointerDown = (e: PointerEvent) => {
-    if (activePointer !== null) return;
+    if (clickPointer !== null || e.button !== 0 || e.altKey || cam.isNavigating()) return;
     // Gizmo handle under the cursor: TransformControls owns this drag
-    if (e.button === 0 && !e.altKey && controls.axis !== null) return;
-    activePointer = e.pointerId;
-    lastX = downX = e.clientX;
-    lastY = downY = e.clientY;
-    if (e.button === 2) dragKind = "look";
-    else if (e.button === 1 || (e.button === 0 && e.altKey)) dragKind = "pan";
-    else if (e.button === 0) dragKind = "click";
-    else dragKind = null;
-    if (dragKind === "look" || dragKind === "pan") {
-      try {
-        canvas.setPointerCapture(e.pointerId);
-      } catch {
-        /* capture unsupported */
-      }
-      e.preventDefault();
-    }
-    easeTarget = null;
+    if (controls.axis !== null) return;
+    clickPointer = e.pointerId;
+    downX = e.clientX;
+    downY = e.clientY;
+  };
+
+  const onPointerUp = (e: PointerEvent) => {
+    if (clickPointer !== e.pointerId) return;
+    clickPointer = null;
+    if (dragging || controls.axis !== null) return;
+    if (Math.hypot(e.clientX - downX, e.clientY - downY) >= 4) return;
+    const rect = canvas.getBoundingClientRect();
+    const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+    const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+    host.onSelectObject(host.pickObjectAt(nx, ny));
     host.wake();
   };
 
-  const onPointerMove = (e: PointerEvent) => {
-    if (activePointer !== e.pointerId || !dragKind) return;
-    const dx = e.clientX - lastX;
-    const dy = e.clientY - lastY;
-    lastX = e.clientX;
-    lastY = e.clientY;
-    if (dragKind === "look") {
-      yaw -= dx * 0.0042;
-      pitch = Math.max(-1.52, Math.min(1.52, pitch - dy * 0.0042));
-      host.wake();
-    } else if (dragKind === "pan") {
-      computeBasis();
-      const rect = canvas.getBoundingClientRect();
-      const worldPerPx =
-        (2 * Math.tan((camera.fov * Math.PI) / 360) * focusDistance) / Math.max(1, rect.height);
-      tmp.set(0, 0, 0).addScaledVector(right, -dx * worldPerPx);
-      // camera-up = right × forward
-      const camUp = new Vector3().crossVectors(right, forward).normalize();
-      tmp.addScaledVector(camUp, dy * worldPerPx);
-      position.add(tmp);
-      host.wake();
-    }
-  };
-
-  const endPointer = (e: PointerEvent) => {
-    if (activePointer !== e.pointerId) return;
-    const kind = dragKind;
-    activePointer = null;
-    dragKind = null;
-    try {
-      canvas.releasePointerCapture(e.pointerId);
-    } catch {
-      /* not captured */
-    }
-    if (kind === "look") keys.clear();
-    if (kind === "click" && !dragging && controls.axis === null) {
-      const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
-      if (moved < 4) {
-        const [nx, ny] = ndcFromEvent(e);
-        const hitId = host.pickObjectAt(nx, ny);
-        host.onSelectObject(hitId);
-      }
-    }
-    host.wake();
-  };
-
-  const onWheel = (e: WheelEvent) => {
-    e.preventDefault();
-    computeBasis();
-    const step = Math.max(0.08, focusDistance * 0.12) * Math.sign(e.deltaY) * -1;
-    position.addScaledVector(forward, step);
-    focusDistance = Math.max(0.3, focusDistance - step);
-    easeTarget = null;
-    host.wake();
-  };
-
-  const onContextMenu = (e: Event) => e.preventDefault();
-
-  // Capture phase on window: while RMB is held, fly keys never reach Studio shortcuts
-  const onKeyDown = (e: KeyboardEvent) => {
-    const k = e.key.toLowerCase();
-    if (dragKind !== "look" || !FLY_KEYS.has(k)) return;
-    if (e.ctrlKey || e.metaKey || e.altKey) return;
-    keys.add(k);
-    shiftHeld = e.shiftKey;
-    e.preventDefault();
-    e.stopPropagation();
-    host.wake();
-  };
-  const onKeyUp = (e: KeyboardEvent) => {
-    const k = e.key.toLowerCase();
-    shiftHeld = e.shiftKey;
-    if (keys.delete(k)) {
-      e.preventDefault();
-      e.stopPropagation();
-    }
-  };
-  const onBlur = () => {
-    keys.clear();
-    dragKind = null;
-    activePointer = null;
+  const onPointerCancel = (e: PointerEvent) => {
+    if (clickPointer === e.pointerId) clickPointer = null;
   };
 
   canvas.addEventListener("pointerdown", onPointerDown);
-  canvas.addEventListener("pointermove", onPointerMove);
-  canvas.addEventListener("pointerup", endPointer);
-  canvas.addEventListener("pointercancel", endPointer);
-  canvas.addEventListener("wheel", onWheel, { passive: false });
-  canvas.addEventListener("contextmenu", onContextMenu);
-  window.addEventListener("keydown", onKeyDown, true);
-  window.addEventListener("keyup", onKeyUp, true);
-  window.addEventListener("blur", onBlur);
+  canvas.addEventListener("pointerup", onPointerUp);
+  canvas.addEventListener("pointercancel", onPointerCancel);
 
   // ── Per-frame ─────────────────────────────────────────────────────────────────
   const update = (dt: number) => {
-    computeBasis();
-
-    if (keys.size > 0) {
-      const speed = Math.max(1.2, focusDistance * 0.9) * (shiftHeld || keys.has("shift") ? 3 : 1);
-      tmp.set(0, 0, 0);
-      if (keys.has("w")) tmp.add(forward);
-      if (keys.has("s")) tmp.sub(forward);
-      if (keys.has("d")) tmp.add(right);
-      if (keys.has("a")) tmp.sub(right);
-      if (keys.has("e")) tmp.add(up);
-      if (keys.has("q")) tmp.sub(up);
-      if (tmp.lengthSq() > 0) position.addScaledVector(tmp.normalize(), speed * dt);
-    }
-
-    if (easeTarget) {
-      const a = 1 - Math.exp(-10 * dt);
-      position.lerp(easeTarget.pos, a);
-      lookFrom(position, easeTarget.look);
-      computeBasis();
-      if (position.distanceToSquared(easeTarget.pos) < 1e-5) easeTarget = null;
-    }
-
-    camera.position.copy(position);
-    euler.set(pitch, yaw, 0, "YXZ");
-    camera.quaternion.setFromEuler(euler);
-    camera.updateMatrixWorld();
-
+    cam.update(dt);
     // Selection may point at a pivot that was (re)created after a model reload
     attachSelected();
+    // Follows the object (gizmo drag, bindings, spin, model load); BoxHelper.update reuses a module Box3
+    if (highlight.visible) highlight.update();
+    if (skeletonWanted) syncSkeleton();
+    if (partObject) updatePartBox();
   };
 
-  const captureCameraState = (): Scene3DCameraCapture => {
-    computeBasis();
-    const dist = Math.max(0.3, focusDistance);
-    const target = position.clone().addScaledVector(forward, dist);
-    const offset = position.clone().sub(target);
-    const el = Math.asin(Math.max(-1, Math.min(1, offset.y / dist)));
-    const az = Math.atan2(offset.x, offset.z);
-    return {
-      target: [round(target.x), round(target.y), round(target.z)],
-      distance: round(dist, 2),
-      azimuthDeg: round(az * RAD2DEG, 1),
-      elevationDeg: round(el * RAD2DEG, 1),
-      fov: round(camera.fov, 1),
-    };
+  const focusOn = (objectId: string): boolean => {
+    const pivot = host.getPivot(objectId);
+    if (!pivot) return false;
+    focusBox.setFromObject(pivot);
+    return cam.focusBox(focusBox);
   };
 
   const focusSelected = () => {
-    const pivot = selectedId ? host.getPivot(selectedId) : null;
-    if (!pivot) return;
-    const box = new Box3().setFromObject(pivot);
-    if (box.isEmpty()) return;
-    const center = box.getCenter(new Vector3());
-    const size = box.getSize(new Vector3());
-    const radius = Math.max(0.4, size.length() * 0.5);
-    const dist = radius / Math.sin((camera.fov * Math.PI) / 360) * 1.15;
-    computeBasis();
-    const pos = center.clone().addScaledVector(forward, -dist);
-    easeTarget = { pos, look: center };
-    host.wake();
+    if (selectedId) focusOn(selectedId);
   };
 
-  const resetView = (view: Scene3DEditorView) => {
-    easeTarget = { pos: new Vector3(...view.position), look: new Vector3(...view.target) };
-    host.wake();
-  };
+  const resetView = (view: Scene3DEditorView) => cam.setView(view, true);
 
   let disposed = false;
   const dispose = () => {
     if (disposed) return;
     disposed = true;
     canvas.removeEventListener("pointerdown", onPointerDown);
-    canvas.removeEventListener("pointermove", onPointerMove);
-    canvas.removeEventListener("pointerup", endPointer);
-    canvas.removeEventListener("pointercancel", endPointer);
-    canvas.removeEventListener("wheel", onWheel);
-    canvas.removeEventListener("contextmenu", onContextMenu);
-    window.removeEventListener("keydown", onKeyDown, true);
-    window.removeEventListener("keyup", onKeyUp, true);
-    window.removeEventListener("blur", onBlur);
+    canvas.removeEventListener("pointerup", onPointerUp);
+    canvas.removeEventListener("pointercancel", onPointerCancel);
+    cam.dispose();
     controls.removeEventListener("dragging-changed", onDraggingChanged as never);
     controls.removeEventListener("change", onGizmoChange as never);
     controls.detach();
     scene.remove(gizmoHelper);
     controls.dispose();
+    disposeSkeleton();
+    disposePartHelper();
+    scene.remove(highlight);
+    highlight.geometry.dispose();
+    highlightMat.dispose();
     scene.remove(grid);
     grid.geometry.dispose();
     for (const m of gridMats) m.dispose();
@@ -396,7 +380,11 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   return {
     setSelected: (id) => {
       selectedId = id;
+      if (partObjectId && partObjectId !== id) {
+        setPartHighlight(null, null);
+      }
       attachSelected();
+      if (skeletonWanted) syncSkeleton();
     },
     setMode: (mode) => controls.setMode(mode),
     setGrid: (visible) => {
@@ -407,17 +395,36 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
       controls.setRotationSnap(enabled ? Math.PI / 12 : null);
       controls.setScaleSnap(enabled ? 0.1 : null);
     },
+    setSkeleton: (visible) => {
+      if (skeletonWanted === visible) return;
+      skeletonWanted = visible;
+      if (visible) syncSkeleton();
+      else disposeSkeleton();
+      host.wake();
+    },
+    getObjectTree: (id) => {
+      const idx = host.getModelIndex(id);
+      return idx ? getModelTree(idx) : null;
+    },
+    highlightNode: (id, nodeId) => {
+      if (nodeId === null) {
+        // Ignore stale unmount cleanup from a previously selected object's outliner
+        if (partObjectId && id && partObjectId !== id) return;
+        setPartHighlight(null, null);
+        return;
+      }
+      const idx = host.getModelIndex(id);
+      const obj = idx ? getTreeNodeObject(idx, nodeId) : null;
+      setPartHighlight(obj, obj ? id : null);
+    },
     isDragging: (id) =>
       (dragging && id === selectedId) || (id === holdId && performance.now() < holdUntil),
     needsFrames: () =>
-      dragging ||
-      keys.size > 0 ||
-      easeTarget !== null ||
-      dragKind === "look" ||
-      dragKind === "pan" ||
-      (holdId !== null && performance.now() < holdUntil),
+      dragging || cam.needsFrames() || (holdId !== null && performance.now() < holdUntil),
     update,
-    captureCameraState,
+    captureCameraState: cam.getState,
+    setCameraState: cam.setState,
+    focusOn,
     focusSelected,
     resetView,
     dispose,

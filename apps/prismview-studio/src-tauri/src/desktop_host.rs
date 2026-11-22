@@ -18,8 +18,8 @@ use windows::Media::Control::{
 use windows::Storage::Streams::{DataReader, IRandomAccessStreamReference};
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MapWindowPoints, MonitorFromWindow, HDC, HMONITOR,
-    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -30,17 +30,15 @@ use windows::Win32::UI::Shell::{
     QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
-    FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-    GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, KillTimer, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-    SendMessageTimeoutW, SetParent, SetTimer, SetWindowLongW, SetWindowPos, ShowWindow,
-    TranslateMessage, UnregisterClassW, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, HWND_BOTTOM,
-    HWND_TOP, MONITORINFOF_PRIMARY, MSG, SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, WINDOW_STYLE, WM_CLOSE,
-    WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, SetWindowLongW,
+    SetWindowPos, TranslateMessage, UnregisterClassW, GWL_EXSTYLE, HWND_BOTTOM,
+    MONITORINFOF_PRIMARY, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_STYLE,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,12 +102,6 @@ impl GsmtcHandle {
     }
 }
 
-const PROGMAN_W: &[u16] = &[80, 114, 111, 103, 109, 97, 110, 0]; // "Progman\0"
-const WORKERW_W: &[u16] = &[87, 111, 114, 107, 101, 114, 87, 0]; // "WorkerW\0"
-const SHELLDLL_DEFVIEW_W: &[u16] = &[
-    83, 72, 69, 76, 76, 68, 76, 76, 95, 68, 101, 102, 86, 105, 101, 119, 0,
-]; // "SHELLDLL_DefView\0"
-
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s)
         .encode_wide()
@@ -127,126 +119,6 @@ unsafe fn hwnd_class_name(hwnd: HWND) -> String {
     let mut buf = [0u16; 128];
     let len = GetClassNameW(hwnd, &mut buf) as usize;
     String::from_utf16_lossy(&buf[..len])
-}
-
-struct WorkerSearch {
-    worker_w: HWND,
-}
-
-unsafe extern "system" fn enum_worker_proc(top: HWND, lparam: LPARAM) -> BOOL {
-    let state = &mut *(lparam.0 as *mut WorkerSearch);
-    if let Ok(sv) = FindWindowExW(
-        top,
-        HWND::default(),
-        PCWSTR(SHELLDLL_DEFVIEW_W.as_ptr()),
-        PCWSTR::null(),
-    ) {
-        if !sv.is_invalid() {
-            if let Ok(next) = GetWindow(top, GW_HWNDNEXT) {
-                if !next.is_invalid() && hwnd_class_name(next).eq_ignore_ascii_case("WorkerW") {
-                    state.worker_w = next;
-                    return BOOL(0);
-                }
-            }
-            if let Ok(worker) = FindWindowExW(
-                HWND::default(),
-                top,
-                PCWSTR(WORKERW_W.as_ptr()),
-                PCWSTR::null(),
-            ) {
-                if !worker.is_invalid() {
-                    state.worker_w = worker;
-                    return BOOL(0);
-                }
-            }
-        }
-    }
-    BOOL(1)
-}
-
-unsafe fn find_existing_worker_w(progman: HWND) -> Option<HWND> {
-    if !progman.is_invalid() {
-        // Windows 11 24H2: SHELLDLL_DefView stays inside Progman with WorkerW child below it
-        if let Ok(sv) = FindWindowExW(
-            progman,
-            HWND::default(),
-            PCWSTR(SHELLDLL_DEFVIEW_W.as_ptr()),
-            PCWSTR::null(),
-        ) {
-            if !sv.is_invalid() {
-                if let Ok(child_w) =
-                    FindWindowExW(progman, sv, PCWSTR(WORKERW_W.as_ptr()), PCWSTR::null())
-                {
-                    if !child_w.is_invalid() {
-                        return Some(child_w);
-                    }
-                }
-                if let Ok(next_child) = GetWindow(sv, GW_HWNDNEXT) {
-                    if !next_child.is_invalid()
-                        && hwnd_class_name(next_child).eq_ignore_ascii_case("WorkerW")
-                    {
-                        return Some(next_child);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut search = WorkerSearch {
-        worker_w: HWND::default(),
-    };
-    let _ = EnumWindows(
-        Some(enum_worker_proc),
-        LPARAM(&mut search as *mut WorkerSearch as isize),
-    );
-    if !search.worker_w.is_invalid() {
-        Some(search.worker_w)
-    } else {
-        None
-    }
-}
-
-/// Resolves the desktop WorkerW container once; returns `(hwnd, is_true_worker_w)`.
-/// Checks for an existing WorkerW first so Explorer is never spammed with 0x052C unnecessarily.
-pub fn resolve_worker_w_ex() -> (HWND, bool) {
-    unsafe {
-        let progman =
-            FindWindowW(PCWSTR(PROGMAN_W.as_ptr()), PCWSTR::null()).unwrap_or_default();
-
-        if let Some(existing) = find_existing_worker_w(progman) {
-            return (existing, true);
-        }
-
-        if !progman.is_invalid() {
-            let mut result = 0usize;
-            let _ = SendMessageTimeoutW(
-                progman,
-                0x052C,
-                WPARAM(0x0D),
-                LPARAM(0x01),
-                SMTO_ABORTIFHUNG,
-                400,
-                Some(&mut result),
-            );
-            if let Some(found) = find_existing_worker_w(progman) {
-                return (found, true);
-            }
-            let _ = SendMessageTimeoutW(
-                progman,
-                0x052C,
-                WPARAM(0),
-                LPARAM(0),
-                SMTO_ABORTIFHUNG,
-                300,
-                Some(&mut result),
-            );
-            if let Some(found) = find_existing_worker_w(progman) {
-                return (found, true);
-            }
-        }
-
-        (progman, false)
-    }
 }
 
 pub fn virtual_screen_bounds() -> (i32, i32, i32, i32) {
@@ -394,78 +266,6 @@ pub fn is_window_alive(hwnd_raw: isize) -> bool {
         return false;
     }
     unsafe { IsWindow(HWND(hwnd_raw as *mut core::ffi::c_void)).as_bool() }
-}
-
-/// Attaches a per-monitor wallpaper HWND to a pre-resolved WorkerW container
-/// (Win10, Win11 23H2 & 24H2 compatible) using MapWindowPoints for negative coordinates.
-pub fn attach_window_to_resolved_worker_w(
-    hwnd_raw: isize,
-    mon: &MonitorInfoDto,
-    worker_w: HWND,
-    is_true_worker_w: bool,
-) -> isize {
-    let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-    if hwnd.is_invalid() {
-        return 0;
-    }
-    unsafe {
-        let cur_ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let _ = SetWindowLongW(
-            hwnd,
-            GWL_EXSTYLE,
-            (cur_ex | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0) as i32,
-        );
-
-        if !worker_w.is_invalid() && SetParent(hwnd, worker_w).is_ok() {
-            let mut pts = [
-                POINT { x: mon.x, y: mon.y },
-                POINT {
-                    x: mon.x + mon.width,
-                    y: mon.y + mon.height,
-                },
-            ];
-            let _ = MapWindowPoints(HWND::default(), worker_w, &mut pts);
-            let rel_x = pts[0].x;
-            let rel_y = pts[0].y;
-            let rel_w = (pts[1].x - pts[0].x).max(mon.width.max(1));
-            let rel_h = (pts[1].y - pts[0].y).max(mon.height.max(1));
-
-            let cur_style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-            let clean_style = (cur_style & !(WS_POPUP.0 | WS_CAPTION.0 | WS_THICKFRAME.0))
-                | WS_CHILD.0
-                | WS_VISIBLE.0
-                | WS_CLIPSIBLINGS.0;
-            let _ = SetWindowLongW(hwnd, GWL_STYLE, clean_style as i32);
-            // If fallback is Progman (not a dedicated WorkerW), keep at HWND_BOTTOM so desktop icons stay above
-            let z_after = if is_true_worker_w {
-                HWND_TOP
-            } else {
-                HWND_BOTTOM
-            };
-            let _ = SetWindowPos(
-                hwnd,
-                z_after,
-                rel_x,
-                rel_y,
-                rel_w,
-                rel_h,
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            worker_w.0 as isize
-        } else {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_BOTTOM,
-                mon.x,
-                mon.y,
-                mon.width.max(1),
-                mon.height.max(1),
-                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            0
-        }
-    }
 }
 
 pub fn configure_desktop_widget_window(hwnd_raw: isize, locked: bool) {

@@ -27,10 +27,11 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; media-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data: asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost blob: data:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost; media-src 'self' data: blob: asset: http://asset.localhost; font-src 'self' data: asset: http://asset.localhost; connect-src 'self' ws://localhost:1420 http://localhost:1420 ipc: http://ipc.localhost asset: http://asset.localhost blob: data:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": ["$DATA/PrismView/**"]
       }
     }
   },

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for PrismView Studio, Desktop Wallpaper, and Standalone Widgets",
-  "windows": ["main", "wallpaper", "wallpaper-*", "widget-*"],
+  "description": "Default capabilities for PrismView Studio and Standalone Widgets",
+  "windows": ["main", "widget-*"],
   "permissions": [
     "core:default",
     "core:event:default",

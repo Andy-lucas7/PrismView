@@ -378,6 +378,10 @@ pub struct TextContent {
     pub text: String,
     #[serde(default = "default_font_id")]
     pub font_id: String,
+    /// Arquivo de fonte do projeto (.ttf/.otf, caminho absoluto). O motor o registra no load e
+    /// usa a família contida nele quando `font_id` não for achado.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub font_path: String,
     #[serde(default = "default_font_size")]
     pub size_px: StaticOrFx<f32>,
     #[serde(default = "default_font_weight")]
@@ -412,6 +416,7 @@ impl Default for TextContent {
         Self {
             text: default_clock_text(),
             font_id: default_font_id(),
+            font_path: String::new(),
             size_px: default_font_size(),
             weight: default_font_weight(),
             letter_spacing_em: 0.0,
@@ -505,6 +510,14 @@ pub enum LayerKind {
     Svg,
     Image,
     DepthSubject,
+    /// Contêiner sem desenho próprio: filhos posicionados livremente na caixa (GROUP do Estúdio).
+    Group,
+    /// Cena 3D (glTF/PBR) do Estúdio: `LayerNode::scene3d` carrega o `Scene3DConfig` (camelCase).
+    #[serde(rename = "SCENE3D", alias = "SCENE_3D")]
+    Scene3d,
+    /// Vídeo em camada (fora do fundo): `asset` = caminho do arquivo; decodificado por
+    /// `HardwareVideoDecoder` (Media Foundation, zero-copy) no motor.
+    Video,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -577,6 +590,10 @@ pub struct LayerNode {
     pub asset: StaticOrFx<String>,
     #[serde(default)]
     pub svg_paths: Vec<String>,
+    /// Documento SVG completo (ícones do Estúdio / SVG próprio), rasterizado pelo motor (resvg).
+    /// `currentColor` é pintado de branco e tingido por `color` no compositor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub svg_markup: String,
     #[serde(default = "default_svg_dim")]
     pub svg_viewbox_w: f32,
     #[serde(default = "default_svg_dim")]
@@ -587,6 +604,14 @@ pub struct LayerNode {
     pub stack_spacing_px: f32,
     #[serde(default)]
     pub touch: TouchAction,
+    /// `Scene3DConfig` bruto (camelCase, contrato `prismview-engine::scene3d::config`) quando
+    /// `kind == Scene3d`. Mantido como JSON: o prism-core não depende do motor 3D.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene3d: Option<serde_json::Value>,
+    /// Ocupa a caixa inteira do pai (camadas "full-bleed" do Estúdio: vídeo/imagem/3D de fundo);
+    /// `width_px`/`height_px` são ignorados.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fill_parent: bool,
     #[serde(default)]
     pub children: Vec<LayerNode>,
 }
@@ -674,11 +699,14 @@ impl Default for LayerNode {
             text: TextContent::default(),
             asset: default_asset_fx(),
             svg_paths: Vec::new(),
+            svg_markup: String::new(),
             svg_viewbox_w: 24.0,
             svg_viewbox_h: 24.0,
             stack_dir: StackDir::Vertical,
             stack_spacing_px: 12.0,
             touch: TouchAction::default(),
+            scene3d: None,
+            fill_parent: false,
             children: Vec::new(),
         }
     }
@@ -879,6 +907,15 @@ pub struct PrismScene {
     pub custom_assets: BTreeMap<String, String>,
     #[serde(default)]
     pub layers: Vec<LayerNode>,
+    /// Bindings reativos de camadas 2D / parâmetros de vidro (contrato nativo, Fase 4). JSON bruto:
+    /// o motor (`prismview-engine::engine_core::bindings::layers`) faz o parse tolerante.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<serde_json::Value>,
+    /// Espaço lógico do Estúdio (`[w, h]`, ex. 1920×1080 ou o tamanho do widget). Presente = a
+    /// escala de UI da saída é `min(w_px / w, h_px / h)` (como o `containerScale` do Estúdio) em
+    /// vez do fator de DPI do monitor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_size: Option<[f32; 2]>,
 }
 
 fn default_scene_title() -> String {
@@ -902,6 +939,8 @@ impl Default for PrismScene {
             globals: Vec::new(),
             custom_assets: BTreeMap::new(),
             layers: Vec::new(),
+            bindings: Vec::new(),
+            logical_size: None,
         }
     }
 }
@@ -1184,6 +1223,21 @@ pub enum IpcRequest {
     SetStudioPreviewMode {
         active: bool,
     },
+    /// Modo nativo (`--native`): pinta o desktop (WorkerW) com `color` RGBA 0..1; `None` = preto.
+    ClearDesktop {
+        #[serde(default)]
+        color: Option<[f32; 4]>,
+    },
+    /// Fase 5: preferência de energia (`AUTO|NORMAL|ECO|ULTRA|FROZEN`) do `PowerGovernor` nativo.
+    SetPowerPreference {
+        preference: String,
+    },
+    /// Fase 5 (Studio → motor): recarrega a cena de um `PrismScene` JSON salvo em disco
+    /// (`%APPDATA%\PrismView\native\active_scene.json`). Evita limite de tamanho do pipe e
+    /// é o mesmo arquivo que o motor relê ao iniciar sem o Studio.
+    LoadSceneFile {
+        path: String,
+    },
     Shutdown,
 }
 
@@ -1197,6 +1251,9 @@ pub struct EngineStatus {
     pub active_monitor_count: u32,
     pub rendered_frames: u64,
     pub gpu_adapter: String,
+    /// Estado do `PowerGovernor` (`normal|eco|ultra|paused|frozen`); vazio no motor legado.
+    #[serde(default)]
+    pub power_state: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
