@@ -75,6 +75,13 @@ export type { Scene3DCameraCapture, Scene3DGizmoMode };
 
 /** Imperative handle the Studio uses while the Sala 3D editor is mounted */
 export interface Scene3DEditorApi {
+  /** Current free-camera state in orbit form (null until the editor chunk is loaded) */
+  getCameraState: () => Scene3DCameraCapture | null;
+  /** Eases the free camera to an orbit state (`fov` comes from the config, not from here) */
+  setCameraState: (state: Scene3DCameraCapture, animate?: boolean) => void;
+  /** Frames one Sala 3D object; false if it has no pivot/bounds yet */
+  focusOn: (objectId: string) => boolean;
+  /** @deprecated alias of `getCameraState` */
   captureCameraState: () => Scene3DCameraCapture | null;
   focusSelected: () => void;
   resetView: () => void;
@@ -938,10 +945,15 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       }
     };
 
-    /** 0 = no cap (follow the monitor). Editing in the Studio is never throttled. */
+    /** 0 = no cap (follow the monitor). */
     const frameIntervalMs = (eng: NonNullable<typeof engineRef.current>, cfg: Scene3DConfig) => {
-      if (eng.editor || isThumbRef.current) return 0;
+      if (isThumbRef.current) return 0;
       const caps = powerCapsRef.current;
+      if (eng.editor) {
+        // Sala 3D editor: ignores the scene's maxFps but honours the energy cap
+        // (floored at 15 fps so FROZEN/ULTRA stay navigable while editing).
+        return caps.fpsCap !== null ? 1000 / Math.max(15, caps.fpsCap) : 0;
+      }
       let fps = cfg.fpsMode === "MONITOR" ? Infinity : clampScene3DFps(cfg.maxFps);
       if (caps.fpsCap !== null) fps = Math.min(fps, caps.fpsCap);
       return Number.isFinite(fps) ? 1000 / fps : 0;
@@ -1536,7 +1548,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     if (!eng) return;
     const safeW = Math.max(16, Math.round(width));
     const safeH = Math.max(16, Math.round(height));
-    const caps = powerCapsFor(editorWanted ? "NORMAL" : powerState);
+    // Editor honours the energy DPR caps; FROZEN would leave the Sala 3D unusable
+    const caps = powerCapsFor(editorWanted && powerState === "FROZEN" ? "NORMAL" : powerState);
     const dpr = isThumbnail
       ? 1
       : Math.min(window.devicePixelRatio || 1, caps.dprCap) *
@@ -2178,6 +2191,9 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       cur.editor = session;
       if (editorApiRef) {
         editorApiRef.current = {
+          getCameraState: () => session?.captureCameraState() ?? null,
+          setCameraState: (state, animate) => session?.setCameraState(state, animate),
+          focusOn: (objectId) => session?.focusOn(objectId) ?? false,
           captureCameraState: () => session?.captureCameraState() ?? null,
           focusSelected: () => session?.focusSelected(),
           resetView: () => session?.resetView(computeConfigCameraView(configRef.current, 0, 0)),
