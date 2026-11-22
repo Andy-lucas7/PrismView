@@ -15,6 +15,7 @@ import {
   Play,
   Plus,
   Power,
+  Settings,
   Sliders,
   Sparkles,
   Trash2,
@@ -349,13 +350,19 @@ const StudioHubApp: React.FC = () => {
   const [monitors, setMonitors] = useState<MonitorInfoDto[]>([]);
   const [targetMonitorId, setTargetMonitorId] = useState<string | null>(null);
   const [autostart, setAutostart] = useState(false);
+  const [engineTrayEnabled, setEngineTrayEnabled] = useState(true);
+  const [trayBusy, setTrayBusy] = useState(false);
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const optionsRef = useRef<HTMLDivElement | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveRef = useRef<PrismProject | null>(null);
-  // Trava global de ações assíncronas (aplicar/fixar/exportar/importar/excluir): evita clique duplo.
+  // Trava de ações pesadas (aplicar/fixar/exportar/importar/excluir); pausa/autostart têm estado próprio.
   const busyRef = useRef<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [pauseBusy, setPauseBusy] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<PrismProject | null>(null);
   /** `silent`: só reserva a trava (sem re-render), p.ex. sincronizações automáticas de widget. */
   const withBusy = useCallback(async (key: string, fn: () => Promise<void>, silent = false): Promise<boolean> => {
@@ -391,40 +398,48 @@ const StudioHubApp: React.FC = () => {
   }, []);
 
   const loadAll = useCallback(async () => {
-    try {
-      const saved = await invokeCmd<PrismProject[]>("list_projects");
+    const [savedRes, rtRes, autoRes, trayRes] = await Promise.allSettled([
+      invokeCmd<PrismProject[]>("list_projects"),
+      invokeCmd<RuntimeState>("get_runtime_state"),
+      invokeCmd<boolean>("get_autostart_enabled"),
+      invokeCmd<boolean>("get_engine_tray_enabled"),
+    ]);
+
+    if (savedRes.status === "fulfilled") {
+      const saved = savedRes.value;
       if (saved.length > 0) {
         // Border migration: legacy 3D configs (30/60/120 FPS, single modelSrc) → schema 2
         setProjects(saved.map((p) => normalizeProjectScene3D(p)));
       } else {
         const defaults = createDefaultProjects();
         setProjects(defaults);
-        for (const p of defaults) {
-          await invokeCmd("save_project", { project: p }).catch(() => {});
-        }
+        void Promise.all(
+          defaults.map((p) => invokeCmd("save_project", { project: p }).catch(() => {}))
+        );
       }
-    } catch {
+    } else {
       setProjects(createDefaultProjects());
     }
 
-    try {
-      const rt = await invokeCmd<RuntimeState>("get_runtime_state");
+    if (rtRes.status === "fulfilled") {
+      const rt = rtRes.value;
       setRuntime(rt);
       if (rt.monitors?.length) {
         setMonitors(rt.monitors);
       } else {
-        const mons = await invokeCmd<MonitorInfoDto[]>("list_monitors").catch(() => []);
-        if (mons.length) setMonitors(mons);
+        void invokeCmd<MonitorInfoDto[]>("list_monitors")
+          .then((mons) => {
+            if (mons.length) setMonitors(mons);
+          })
+          .catch(() => {});
       }
-    } catch {
-      /* browser mode */
     }
 
-    try {
-      const auto = await invokeCmd<boolean>("get_autostart_enabled");
-      setAutostart(Boolean(auto));
-    } catch {
-      /* browser mode */
+    if (autoRes.status === "fulfilled") {
+      setAutostart(Boolean(autoRes.value));
+    }
+    if (trayRes.status === "fulfilled") {
+      setEngineTrayEnabled(Boolean(trayRes.value));
     }
   }, []);
 
@@ -492,9 +507,11 @@ const StudioHubApp: React.FC = () => {
 
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
+  // Serializa sincronizações automáticas com o desktop (último snapshot vence, sem IPC paralelo).
+  const desktopSyncInFlightRef = useRef(false);
+  const desktopSyncPendingRef = useRef<PrismProject | null>(null);
 
-  const syncIfActiveOnDesktop = useCallback(async (proj: PrismProject) => {
-    if (!isTauriRuntime()) return;
+  const runDesktopSyncNow = useCallback(async (proj: PrismProject) => {
     const rt = runtimeRef.current;
     if (proj.packageType === "WIDGET") {
       if (rt.pinned_widget_ids.includes(proj.id)) {
@@ -509,13 +526,11 @@ const StudioHubApp: React.FC = () => {
       .filter(([, pid]) => pid === proj.id)
       .map(([mid]) => mid);
     if (matchingMonitors.length > 0) {
-      for (const mid of matchingMonitors) {
-        const nextRt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
-          project: withNativeAssets(proj),
-          monitorId: mid,
-        }).catch(() => null);
-        if (nextRt) setRuntime(nextRt);
-      }
+      const nextRt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
+        project: withNativeAssets(proj),
+        monitorId: matchingMonitors[0],
+      }).catch(() => null);
+      if (nextRt) setRuntime(nextRt);
     } else if (rt.active_wallpaper_id === proj.id) {
       const nextRt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
         project: withNativeAssets(proj),
@@ -524,6 +539,28 @@ const StudioHubApp: React.FC = () => {
       if (nextRt) setRuntime(nextRt);
     }
   }, []);
+
+  const syncIfActiveOnDesktop = useCallback(
+    async (proj: PrismProject) => {
+      if (!isTauriRuntime()) return;
+      desktopSyncPendingRef.current = proj;
+      if (desktopSyncInFlightRef.current) return;
+      desktopSyncInFlightRef.current = true;
+      try {
+        while (desktopSyncPendingRef.current) {
+          const next = desktopSyncPendingRef.current;
+          desktopSyncPendingRef.current = null;
+          await runDesktopSyncNow(next);
+        }
+      } finally {
+        desktopSyncInFlightRef.current = false;
+      }
+    },
+    [runDesktopSyncNow]
+  );
+
+  const txActiveRef = useRef(false);
+  const txReleaseCleanupRef = useRef<(() => void) | null>(null);
 
   const flushPendingSave = useCallback(
     async (skipDesktopSync = false) => {
@@ -534,12 +571,59 @@ const StudioHubApp: React.FC = () => {
       const pending = pendingSaveRef.current;
       if (!pending) return;
       pendingSaveRef.current = null;
-      await invokeCmd("save_project", { project: pending }).catch(() => {});
+      // Save border: normalize once on commit/save instead of on every slider frame
+      const normalized = normalizeProjectScene3D(pending);
+      setEditing((cur) => (cur?.id === normalized.id ? normalized : cur));
+      setProjects((prev) =>
+        prev.some((p) => p.id === normalized.id)
+          ? prev.map((p) => (p.id === normalized.id ? normalized : p))
+          : [...prev, normalized]
+      );
+      await invokeCmd("save_project", { project: normalized }).catch(() => {});
       if (!skipDesktopSync) {
-        await syncIfActiveOnDesktop(pending);
+        await syncIfActiveOnDesktop(normalized);
       }
     },
     [syncIfActiveOnDesktop]
+  );
+
+  const setEditingTxActive = useCallback(
+    (active: boolean) => {
+      txActiveRef.current = active;
+      if (txReleaseCleanupRef.current) {
+        txReleaseCleanupRef.current();
+        txReleaseCleanupRef.current = null;
+      }
+      if (active) {
+        // Never fire autosave/desktop sync mid-drag.
+        if (saveTimerRef.current !== null) {
+          window.clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = null;
+        }
+        // Safety net: if pointerup happens outside the control, unlock tx cleanly.
+        const release = () => {
+          if (!txActiveRef.current) return;
+          txActiveRef.current = false;
+          if (txReleaseCleanupRef.current) {
+            txReleaseCleanupRef.current();
+            txReleaseCleanupRef.current = null;
+          }
+          if (pendingSaveRef.current && saveTimerRef.current === null) {
+            saveTimerRef.current = window.setTimeout(() => {
+              saveTimerRef.current = null;
+              void flushPendingSave();
+            }, 220);
+          }
+        };
+        window.addEventListener("pointerup", release, { once: true });
+        window.addEventListener("pointercancel", release, { once: true });
+        txReleaseCleanupRef.current = () => {
+          window.removeEventListener("pointerup", release);
+          window.removeEventListener("pointercancel", release);
+        };
+      }
+    },
+    [flushPendingSave]
   );
 
   useEffect(() => {
@@ -549,35 +633,50 @@ const StudioHubApp: React.FC = () => {
     window.addEventListener("beforeunload", onUnload);
     return () => {
       window.removeEventListener("beforeunload", onUnload);
+      if (txReleaseCleanupRef.current) {
+        txReleaseCleanupRef.current();
+        txReleaseCleanupRef.current = null;
+      }
       void flushPendingSave();
     };
   }, [flushPendingSave]);
 
   const persistProject = useCallback(
-    (incoming: PrismProject) => {
-      // Save border: legacy 3D fields (modelSrc, autoRotateSpeed…) are never written back
-      const next = normalizeProjectScene3D(incoming);
+    (incoming: PrismProject, transient = false) => {
+      // Live path: update ONLY the active editor project (never re-render Hub `projects[]`
+      // or run deep 3D normalization on every slider tick).
+      const next = transient ? incoming : normalizeProjectScene3D(incoming);
       setEditing((cur) => (cur?.id === next.id ? next : cur));
-      setProjects((prev) =>
-        prev.some((p) => p.id === next.id)
-          ? prev.map((p) => (p.id === next.id ? next : p))
-          : [...prev, next]
-      );
       if (pendingSaveRef.current && pendingSaveRef.current.id !== next.id) {
-        const previous = pendingSaveRef.current;
+        const previous = normalizeProjectScene3D(pendingSaveRef.current);
         pendingSaveRef.current = null;
+        setProjects((prev) =>
+          prev.some((p) => p.id === previous.id)
+            ? prev.map((p) => (p.id === previous.id ? previous : p))
+            : [...prev, previous]
+        );
         void invokeCmd("save_project", { project: previous }).catch(() => {});
       }
       pendingSaveRef.current = next;
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+      // Pause debounced disk save & desktop sync while a drag/slider transaction is in progress.
+      if (txActiveRef.current) {
+        return;
       }
       saveTimerRef.current = window.setTimeout(() => {
         saveTimerRef.current = null;
         void flushPendingSave();
-      }, 400);
+      }, 450);
     },
     [flushPendingSave]
+  );
+
+  const persistProjectLive = useCallback(
+    (incoming: PrismProject) => persistProject(incoming, true),
+    [persistProject]
   );
 
   const persistProjectImmediate = useCallback(async (incoming: PrismProject) => {
@@ -599,6 +698,8 @@ const StudioHubApp: React.FC = () => {
   }, []);
 
   const applyWallpaper = async (proj: PrismProject, silent = false) => {
+    // Clique explícito sempre vence qualquer autosave enfileirado.
+    desktopSyncPendingRef.current = null;
     await withBusy(
       `apply:${proj.id}`,
       async () => {
@@ -908,30 +1009,97 @@ const StudioHubApp: React.FC = () => {
   })();
 
   const togglePause = async () => {
-    await withBusy("pause", async () => {
+    if (pauseBusy) return;
+    const nextPaused = !runtimeRef.current.paused;
+    setPauseBusy(true);
+    // Feedback imediato no botão Ativo/Pausado sem esperar outras ações do Hub.
+    setRuntime((prev) => ({ ...prev, paused: nextPaused }));
+    try {
+      const rt = await invokeCmd<RuntimeState>("set_engine_paused", { paused: nextPaused });
+      setRuntime(rt);
+    } catch (err) {
+      setRuntime((prev) => ({ ...prev, paused: !nextPaused }));
+      notify(friendlyError(err, "Não foi possível pausar/retomar o motor."));
+    } finally {
+      setPauseBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!optionsOpen) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (optionsRef.current && !optionsRef.current.contains(ev.target as Node)) {
+        setOptionsOpen(false);
+      }
+    };
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setOptionsOpen(false);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [optionsOpen]);
+
+  const toggleEngineTray = async () => {
+    if (trayBusy) return;
+    const next = !engineTrayEnabled;
+    setTrayBusy(true);
+    setEngineTrayEnabled(next);
+    try {
+      const saved = await invokeCmd<boolean>("set_engine_tray_visible", { visible: next });
+      setEngineTrayEnabled(Boolean(saved));
+      notify(
+        saved
+          ? "Engine visível na bandeja do sistema"
+          : "Engine oculta da bandeja do sistema"
+      );
+    } catch (err) {
+      setEngineTrayEnabled(!next);
+      notify(
+        isTauriRuntime()
+          ? friendlyError(err, "Não foi possível alterar a bandeja da engine.")
+          : "Disponível no app desktop"
+      );
+    } finally {
+      setTrayBusy(false);
+    }
+  };
+
+  const stopBackgroundEngine = async () => {
+    setOptionsOpen(false);
+    await withBusy("stop-engine", async () => {
       try {
-        const rt = await invokeCmd<RuntimeState>("set_engine_paused", { paused: !runtime.paused });
-        setRuntime(rt);
+        await invokeCmd("native_engine_stop");
+        notify("Engine em segundo plano encerrada");
       } catch (err) {
-        notify(friendlyError(err, "Não foi possível pausar/retomar o motor."));
+        notify(
+          isTauriRuntime()
+            ? friendlyError(err, "Não foi possível encerrar a engine.")
+            : "Disponível no app desktop"
+        );
       }
     });
   };
 
   const toggleAutostart = async () => {
-    await withBusy("autostart", async () => {
-      try {
-        const next = await invokeCmd<boolean>("set_autostart_enabled", { enabled: !autostart });
-        setAutostart(Boolean(next));
-        notify(next ? "Iniciar com o Windows ativado" : "Iniciar com o Windows desativado");
-      } catch (err) {
-        notify(
-          isTauriRuntime()
-            ? friendlyError(err, "Não foi possível alterar o início automático.")
-            : "Disponível no app desktop"
-        );
-      }
-    });
+    if (autostartBusy) return;
+    setAutostartBusy(true);
+    try {
+      const next = await invokeCmd<boolean>("set_autostart_enabled", { enabled: !autostart });
+      setAutostart(Boolean(next));
+      notify(next ? "Iniciar com o Windows ativado" : "Iniciar com o Windows desativado");
+    } catch (err) {
+      notify(
+        isTauriRuntime()
+          ? friendlyError(err, "Não foi possível alterar o início automático.")
+          : "Disponível no app desktop"
+      );
+    } finally {
+      setAutostartBusy(false);
+    }
   };
 
   if (editing) {
@@ -942,24 +1110,31 @@ const StudioHubApp: React.FC = () => {
           availableWidgets={widgets}
           telemetry={telemetry}
           onChangeProject={persistProject}
+          onChangeProjectLive={persistProjectLive}
+          onTxStateChange={setEditingTxActive}
           onFlushSave={() => void flushPendingSave()}
           onBack={() => {
+            setEditingTxActive(false);
             void flushPendingSave();
             setEditing(null);
           }}
           applying={busy !== null && (busy.startsWith("apply:") || busy.startsWith("pin:"))}
           exporting={busy !== null && busy.startsWith("export:")}
           onApply={() => {
+            setEditingTxActive(false);
+            const ready = normalizeProjectScene3D(editing);
             void flushPendingSave(true);
-            if (editing.packageType === "WIDGET") {
-              void pinWidget(editing);
+            if (ready.packageType === "WIDGET") {
+              void pinWidget(ready);
             } else {
-              void applyWallpaper(editing);
+              void applyWallpaper(ready);
             }
           }}
           onExport={() => {
+            setEditingTxActive(false);
+            const ready = normalizeProjectScene3D(editing);
             void flushPendingSave();
-            void exportProject(editing);
+            void exportProject(ready);
           }}
         />
         <ToastOverlay message={toast} />
@@ -1036,7 +1211,7 @@ const StudioHubApp: React.FC = () => {
         <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={toggleAutostart}
-            disabled={busy !== null}
+            disabled={autostartBusy}
             title="Iniciar automaticamente com o Windows"
             className={`${LOCK_CLS} rounded-full px-3.5 py-2 text-xs flex items-center gap-1.5 transition ${
               autostart
@@ -1072,7 +1247,7 @@ const StudioHubApp: React.FC = () => {
 
           <button
             onClick={togglePause}
-            disabled={busy !== null}
+            disabled={pauseBusy}
             className={`${LOCK_CLS} frosted-chrome rounded-full px-4 py-2 text-xs flex items-center gap-2 text-white hover:border-white/30 transition`}
           >
             <span
@@ -1083,6 +1258,80 @@ const StudioHubApp: React.FC = () => {
             {runtime.paused ? "Pausado" : "Ativo"}
             {runtime.paused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
           </button>
+
+          <div ref={optionsRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setOptionsOpen((open) => !open)}
+              title="Opções do PrismView e da Engine em segundo plano"
+              aria-expanded={optionsOpen}
+              className={`rounded-full p-2 text-xs flex items-center justify-center transition ${
+                optionsOpen
+                  ? "prism-pill-active"
+                  : "frosted-chrome text-[#A1A1AA] hover:text-white hover:border-white/30"
+              }`}
+            >
+              <Settings className="w-3.5 h-3.5" />
+            </button>
+
+            {optionsOpen && (
+              <div className="absolute right-0 top-11 z-50 w-80 frosted-chrome frosted-chrome-panel rounded-2xl p-4 shadow-2xl border border-white/15 space-y-3">
+                <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                  <span className="text-xs font-semibold text-white">Opções do Aplicativo</span>
+                  <button
+                    type="button"
+                    onClick={() => setOptionsOpen(false)}
+                    aria-label="Fechar opções"
+                    className="text-[#A1A1AA] hover:text-white p-0.5"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <label className="flex items-start justify-between gap-3 cursor-pointer select-none">
+                  <div className="space-y-0.5">
+                    <div className="text-xs font-medium text-white">
+                      Mostrar engine na bandeja do sistema
+                    </div>
+                    <p className="text-[11px] leading-snug text-[#A1A1AA]">
+                      Exibe o ícone na gaveta do Windows enquanto o wallpaper roda em segundo plano,
+                      permitindo pausar ou desligar a engine quando quiser.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={engineTrayEnabled}
+                    disabled={trayBusy}
+                    onClick={() => void toggleEngineTray()}
+                    className={`mt-0.5 shrink-0 w-9 h-5 rounded-full transition-colors relative ${
+                      engineTrayEnabled ? "bg-white" : "bg-white/15"
+                    } ${trayBusy ? "opacity-60" : ""}`}
+                  >
+                    <span
+                      className={`block w-3.5 h-3.5 rounded-full transition-transform absolute top-[3px] ${
+                        engineTrayEnabled
+                          ? "translate-x-[19px] bg-black"
+                          : "translate-x-[3px] bg-white/80"
+                      }`}
+                    />
+                  </button>
+                </label>
+
+                <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-[#A1A1AA]">Processo em segundo plano</span>
+                  <button
+                    type="button"
+                    onClick={() => void stopBackgroundEngine()}
+                    disabled={busy !== null}
+                    className={`${LOCK_CLS} rounded-full px-3 py-1 text-[11px] border border-red-400/30 bg-red-500/10 text-red-200 hover:bg-red-500/20 hover:text-white transition`}
+                  >
+                    Desligar Engine
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 

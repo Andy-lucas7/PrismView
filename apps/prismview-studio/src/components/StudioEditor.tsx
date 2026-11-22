@@ -15,6 +15,7 @@ import {
   EyeOff,
   Film,
   Focus,
+  Folder,
   FolderPlus,
   Gauge,
   Grid3x3,
@@ -37,8 +38,10 @@ import {
   Ungroup,
   Unlock,
   Upload,
+  X,
 } from "lucide-react";
 import {
+  createBindingForPart,
   createLayer,
   createScene3DObject,
   DEFAULT_REACTIVE_SIGNAL,
@@ -55,6 +58,7 @@ import {
   PrismProject,
   ReactiveSignal,
   Scene3DInspectInfo,
+  Scene3DPickedPart,
   SceneLayer,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
@@ -99,6 +103,10 @@ interface StudioEditorProps {
   availableWidgets: PrismProject[];
   telemetry: LiveTelemetry;
   onChangeProject: (next: PrismProject) => void;
+  /** Live transient update path (sliders/canvas drag): skips Hub re-renders and deep 3D normalization. */
+  onChangeProjectLive?: (next: PrismProject) => void;
+  /** Signals active slider/canvas drag transactions so autosave & desktop sync wait for commit. */
+  onTxStateChange?: (active: boolean) => void;
   onFlushSave?: () => void;
   onBack: () => void;
   onApply: () => void;
@@ -159,6 +167,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   availableWidgets,
   telemetry,
   onChangeProject,
+  onChangeProjectLive,
+  onTxStateChange,
   onFlushSave,
   onBack,
   onApply,
@@ -200,6 +210,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   // Bumped when the Sala 3D editor API appears or a model (re)loads → outliner refetches its tree
   const [outlinerRev, setOutlinerRev] = useState(0);
   const bumpOutlinerRev = useCallback(() => setOutlinerRev((r) => r + 1), []);
+  const [pickedPart3d, setPickedPart3d] = useState<Scene3DPickedPart | null>(null);
+  const [selectedBindingId3d, setSelectedBindingId3d] = useState<string | null>(null);
   // Performance HUD (Ctrl+Shift+P)
   const [hudOpen, setHudOpen] = useState(false);
   const [hudStats, setHudStats] = useState<Record<string, Scene3DStats>>({});
@@ -378,6 +390,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   selectedIdsRef.current = validSelectedIds;
   const totalLayersCount = useMemo(() => countAllLayers(project.layers), [project.layers]);
 
+  const emitLiveProject = onChangeProjectLive ?? onChangeProject;
+
+  useEffect(() => {
+    return () => {
+      onTxStateChange?.(false);
+    };
+  }, [onTxStateChange]);
+
   const applyDiscreteChange = useCallback(
     (next: PrismProject) => {
       history.pushSnapshot(projectRef.current);
@@ -389,20 +409,20 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   const applyCoalescedChange = useCallback(
     (next: PrismProject) => {
       history.recordCoalesced(projectRef.current, 350);
-      onChangeProject(next);
+      emitLiveProject(next);
     },
-    [history, onChangeProject]
+    [history, emitLiveProject]
   );
 
   const patchLayerRaw = useCallback(
     (id: string, fn: (l: SceneLayer) => SceneLayer) => {
       const cur = projectRef.current;
-      onChangeProject({
+      emitLiveProject({
         ...cur,
         layers: updateLayerById(cur.layers, id, fn),
       });
     },
-    [onChangeProject]
+    [emitLiveProject]
   );
 
   const patchMultiplePositionsRaw = useCallback(
@@ -410,7 +430,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       if (moves.length === 0) return;
       const map = new Map(moves.map((m) => [m.id, m]));
       const cur = projectRef.current;
-      onChangeProject({
+      emitLiveProject({
         ...cur,
         layers: updateLayersByIds(cur.layers, new Set(map.keys()), (l) => {
           const target = map.get(l.id);
@@ -418,7 +438,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         }),
       });
     },
-    [onChangeProject]
+    [emitLiveProject]
   );
 
   const patchLayer = useCallback(
@@ -429,12 +449,19 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     ) => {
       if (mode === "discrete") {
         history.pushSnapshot(projectRef.current);
-      } else if (mode === "coalesced") {
+        const cur = projectRef.current;
+        onChangeProject({
+          ...cur,
+          layers: updateLayerById(cur.layers, id, fn),
+        });
+        return;
+      }
+      if (mode === "coalesced") {
         history.recordCoalesced(projectRef.current, 350);
       }
       patchLayerRaw(id, fn);
     },
-    [history, patchLayerRaw]
+    [history, onChangeProject, patchLayerRaw]
   );
 
   const handleSelectLayer = useCallback(
@@ -557,7 +584,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
   const saveWallpaperCamera = useCallback(() => {
     const layerId = room3dLayerIdRef.current;
-    const cap = editorApiRef.current?.captureCameraState();
+    const cap = editorApiRef.current?.getCameraState();
     if (!layerId || !cap) return;
     patchLayer(
       layerId,
@@ -657,6 +684,43 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     setHudStats((prev) => ({ ...prev, [layerId]: st }));
   }, []);
 
+  useEffect(() => {
+    if (!room3dMode) setPickedPart3d(null);
+  }, [room3dMode]);
+
+  useEffect(() => {
+    if (pickedPart3d && (!selected3dObjectId || pickedPart3d.objectId !== selected3dObjectId)) {
+      setPickedPart3d(null);
+    }
+  }, [pickedPart3d, selected3dObjectId]);
+
+  const interactWithPickedPart = useCallback(
+    (part: Scene3DPickedPart) => {
+      const layerId = room3dLayerIdRef.current ?? selectedLayerIdRef.current;
+      if (!layerId) return;
+      const binding = createBindingForPart(part);
+      patchLayer(
+        layerId,
+        (l) => {
+          const s3d = l.scene3d ?? defaultScene3D();
+          return {
+            ...l,
+            scene3d: {
+              ...s3d,
+              bindings: [...(s3d.bindings ?? []), binding],
+            },
+          };
+        },
+        "discrete"
+      );
+      setSelectedIds([layerId]);
+      setSelected3dObjectId(part.objectId);
+      setInspectorMode("LAYER");
+      setSelectedBindingId3d(binding.id);
+    },
+    [patchLayer]
+  );
+
   const room3dBinding: Room3DEditBinding | null =
     room3dMode && room3dLayer
       ? {
@@ -668,6 +732,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           showSkeleton: showSkeleton3d,
           onEditorSync: bumpOutlinerRev,
           onSelectObject: setSelected3dObjectId,
+          onPickPart: setPickedPart3d,
           onCommitObjectTransform: commitRoomTransform,
           editorApiRef,
         }
@@ -1573,7 +1638,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           )}
           <button
             onClick={onExport}
-            disabled={exporting || applying}
+            disabled={exporting}
             aria-busy={exporting}
             className="frosted-chrome rounded-full px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-[#A1A1AA]"
           >
@@ -1582,7 +1647,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           </button>
           <button
             onClick={onApply}
-            disabled={applying || exporting}
+            disabled={applying}
             aria-busy={applying}
             className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
           >
@@ -1861,9 +1926,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             }
             onDragStateChange={(dragging) => {
               if (dragging) {
+                onTxStateChange?.(true);
                 history.beginTransaction(projectRef.current);
               } else {
                 history.commitTransaction(projectRef.current);
+                onTxStateChange?.(false);
                 onFlushSave?.();
               }
             }}
@@ -1973,7 +2040,46 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           )}
           {room3dMode && (
             <div className="pointer-events-none absolute top-3 left-3 z-40 frosted-chrome rounded-xl px-2.5 py-1.5 text-[10px] text-[#D4D4D8] leading-relaxed">
-              Botão dir. + WASD/QE: voar · Meio/Alt: pan · Scroll: zoom · Clique: selecionar
+              Botão dir. + WASD/QE: voar · Meio/Alt+arrastar: pan · Alt+Clique: peça · Scroll: zoom · Clique: selecionar
+            </div>
+          )}
+          {room3dMode && room3dLayer && pickedPart3d && (
+            <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-40 frosted-chrome rounded-full pl-3 pr-1.5 py-1 flex items-center gap-2 text-[11px] text-white border border-amber-300/40 shadow-2xl">
+              {pickedPart3d.type === "bone" ? (
+                <Bone className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+              ) : pickedPart3d.type === "mesh" ? (
+                <Box className="w-3.5 h-3.5 text-amber-200 shrink-0" />
+              ) : (
+                <Folder className="w-3.5 h-3.5 text-amber-200 shrink-0" />
+              )}
+              <span className="text-[10px] text-[#A1A1AA]">
+                {pickedPart3d.type === "bone"
+                  ? "Osso"
+                  : pickedPart3d.type === "mesh"
+                  ? "Malha"
+                  : "Grupo"}
+              </span>
+              <span className="font-mono-fx max-w-[180px] truncate" title={pickedPart3d.name}>
+                {pickedPart3d.name}
+              </span>
+              <button
+                type="button"
+                onClick={() => interactWithPickedPart(pickedPart3d)}
+                className="rounded-full px-2.5 py-1 bg-amber-300 text-black font-medium text-[10px] hover:bg-amber-200 transition shrink-0"
+              >
+                + Interagir com esta parte
+              </button>
+              <button
+                type="button"
+                title="Limpar seleção da parte"
+                onClick={() => {
+                  editorApiRef.current?.highlightNode(pickedPart3d.objectId, null);
+                  setPickedPart3d(null);
+                }}
+                className="rounded-full p-1 text-[#A1A1AA] hover:text-white hover:bg-white/10 transition"
+              >
+                <X className="w-3 h-3" />
+              </button>
             </div>
           )}
           {hudOpen && (
@@ -2028,6 +2134,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         room3dMode={room3dMode}
         editorApiRef={editorApiRef}
         outlinerRev={outlinerRev}
+        pickedPart3d={pickedPart3d}
+        onPickPart3d={setPickedPart3d}
+        onInteractPickedPart={interactWithPickedPart}
+        selectedBindingId={selectedBindingId3d}
+        onSelectBindingId={setSelectedBindingId3d}
         onAdd3dGlbObject={() => void addGlbObjectTo3DLayer()}
         test3dMode={test3dMode}
         onToggleTest3d={() => setViewMode(test3dMode ? "LAYOUT" : "TEST")}
@@ -2037,7 +2148,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         onAddChildToGroup={addChildToGroup}
         onApplyDiscreteProject={applyDiscreteChange}
         onApplyCoalescedProject={applyCoalescedChange}
-        onChangeProjectRaw={onChangeProject}
+        onChangeProjectRaw={emitLiveProject}
         onPickFile={pickFileForLayer}
         onPickDynamicTexImage={async (objectId: string, texId: string) => {
           const targetId = selectedLayerIdRef.current;
@@ -2079,9 +2190,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           }
         }}
         onOpenFx={setFxTarget}
-        onBeginTx={() => history.beginTransaction(projectRef.current)}
+        onBeginTx={() => {
+          onTxStateChange?.(true);
+          history.beginTransaction(projectRef.current);
+        }}
         onCommitTx={() => {
           history.commitTransaction(projectRef.current);
+          onTxStateChange?.(false);
           onFlushSave?.();
         }}
         onRecordStep={() => history.pushSnapshot(projectRef.current)}

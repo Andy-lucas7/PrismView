@@ -40,8 +40,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-/// Tint padrão do vidro nativo (≈ 0,15 de alpha), o Estúdio guarda só RGB.
-const GLASS_TINT_ALPHA: f64 = 0.15;
 /// Espaço lógico de wallpapers: `min(w, h) / 1080` = `containerScale` do Estúdio.
 const WALLPAPER_LOGICAL: f64 = 1080.0;
 /// Caixa (px lógicos) que cobre qualquer aspecto ≤ 32:9 com escala `h/1080`.
@@ -622,20 +620,25 @@ fn glass_plate(node: &mut Value, glass: &Value) {
     }
 }
 
-/// `GlassEffect` → `OpticalCrystalParams`. Hipóteses (mesmas do `scene2d::glass_params`, no
-/// sentido inverso): aberração cromática px = dispersão ×400; especular → fresnel; borda → aro.
+/// `GlassEffect` → `OpticalCrystalParams` em paridade 1:1 com `OpticalGlassSurface.tsx` e
+/// `opticalGlassWebGL.ts` (luz top-left `normalize(-0.65, -0.76)` ≈ 229,5°, brilho/contraste,
+/// dispersão = `chromaticAberration / 400`, especular → fresnel, borda → aro).
 fn crystal(g: &Value) -> Value {
+    let frost = number(g, "frostOpacity", 0.08).clamp(0.0, 0.94);
     json!({
-        "blur_px": number(g, "blurPx", 22.0).max(0.0),
-        "refraction": number(g, "refractionScale", 16.0),
-        "bevel_width": number(g, "bevelWidth", 22.0).clamp(0.0, 80.0),
+        "blur_px": number(g, "blurPx", 22.0).clamp(0.0, 80.0),
+        "refraction": number(g, "refractionScale", 16.0).clamp(0.0, 60.0),
+        "bevel_width": number(g, "bevelWidth", 22.0).clamp(4.0, 80.0),
         "dispersion_rgb": number(g, "chromaticAberration", 0.0).clamp(0.0, 6.0) / 400.0,
-        "frost_amount": number(g, "frostOpacity", 0.08).clamp(0.0, 0.94),
-        "fresnel_intensity": number(g, "specularIntensity", 0.45).max(0.0),
-        "prismatic_rim_intensity": number(g, "borderOpacity", 0.16).max(0.0),
-        "saturation": number(g, "saturation", 1.2).max(0.0),
-        "tint_rgba": css_to_argb(non_empty(text(g, "tintColor"), "#FFFFFF"), GLASS_TINT_ALPHA),
-        "grain": number(g, "noiseOpacity", 0.04).max(0.0),
+        "frost_amount": frost,
+        "light_angle_deg": 229.5,
+        "fresnel_intensity": number(g, "specularIntensity", 0.45).clamp(0.0, 1.0),
+        "prismatic_rim_intensity": number(g, "borderOpacity", 0.16).clamp(0.0, 0.8),
+        "brightness": number(g, "brightness", 1.06).clamp(0.5, 1.8),
+        "contrast": number(g, "contrast", 1.04).clamp(0.6, 1.8),
+        "saturation": number(g, "saturation", 1.2).clamp(0.0, 2.6),
+        "tint_rgba": css_to_argb(non_empty(text(g, "tintColor"), "#FFFFFF"), frost),
+        "grain": number(g, "noiseOpacity", 0.04).clamp(0.0, 0.4),
     })
 }
 
@@ -1254,10 +1257,10 @@ mod tests {
     fn asset_urls() {
         assert_eq!(
             local_path("http://asset.localhost/C%3A%5CUsers%5Ca%20b.png").as_deref(),
-            Some("C:\Users\a b.png")
+            Some(r"C:\Users\a b.png")
         );
         assert_eq!(local_path("blob:xyz"), None);
-        assert_eq!(local_path("D:\m.glb").as_deref(), Some("D:\m.glb"));
+        assert_eq!(local_path(r"D:\m.glb").as_deref(), Some(r"D:\m.glb"));
     }
 
     #[test]
@@ -1268,11 +1271,11 @@ mod tests {
             "globals": [{ "name": "show", "kind": "SWITCH", "value": "1", "label": "", "exposed": true }],
             "layers": [
                 layer("bg", "IMAGE", json!({ "width": 1920, "height": 1080,
-                    "image": { "src": "C:\bg.jpg", "objectFit": "cover", "borderRadius": 0 } })),
+                    "image": { "src": r"C:\bg.jpg", "objectFit": "cover", "borderRadius": 0 } })),
                 layer("clock", "TEXT", json!({ "y": 0.4, "parallaxX": 0.5,
-                    "glass": { "enabled": true, "blurPx": 20, "tintColor": "#FFFFFF" },
-                    "text": { "content": "$df(HH:mm)$", "fontFamily": "Minha", "fontPath": "C:\f.ttf", "fontSize": 180,
-                              "fontWeight": 700, "letterSpacing": 0, "align": "center", "color": "#FFFFFF",
+                    "glass": { "enabled": true, "blurPx": 20, "frostOpacity": 0, "brightness": 1.36, "contrast": 1.12, "tintColor": "#FFFFFF" },
+                    "text": { "content": "$df(HH:mm)$", "fontFamily": "Minha", "fontPath": r"C:\f.ttf", "fontSize": 180,
+                              "fontWeight": 700, "letterSpacing": 0, "align": "center", "color": "#FAFAFA", "colorAlpha": 0.65,
                               "stemStretch": 1, "shadowBlur": 0 },
                     "fx": { "opacity": "$gv(show)$" } })),
                 layer("room", "SCENE_3D", json!({ "width": 1920, "height": 1080,
@@ -1289,7 +1292,12 @@ mod tests {
         let layers = scene["layers"].as_array().expect("layers");
         assert_eq!(layers[0]["kind"], "TEXT");
         assert_eq!(layers[0]["fill"], "OPTICAL_CRYSTAL");
-        assert_eq!(layers[0]["text"]["font_path"], "C:\f.ttf");
+        assert_eq!(layers[0]["color"], "#A6FAFAFA");
+        assert_eq!(layers[0]["crystal"]["frost_amount"], 0.0);
+        assert_eq!(layers[0]["crystal"]["brightness"], 1.36);
+        assert_eq!(layers[0]["crystal"]["contrast"], 1.12);
+        assert_eq!(layers[0]["crystal"]["light_angle_deg"], 229.5);
+        assert_eq!(layers[0]["text"]["font_path"], r"C:\f.ttf");
         assert_eq!(layers[0]["opacity"]["expr"], "$gv(show)$");
         assert_eq!(layers[1]["kind"], "SCENE3D");
         assert_eq!(layers[1]["fill_parent"], true);
@@ -1299,7 +1307,7 @@ mod tests {
         assert!(s3d.get("modelSrc").is_none());
         assert_eq!(s3d["objects"][0]["id"], "obj-primary");
         assert_eq!(s3d["objects"][0]["kind"], "GLB");
-        assert_eq!(s3d["objects"][0]["modelSrc"], "D:\m.glb");
+        assert_eq!(s3d["objects"][0]["modelSrc"], r"D:\m.glb");
         assert_eq!(s3d["objects"][0]["scale"][1], 2.0);
         assert_eq!(s3d["objects"][0]["autoRotateSpeed"], 0.0);
         let swing = &s3d["bindings"][0];
@@ -1318,8 +1326,8 @@ mod tests {
     fn video_svg_and_actions_never_block() {
         let project = json!({
             "id": "p", "packageType": "WALLPAPER", "layers": [
-                layer("v", "VIDEO", json!({ "width": 1920, "height": 1080, "video": { "src": "C:\v.mp4", "muted": true } })),
-                layer("clip", "VIDEO", json!({ "video": { "src": "C:\c.mp4", "clipRadius": 12 } })),
+                layer("v", "VIDEO", json!({ "width": 1920, "height": 1080, "video": { "src": r"C:\v.mp4", "muted": true } })),
+                layer("clip", "VIDEO", json!({ "video": { "src": r"C:\c.mp4", "clipRadius": 12 } })),
                 layer("play", "SVG", json!({ "clickAction": "MEDIA_PLAY_PAUSE",
                     "svg": { "iconName": "play", "customSvg": "", "color": "#FF0000", "strokeWidth": 1.6,
                              "resolvedSvg": "<svg viewBox=\"0 0 24 24\" fill=\"currentColor\"><polygon points=\"6 4 20 12 6 20\"/></svg>",
@@ -1332,7 +1340,7 @@ mod tests {
         assert_eq!(scene["background"]["type"], "VIDEO");
         let layers = scene["layers"].as_array().expect("layers");
         assert_eq!(layers[0]["kind"], "VIDEO");
-        assert_eq!(layers[0]["asset"], "C:\c.mp4");
+        assert_eq!(layers[0]["asset"], r"C:\c.mp4");
         assert_eq!(layers[1]["kind"], "SVG");
         assert_eq!(layers[2]["id"], "play__playing");
         assert_eq!(layers[2]["visible"]["expr"], "$mi(playing)$");

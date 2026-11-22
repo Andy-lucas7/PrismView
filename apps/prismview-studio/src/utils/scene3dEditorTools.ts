@@ -27,7 +27,13 @@ import {
   type Scene3DEditorView,
 } from "../engine/scene3d/editorCamera";
 import type { ModelSceneIndex } from "../engine/scene3d/modelIndex";
-import { getModelTree, getTreeNodeObject, type Scene3DObjectTree } from "../engine/scene3d/modelTree";
+import {
+  getModelTree,
+  getTreeNodeId,
+  getTreeNodeObject,
+  type Scene3DObjectTree,
+} from "../engine/scene3d/modelTree";
+import type { Scene3DPickedPart } from "../types/prism";
 
 export type { Scene3DCameraCapture, Scene3DEditorView };
 
@@ -42,8 +48,11 @@ export interface Scene3DEditorHost {
   /** Index of the loaded model of an object (null while loading / unknown) */
   getModelIndex: (objectId: string) => ModelSceneIndex | null;
   pickObjectAt: (nx: number, ny: number) => string | null;
+  /** Raycast for Alt+Click part picking: resolves the most useful named bone/group/mesh under cursor */
+  pickPartAt: (nx: number, ny: number) => { objectId: string; node: Object3D } | null;
   wake: () => void;
   onSelectObject: (objectId: string | null) => void;
+  onPickPart: (part: Scene3DPickedPart | null) => void;
   onCommitTransform: (
     objectId: string,
     position: [number, number, number],
@@ -96,6 +105,43 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     // Camera drag (Alt+LMB pan, RMB...) owns the pointer: the gizmo must not start a drag too
     onNavigate: (active) => {
       controls.enabled = !active;
+    },
+    // Alt+LMB without drag: pick the bone/part under cursor without conflicting with Alt+drag pan
+    onAltClick: (clientX, clientY) => {
+      const rect = canvas.getBoundingClientRect();
+      const nx = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+      const ny = Math.max(0, Math.min(1, (clientY - rect.top) / Math.max(1, rect.height)));
+      const hit = host.pickPartAt(nx, ny);
+      if (!hit) {
+        setPartHighlight(null, null);
+        host.onPickPart(null);
+        return;
+      }
+      const idx = host.getModelIndex(hit.objectId);
+      const tree = idx ? getModelTree(idx) : null;
+      const nodeId = idx ? getTreeNodeId(idx, hit.node) : null;
+      const treeNode = tree && nodeId !== null ? tree.flat[nodeId] ?? null : null;
+      const rawName = hit.node.name || treeNode?.name || "__ROOT__";
+      const name = rawName === "(sem nome)" ? "__ROOT__" : rawName;
+      const type: Scene3DPickedPart["type"] =
+        treeNode?.type ??
+        ((hit.node as Object3D & { isBone?: boolean }).isBone
+          ? "bone"
+          : (hit.node as Object3D & { isMesh?: boolean }).isMesh
+          ? "mesh"
+          : "group");
+      setPartHighlight(hit.node, hit.objectId);
+      if (hit.objectId !== selectedId) {
+        host.onSelectObject(hit.objectId);
+      }
+      host.onPickPart({
+        objectId: hit.objectId,
+        nodeId: nodeId ?? -1,
+        name,
+        type,
+        morphs: treeNode?.morphs ?? [],
+        materials: treeNode?.materials ?? [],
+      });
     },
   });
   const focusBox = new Box3();
@@ -160,12 +206,13 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
     scene.add(helper);
   };
 
-  // ── Part highlight (outliner click): one Box3Helper reused for every part ─────
+  // ── Part highlight (outliner / Alt+Click): one Box3Helper reused for every part ──
   const partBox = new Box3();
   const partPos = new Vector3();
   const partSize = new Vector3(0.08, 0.08, 0.08);
   let partHelper: Box3Helper | null = null;
   let partObject: Object3D | null = null;
+  let partObjectId: string | null = null;
 
   const disposePartHelper = () => {
     if (!partHelper) return;
@@ -184,6 +231,30 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
       partBox.setFromCenterAndSize(partPos, partSize);
     }
     partHelper.box.copy(partBox);
+  };
+
+  const setPartHighlight = (obj: Object3D | null, ownerId: string | null) => {
+    if (!obj) {
+      partObject = null;
+      partObjectId = null;
+      disposePartHelper();
+      host.wake();
+      return;
+    }
+    if (!partHelper) {
+      partHelper = new Box3Helper(partBox, 0xffb454);
+      partHelper.renderOrder = 999;
+      const mat = partHelper.material as LineBasicMaterial;
+      mat.transparent = true;
+      mat.opacity = 0.95;
+      mat.depthTest = false;
+      mat.toneMapped = false;
+      scene.add(partHelper);
+    }
+    partObject = obj;
+    partObjectId = ownerId;
+    updatePartBox();
+    host.wake();
   };
 
   let attachedPivot: Object3D | null = null;
@@ -309,6 +380,9 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
   return {
     setSelected: (id) => {
       selectedId = id;
+      if (partObjectId && partObjectId !== id) {
+        setPartHighlight(null, null);
+      }
       attachSelected();
       if (skeletonWanted) syncSkeleton();
     },
@@ -333,27 +407,15 @@ export function createScene3DEditorSession(host: Scene3DEditorHost): Scene3DEdit
       return idx ? getModelTree(idx) : null;
     },
     highlightNode: (id, nodeId) => {
-      const idx = nodeId === null ? null : host.getModelIndex(id);
-      const obj = idx && nodeId !== null ? getTreeNodeObject(idx, nodeId) : null;
-      if (!obj) {
-        partObject = null;
-        disposePartHelper();
-        host.wake();
+      if (nodeId === null) {
+        // Ignore stale unmount cleanup from a previously selected object's outliner
+        if (partObjectId && id && partObjectId !== id) return;
+        setPartHighlight(null, null);
         return;
       }
-      if (!partHelper) {
-        partHelper = new Box3Helper(partBox, 0xffb454);
-        partHelper.renderOrder = 999;
-        const mat = partHelper.material as LineBasicMaterial;
-        mat.transparent = true;
-        mat.opacity = 0.95;
-        mat.depthTest = false;
-        mat.toneMapped = false;
-        scene.add(partHelper);
-      }
-      partObject = obj;
-      updatePartBox();
-      host.wake();
+      const idx = host.getModelIndex(id);
+      const obj = idx ? getTreeNodeObject(idx, nodeId) : null;
+      setPartHighlight(obj, obj ? id : null);
     },
     isDragging: (id) =>
       (dragging && id === selectedId) || (id === holdId && performance.now() < holdUntil),

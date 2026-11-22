@@ -1496,6 +1496,7 @@ async fn apply_desktop_wallpaper(
             !st.pinned_widgets.is_empty()
         };
         ensure_engine_login_autostart(has_widgets);
+        sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1515,6 +1516,7 @@ async fn clear_desktop_wallpaper(
     let _ = monitor_id;
     tauri::async_runtime::spawn_blocking(move || {
         clear_wallpaper_inner(&app, &state_arc, None)?;
+        sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1685,6 +1687,7 @@ async fn pin_standalone_widget(
     let state_arc = Arc::clone(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         pin_widget_inner(&app, &state_arc, project, true)?;
+        sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1721,6 +1724,7 @@ async fn unpin_standalone_widget(
         if let Some(win) = app.get_webview_window(&label) {
             let _ = win.close();
         }
+        sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1814,6 +1818,8 @@ fn apply_manual_pause_inner(app: &AppHandle, state: &SharedState, paused: bool) 
         (wps, wgs, !paused && st.desktop_visible)
     };
     let reason = if paused { "manual_pause" } else { "resumed" };
+    // Propaga pausa/retomada ao motor nativo em background (não bloqueia a UI).
+    std::thread::spawn(move || native_engine::set_paused(paused));
     for (lbl, vis) in wp_targets.into_iter().chain(wg_targets) {
         let _ = app.emit_to(
             &lbl,
@@ -1899,6 +1905,42 @@ fn set_engine_paused(
 ) -> Result<RuntimeStateDto, String> {
     apply_manual_pause_inner(&app, state.inner(), paused)?;
     get_runtime_state(state)
+}
+
+/// Coordena o ícone de bandeja do Studio (`studio_tray`) com o ícone nativo do `prismview-engine`
+/// para nunca existirem 2 ícones duplicados ao mesmo tempo:
+/// - Quando a engine está rodando com bandeja ativa, ela assume o ícone único.
+/// - O tray do Studio só aparece quando há widgets fixados sem o tray da engine visível.
+fn sync_studio_tray_visibility(app: &AppHandle, state: &SharedState) {
+    let Some(tray) = app.tray_by_id("studio_tray") else {
+        return;
+    };
+    let has_widgets = state
+        .lock()
+        .map(|st| !st.pinned_widgets.is_empty())
+        .unwrap_or(false);
+    let engine_owns_tray = native_engine::get_tray_enabled() && native_engine::is_running_fast();
+    let show_studio_tray = has_widgets && !engine_owns_tray;
+    let _ = tray.set_visible(show_studio_tray);
+}
+
+#[tauri::command]
+fn get_engine_tray_enabled() -> Result<bool, String> {
+    Ok(native_engine::get_tray_enabled())
+}
+
+#[tauri::command]
+async fn set_engine_tray_visible(
+    app: AppHandle,
+    state: tauri::State<'_, SharedState>,
+    visible: bool,
+) -> Result<bool, String> {
+    let state_arc = Arc::clone(state.inner());
+    let result = tauri::async_runtime::spawn_blocking(move || native_engine::set_tray_visible(visible))
+        .await
+        .map_err(|e| format!("tray_visible_task: {e}"))??;
+    sync_studio_tray_visibility(&app, &state_arc);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2827,7 +2869,7 @@ pub fn run() {
 
             let st_menu = Arc::clone(&state_for_setup);
             let autostart_item = toggle_autostart.clone();
-            let mut tray_builder = TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::with_id("studio_tray")
                 .menu(&menu)
                 .tooltip("PrismView")
                 .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -2880,7 +2922,9 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon().cloned() {
                 tray_builder = tray_builder.icon(icon);
             }
-            let _ = tray_builder.build(app)?;
+            let studio_tray = tray_builder.build(app)?;
+            // Inicia oculto até sincronizar com widgets/engine (evita flash de 2 ícones).
+            let _ = studio_tray.set_visible(false);
 
             // Enumerar monitores físicos iniciais e restaurar última sessão (compatível com schema legado e multi-monitor)
             let initial_monitors = desktop_host::enumerate_monitors();
@@ -2948,6 +2992,7 @@ pub fn run() {
                         Some(project) => engine.apply_project(&project),
                         None => engine.ensure_running(),
                     };
+                    sync_studio_tray_visibility(&handle_for_migration, &state_for_migration);
                     let Err(err) = result else { return };
                     eprintln!("[prismview-studio] motor nativo: {err}");
                     if !migrating {
@@ -3048,6 +3093,8 @@ pub fn run() {
             set_widget_locked,
             widget_window_ready,
             set_engine_paused,
+            get_engine_tray_enabled,
+            set_engine_tray_visible,
             get_autostart_enabled,
             set_autostart_enabled,
             get_runtime_state,

@@ -45,8 +45,10 @@ import {
   Scene3DInspectInfo,
   Scene3DObject,
   Scene3DObjectInspectInfo,
+  Scene3DPickedPart,
 } from "../types/prism";
 import {
+  applyConfigCamera,
   applyDayNightLighting,
   applySceneBackground,
   buildProceduralEnvironment,
@@ -63,6 +65,7 @@ import {
   matchesMeshTarget,
   type ModelSceneIndex,
   nodeUnitScale,
+  resolvePickedPartNode,
 } from "../engine/scene3d/modelIndex";
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
 import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
@@ -142,6 +145,8 @@ export interface Scene3DLayerProps {
   /** Sala 3D: fires when the editor API becomes available and after every model (re)load, so the outliner can refetch */
   onEditorSync?: () => void;
   onSelectObject?: (objectId: string | null) => void;
+  /** Sala 3D: fires on Alt+Click in the viewport with the resolved bone/part (or null on empty space) */
+  onPickPart?: (part: Scene3DPickedPart | null) => void;
   onCommitObjectTransform?: (
     objectId: string,
     position: [number, number, number],
@@ -376,6 +381,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   showSkeleton = false,
   onEditorSync,
   onSelectObject,
+  onPickPart,
   onCommitObjectTransform,
   editorApiRef,
   onStats,
@@ -463,6 +469,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   onStatsRef.current = onStats;
   const onSelectObjectRef = useRef(onSelectObject);
   onSelectObjectRef.current = onSelectObject;
+  const onPickPartRef = useRef(onPickPart);
+  onPickPartRef.current = onPickPart;
   const onEditorSyncRef = useRef(onEditorSync);
   onEditorSyncRef.current = onEditorSync;
   const onCommitTransformRef = useRef(onCommitObjectTransform);
@@ -508,6 +516,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     statsWasSleeping: boolean;
     cancelFrames: () => void;
     pick: (nx: number, ny: number) => string | null;
+    pickPart: (nx: number, ny: number) => { objectId: string; node: Object3D } | null;
     lastRenderMs: number;
     lastFrameMs: number;
     curOrbitAz: number;
@@ -596,6 +605,13 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     const tmpInvQuat = new Quaternion();
     const tmpGlowColor = new Color("#dce6ff");
     const rayBox = new Box3();
+    const rayHitPoint = new Vector3();
+    const rayHitResult: {
+      object: Object3D;
+      objectId: string;
+      face: { a: number; b: number; c: number } | null;
+      point: Vector3;
+    } = { object: stagePivot, objectId: "", face: null, point: rayHitPoint };
 
     // ── 3.1/3.2 per-frame reuse: nothing below is allocated inside renderFrame ──
     const DEG2RAD = Math.PI / 180;
@@ -849,13 +865,19 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       eng: NonNullable<typeof engineRef.current>,
       nx: number,
       ny: number
-    ): { object: Object3D; objectId: string } | null => {
+    ): {
+      object: Object3D;
+      objectId: string;
+      face: { a: number; b: number; c: number } | null;
+      point: Vector3;
+    } | null => {
       if (eng.objectsMap.size === 0) return null;
       eng.camera.updateMatrixWorld();
       eng.rayNdc.set(nx * 2 - 1, -(ny * 2 - 1));
       eng.raycaster.setFromCamera(eng.rayNdc, eng.camera);
       let bestDist = Infinity;
       let bestHit: Object3D | null = null;
+      let bestFace: { a: number; b: number; c: number } | null = null;
       let bestObjId = "";
       eng.objectsMap.forEach((rt, objId) => {
         if (!rt.pivot.visible || !rt.modelIndex || rt.modelIndex.meshes.length === 0) return;
@@ -876,10 +898,16 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         if (hits.length > 0 && hits[0].distance < bestDist) {
           bestDist = hits[0].distance;
           bestHit = hits[0].object;
+          bestFace = hits[0].face ?? null;
+          rayHitPoint.copy(hits[0].point);
           bestObjId = objId;
         }
       });
-      return bestHit ? { object: bestHit, objectId: bestObjId } : null;
+      if (!bestHit) return null;
+      rayHitResult.object = bestHit;
+      rayHitResult.objectId = bestObjId;
+      rayHitResult.face = bestFace;
+      return rayHitResult;
     };
 
     const handleCursorClick = (nx: number, ny: number) => {
@@ -1169,9 +1197,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           viewCfg = cfg;
           viewAz = eng.curOrbitAz;
           viewEl = eng.curOrbitEl;
-          const view = computeConfigCameraView(cfg, eng.curOrbitAz, eng.curOrbitEl);
-          camera.position.set(view.position[0], view.position[1], view.position[2]);
-          camera.lookAt(view.target[0], view.target[1], view.target[2]);
+          applyConfigCamera(cfg, eng.curOrbitAz, eng.curOrbitEl, camera);
         }
       }
       if (projDirty) camera.updateProjectionMatrix();
@@ -1409,11 +1435,12 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           !orbitSettled ||
           anyBindingMoving ||
           (editor ? editor.needsFrames() : false));
+      const hudPowerState = powerCapsRef.current.state;
       if (keepGoing) {
-        emitStats(eng, nowMs, false, caps.state);
+        emitStats(eng, nowMs, false, hudPowerState);
         requestFrameAfter(eng, eng.lastRenderMs + minInterval - performance.now());
       } else {
-        emitStats(eng, nowMs, true, caps.state);
+        emitStats(eng, nowMs, true, hudPowerState);
       }
     };
 
@@ -1466,6 +1493,16 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         const eng = engineRef.current;
         if (!eng) return null;
         return performRaycastAt(eng, nx, ny)?.objectId ?? null;
+      },
+      pickPart: (nx, ny) => {
+        const eng = engineRef.current;
+        if (!eng) return null;
+        const hit = performRaycastAt(eng, nx, ny);
+        if (!hit) return null;
+        const rt = eng.objectsMap.get(hit.objectId);
+        if (!rt?.modelIndex) return null;
+        const node = resolvePickedPartNode(rt.modelIndex, hit.object, hit.face, hit.point);
+        return { objectId: hit.objectId, node };
       },
       lastRenderMs: 0,
       lastFrameMs: performance.now(),
@@ -1543,7 +1580,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
             disposeObject3D(rt.modelRoot, sharedTextures);
             rt.modelRoot = null;
           }
-          eng.stagePivot.remove(rt.pivot);
+          rt.pivot.parent?.remove(rt.pivot);
           // per-object loader reference (taken when the runtime was created)
           releaseSharedLoaders();
         });
@@ -1705,7 +1742,11 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         rt.loadToken++;
         rt.loadKey = "";
         clearRuntimeModel(rt);
-        eng.stagePivot.remove(rt.pivot);
+        // Reparent any remaining child pivots back to stagePivot before removing this pivot
+        while (rt.pivot.children.length > 0) {
+          eng.stagePivot.add(rt.pivot.children[0]);
+        }
+        rt.pivot.parent?.remove(rt.pivot);
         eng.objectsMap.delete(id);
         releaseSharedLoaders();
         syncChanged = true;
@@ -1763,6 +1804,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         clearRuntimeModel(rt!);
         const sculp = buildShowcaseSculpture(obj.showcaseVariant ?? "MONOLITH");
         rt!.pivot.add(sculp.group);
+        sculp.group.updateMatrixWorld(true);
         rt!.modelRoot = sculp.group;
         rt!.defaultRefs = sculp;
         rt!.modelIndex = buildModelIndex(obj.id, sculp.group, [], true);
@@ -1824,6 +1866,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
 
           holder.add(root);
           capturedRt.pivot.add(holder);
+          // Refresh world matrices after normalization so nodeUnitScale() reads the true scale on frame 1
+          holder.updateMatrixWorld(true);
           capturedRt.modelRoot = holder;
           capturedRt.clips = gltf.animations ?? [];
           if (capturedRt.clips.length > 0) {
@@ -1930,11 +1974,44 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
       normalizedObjects
         .map(
           (o) =>
-            `${o.id}:${o.visible}:${o.autoRotateSpeed}:${o.position.join(",")}:${o.rotation.join(",")}:${o.scale.join(",")}`
+            `${o.id}:${o.parentId ?? ""}:${o.visible}:${o.autoRotateSpeed}:${o.position.join(",")}:${o.rotation.join(",")}:${o.scale.join(",")}`
         )
         .join("|"),
     [normalizedObjects]
   );
+
+  const objectsParentKey = useMemo(
+    () => normalizedObjects.map((o) => `${o.id}>${o.parentId ?? ""}`).join("|"),
+    [normalizedObjects]
+  );
+
+  // Sync object parentId hierarchy (mirrors Rust SceneGraph; cyclic/missing parentId falls back to stagePivot)
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    const orderedObjs = normalizeScene3DObjects(configRef.current);
+    const parentById = new Map<string, string | undefined>();
+    for (const o of orderedObjs) parentById.set(o.id, o.parentId);
+    const hasCycle = (id: string): boolean => {
+      let cur = parentById.get(id);
+      for (let steps = 0; cur && steps <= orderedObjs.length; steps++) {
+        if (cur === id) return true;
+        cur = parentById.get(cur);
+      }
+      return false;
+    };
+    for (const obj of orderedObjs) {
+      const rt = eng.objectsMap.get(obj.id);
+      if (!rt) continue;
+      const pId = obj.parentId;
+      const parentRt = pId && pId !== obj.id && !hasCycle(obj.id) ? eng.objectsMap.get(pId) : undefined;
+      const desiredParent: Object3D = parentRt ? parentRt.pivot : eng.stagePivot;
+      if (rt.pivot.parent !== desiredParent) {
+        desiredParent.add(rt.pivot);
+      }
+    }
+    eng.wake();
+  }, [objectsParentKey, objectsSourceKey, canvasGen]);
   // 3.4: telemetry only wakes the renderer when an enabled binding actually reads it
   const usesCpuBinding = useMemo(
     () => (config.bindings ?? []).some((b) => b.enabled && b.source === "CPU_USAGE"),
@@ -2209,8 +2286,10 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         getPivot: (id) => engineRef.current?.objectsMap.get(id)?.pivot ?? null,
         getModelIndex: (id) => engineRef.current?.objectsMap.get(id)?.modelIndex ?? null,
         pickObjectAt: (nx, ny) => engineRef.current?.pick(nx, ny) ?? null,
+        pickPartAt: (nx, ny) => engineRef.current?.pickPart(nx, ny) ?? null,
         wake: () => engineRef.current?.wake(),
         onSelectObject: (id) => onSelectObjectRef.current?.(id),
+        onPickPart: (part) => onPickPartRef.current?.(part),
         onCommitTransform: (id, p, r, sc) => onCommitTransformRef.current?.(id, p, r, sc),
       });
       cur.editor = session;

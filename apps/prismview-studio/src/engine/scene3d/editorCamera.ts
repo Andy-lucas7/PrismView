@@ -35,6 +35,8 @@ export interface EditorCameraHost {
   wake: () => void;
   /** Fires when a camera drag (look/orbit/pan) starts or ends */
   onNavigate?: (active: boolean) => void;
+  /** Fires on Alt+LMB click without drag (movement below pixel threshold) */
+  onAltClick?: (clientX: number, clientY: number) => void;
 }
 
 export interface EditorCameraController {
@@ -60,6 +62,7 @@ const DEG2RAD = Math.PI / 180;
 const LOOK_SPEED = 0.0042;
 const PITCH_LIMIT = 1.52;
 const MIN_DISTANCE = 0.3;
+const ALT_CLICK_THRESHOLD_PX = 5;
 
 function round(n: number, digits = 3): number {
   const f = 10 ** digits;
@@ -126,6 +129,10 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
   let activePointer: number | null = null;
   let lastX = 0;
   let lastY = 0;
+  let downX = 0;
+  let downY = 0;
+  let altLmbPending = false;
+  let altPanStarted = false;
   let kW = false;
   let kA = false;
   let kS = false;
@@ -151,6 +158,10 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
     activePointer = e.pointerId;
     lastX = e.clientX;
     lastY = e.clientY;
+    downX = e.clientX;
+    downY = e.clientY;
+    altLmbPending = kind === "pan" && e.button === 0 && e.altKey;
+    altPanStarted = false;
     try {
       canvas.setPointerCapture(e.pointerId);
     } catch {
@@ -164,6 +175,10 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
 
   const onPointerMove = (e: PointerEvent) => {
     if (activePointer !== e.pointerId || !dragKind) return;
+    if (altLmbPending && !altPanStarted) {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) < ALT_CLICK_THRESHOLD_PX) return;
+      altPanStarted = true;
+    }
     const dx = e.clientX - lastX;
     const dy = e.clientY - lastY;
     lastX = e.clientX;
@@ -191,8 +206,15 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
   const endPointer = (e: PointerEvent) => {
     if (activePointer !== e.pointerId) return;
     const kind = dragKind;
+    const wasAltClick =
+      e.type === "pointerup" &&
+      altLmbPending &&
+      !altPanStarted &&
+      Math.hypot(e.clientX - downX, e.clientY - downY) < ALT_CLICK_THRESHOLD_PX;
     activePointer = null;
     dragKind = null;
+    altLmbPending = false;
+    altPanStarted = false;
     try {
       canvas.releasePointerCapture(e.pointerId);
     } catch {
@@ -200,6 +222,9 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
     }
     if (kind === "look" || kind === "orbit") clearKeys();
     host.onNavigate?.(false);
+    if (wasAltClick) {
+      host.onAltClick?.(e.clientX, e.clientY);
+    }
     host.wake();
   };
 
@@ -284,6 +309,8 @@ export function createEditorCamera(host: EditorCameraHost): EditorCameraControll
     clearKeys();
     dragKind = null;
     activePointer = null;
+    altLmbPending = false;
+    altPanStarted = false;
     if (wasNavigating) host.onNavigate?.(false);
   };
   const onBlur = releaseNavigation;

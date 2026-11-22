@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Bone, Box, ChevronDown, ChevronRight, Folder, Search } from "lucide-react";
 import type { Scene3DEditorApi } from "./Scene3DLayer";
 import type { Scene3DObjectTree, Scene3DTreeNode } from "../engine/scene3d/modelTree";
+import type { Scene3DPickedPart } from "../types/prism";
 
 // Studio-only outliner (bones / meshes / groups) of the selected Sala 3D object.
 // The tree itself is built + cached per model by the lazy editor chunk (`Scene3DEditorApi.getObjectTree`).
@@ -25,9 +26,21 @@ export interface Scene3DOutlinerProps {
   editorApiRef?: React.MutableRefObject<Scene3DEditorApi | null>;
   /** Changes whenever the editor API appears or a model (re)loads */
   rev: number;
+  /** Syncs selection with Alt+Click in the viewport */
+  pickedPart?: Scene3DPickedPart | null;
+  onPickPart?: (part: Scene3DPickedPart | null) => void;
+  onInteractPart?: (part: Scene3DPickedPart) => void;
 }
 
-export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({ objectId, roomMode, editorApiRef, rev }) => {
+export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({
+  objectId,
+  roomMode,
+  editorApiRef,
+  rev,
+  pickedPart = null,
+  onPickPart,
+  onInteractPart,
+}) => {
   const [tree, setTree] = useState<Scene3DObjectTree | null>(null);
   const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<ReadonlySet<number>>(() => new Set());
@@ -43,11 +56,40 @@ export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({ objectId, room
 
   useEffect(() => {
     setCollapsed(new Set());
-    setSelectedNode(null);
+    setSelectedNode(
+      pickedPart &&
+        pickedPart.objectId === objectId &&
+        pickedPart.nodeId >= 0 &&
+        tree?.flat[pickedPart.nodeId]
+        ? pickedPart.nodeId
+        : null
+    );
     setQuery("");
     setScrollTop(0);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tree]);
+
+  // Sync external Alt+Click part picks into the outliner (expand collapsed ancestors so it's visible)
+  useEffect(() => {
+    if (!tree) return;
+    if (!pickedPart || pickedPart.objectId !== objectId || pickedPart.nodeId < 0) {
+      setSelectedNode(null);
+      return;
+    }
+    const target = tree.flat[pickedPart.nodeId];
+    if (!target) return;
+    setSelectedNode(target.id);
+    setCollapsed((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set(prev);
+      for (let p = target.parentId; p >= 0; p = tree.flat[p].parentId) {
+        if (next.delete(p)) changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [pickedPart, objectId, tree]);
 
   // Viewport highlight follows the selected node; cleared on node change, object change, unmount (no leak)
   useEffect(() => {
@@ -133,7 +175,24 @@ export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({ objectId, room
         key={n.id}
         role="treeitem"
         aria-selected={active}
-        onClick={() => setSelectedNode(active ? null : n.id)}
+        onClick={() => {
+          const nextId = active ? null : n.id;
+          setSelectedNode(nextId);
+          if (onPickPart) {
+            onPickPart(
+              nextId === null
+                ? null
+                : {
+                    objectId,
+                    nodeId: n.id,
+                    name: n.name === "(sem nome)" ? "__ROOT__" : n.name,
+                    type: n.type,
+                    morphs: n.morphs,
+                    materials: n.materials,
+                  }
+            );
+          }
+        }}
         title={n.name}
         style={{
           position: virtual ? "absolute" : undefined,
@@ -207,13 +266,31 @@ export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({ objectId, room
         )}
       </div>
       {selected && (
-        <div className="text-[10px] text-[#A1A1AA] space-y-0.5">
+        <div className="text-[10px] text-[#A1A1AA] space-y-1">
           <p className="font-mono-fx text-white truncate">{selected.name}</p>
           {selected.morphs.length > 0 && (
             <p className="break-words">Morphs: {selected.morphs.join(", ")}</p>
           )}
           {selected.materials.length > 0 && (
             <p className="break-words">Materiais: {selected.materials.join(", ")}</p>
+          )}
+          {onInteractPart && (
+            <button
+              type="button"
+              onClick={() =>
+                onInteractPart({
+                  objectId,
+                  nodeId: selected.id,
+                  name: selected.name === "(sem nome)" ? "__ROOT__" : selected.name,
+                  type: selected.type,
+                  morphs: selected.morphs,
+                  materials: selected.materials,
+                })
+              }
+              className="w-full prism-pill-active py-1 rounded-lg text-[10px] font-medium"
+            >
+              + Interagir com esta parte
+            </button>
           )}
         </div>
       )}

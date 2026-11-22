@@ -178,6 +178,44 @@ export interface Scene3DConfig {
   dynamicTextures?: Scene3DDynamicTexture[];
 }
 
+export type Scene3DAutoSuggestionKind = "BINDING" | "DYNAMIC_TEXTURE";
+
+export type Scene3DAutoSuggestionRole =
+  | "HEAD"
+  | "NECK"
+  | "EYE"
+  | "JAW"
+  | "WING"
+  | "FAN"
+  | "WHEEL"
+  | "SPEAKER"
+  | "SCREEN";
+
+export interface Scene3DAutoSuggestion {
+  id: string;
+  role: Scene3DAutoSuggestionRole;
+  kind: Scene3DAutoSuggestionKind;
+  /** Short PT-BR chip label */
+  label: string;
+  /** Tooltip describing the detected part and action */
+  detail: string;
+  /** Matched node / morph / material name */
+  targetName: string;
+  binding?: Omit<ReactiveBinding3D, "id" | "objectId">;
+  dynamicTexture?: Omit<Scene3DDynamicTexture, "id">;
+}
+
+export interface Scene3DPickedPart {
+  objectId: string;
+  /** Index into Scene3DObjectTree.flat (-1 if unavailable) */
+  nodeId: number;
+  /** Target name for bindings ("__ROOT__" if unnamed) */
+  name: string;
+  type: "bone" | "mesh" | "group";
+  morphs: string[];
+  materials: string[];
+}
+
 export interface Scene3DObjectInspectInfo {
   objectId: string;
   clipNames: string[];
@@ -192,6 +230,7 @@ export interface Scene3DObjectInspectInfo {
   estimatedVramMb: number;
   isDefaultSculpture: boolean;
   error?: string | null;
+  suggestions?: Scene3DAutoSuggestion[];
 }
 
 export interface Scene3DInspectInfo {
@@ -706,6 +745,175 @@ export function createBinding3D(
   };
 }
 
+/** Creates a sensible ReactiveBinding3D targeting a specific picked bone/mesh/group (Alt+Click or Outliner). */
+export function createBindingForPart(part: Scene3DPickedPart): ReactiveBinding3D {
+  const id = `b3d-${Math.random().toString(36).slice(2, 9)}`;
+  const targetName = part.name && part.name !== "(sem nome)" ? part.name : "__ROOT__";
+  const lower = targetName.toLowerCase();
+
+  if (/head(?!phone|set|light|er)|cabeca|cabeça/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "CURSOR_LOOK",
+      sourceNode: "*",
+      targetType: "NODE_LOOK_AT",
+      targetName,
+      strength: 24,
+      smoothing: 0.12,
+      invertX: false,
+      invertY: false,
+    };
+  }
+  if (/neck|pescoco|pescoço/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "CURSOR_LOOK",
+      sourceNode: "*",
+      targetType: "NODE_LOOK_AT",
+      targetName,
+      strength: 15,
+      smoothing: 0.1,
+      invertX: false,
+      invertY: false,
+    };
+  }
+  if (/(?:^|[^a-z])eyes?(?:$|[^a-z])|eyeball|olho/i.test(lower) && !/eyebrow|eyelid|eyelash/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "CURSOR_LOOK",
+      sourceNode: "*",
+      targetType: "NODE_LOOK_AT",
+      targetName,
+      strength: 18,
+      smoothing: 0.18,
+      invertX: false,
+      invertY: false,
+    };
+  }
+  if (/jaw|mandib/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "AUDIO_MID",
+      sourceNode: "*",
+      targetType: "NODE_ROTATE_SWING",
+      targetName,
+      strength: 22,
+      smoothing: 0.22,
+      axis: "X",
+      invertAxis: false,
+    };
+  }
+  if ((/(?:^|[^a-z])wings?(?:$|[^a-z])|wing|asa/i.test(lower)) && !/swing/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "AUDIO_BASS",
+      sourceNode: "*",
+      targetType: "NODE_ROTATE_SWING",
+      targetName,
+      strength: 24,
+      smoothing: 0.2,
+      axis: "Z",
+      invertAxis: false,
+    };
+  }
+  if (/(?:^|[^a-z])fans?(?:$|[^a-z])|ventoinha|rotor|propeller|helice|hélice/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "CPU_USAGE",
+      sourceNode: "*",
+      targetType: "NODE_ROTATE_SPIN",
+      targetName,
+      strength: 4.5,
+      smoothing: 0.14,
+      axis: "Z",
+      invertAxis: false,
+    };
+  }
+  if (/wheel|roda|turntable|vinyl/i.test(lower)) {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "MEDIA_PLAYING",
+      sourceNode: "*",
+      targetType: "NODE_ROTATE_SPIN",
+      targetName,
+      strength: 3.2,
+      smoothing: 0.12,
+      axis: /turntable|vinyl/i.test(lower) ? "Y" : "X",
+      invertAxis: false,
+    };
+  }
+  if (/speaker|woofer|subwoofer|cone/i.test(lower)) {
+    const isCone = /cone|woofer|subwoofer|driver|diaphragm/i.test(lower);
+    return isCone
+      ? {
+          id,
+          enabled: true,
+          objectId: part.objectId,
+          source: "AUDIO_BASS",
+          sourceNode: "*",
+          targetType: "NODE_MOVE_OFFSET",
+          targetName,
+          strength: 0.08,
+          smoothing: 0.26,
+          axis: "Z",
+          invertAxis: false,
+        }
+      : {
+          id,
+          enabled: true,
+          objectId: part.objectId,
+          source: "AUDIO_BASS",
+          sourceNode: "*",
+          targetType: "NODE_SCALE_PULSE",
+          targetName,
+          strength: 0.16,
+          smoothing: 0.24,
+        };
+  }
+
+  if (part.type === "bone") {
+    return {
+      id,
+      enabled: true,
+      objectId: part.objectId,
+      source: "AUDIO_BASS",
+      sourceNode: "*",
+      targetType: "NODE_ROTATE_SWING",
+      targetName,
+      strength: 20,
+      smoothing: 0.18,
+      axis: "Z",
+      invertAxis: false,
+    };
+  }
+
+  return {
+    id,
+    enabled: true,
+    objectId: part.objectId,
+    source: "AUDIO_BASS",
+    sourceNode: "*",
+    targetType: "NODE_SCALE_PULSE",
+    targetName,
+    strength: 0.16,
+    smoothing: 0.2,
+  };
+}
+
 function defaultShowcaseLabel(variant?: Scene3DShowcaseVariant): string {
   if (variant === "GYROSCOPE") return "Astrolábio Solar";
   if (variant === "KINETIC_SLAB") return "Display Slab 3D";
@@ -984,6 +1192,435 @@ export function defaultScene3D(
 
 function finiteOr(n: unknown, fallback: number): number {
   return typeof n === "number" && Number.isFinite(n) ? n : fallback;
+}
+
+export type Scene3DBindingTargetKind = "NODE" | "MORPH" | "MATERIAL" | "CLIP";
+
+export interface Scene3DActionMeta {
+  targetType: Scene3DBindingTarget;
+  label: string;
+  shortLabel: string;
+  example: string;
+  targetKind: Scene3DBindingTargetKind;
+  usesAxis: boolean;
+  usesStrength: boolean;
+  usesSmoothing: boolean;
+  usesInvertXY: boolean;
+  strengthLabel: string;
+  strengthMin: number;
+  strengthMax: number;
+  strengthStep: number;
+  strengthUnit: string;
+  defaultStrength: number;
+  defaultSmoothing: number;
+  defaultAxis?: Scene3DAxis;
+}
+
+export const SCENE3D_ACTION_META: Record<Scene3DBindingTarget, Scene3DActionMeta> = {
+  NODE_LOOK_AT: {
+    targetType: "NODE_LOOK_AT",
+    label: "Olhar p/ Cursor",
+    shortLabel: "Olhar Mouse",
+    example: "ex.: cabeça ou olho segue o mouse",
+    targetKind: "NODE",
+    usesAxis: false,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: true,
+    strengthLabel: "Ângulo Máx.",
+    strengthMin: 2,
+    strengthMax: 65,
+    strengthStep: 1,
+    strengthUnit: "°",
+    defaultStrength: 22,
+    defaultSmoothing: 0.12,
+  },
+  NODE_ROTATE_SWING: {
+    targetType: "NODE_ROTATE_SWING",
+    label: "Balançar (Dobradiça)",
+    shortLabel: "Balançar",
+    example: "ex.: asa, mandíbula ou agulha no áudio",
+    targetKind: "NODE",
+    usesAxis: true,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Ângulo do Balanço",
+    strengthMin: 2,
+    strengthMax: 120,
+    strengthStep: 1,
+    strengthUnit: "°",
+    defaultStrength: 25,
+    defaultSmoothing: 0.2,
+    defaultAxis: "Z",
+  },
+  NODE_MOVE_OFFSET: {
+    targetType: "NODE_MOVE_OFFSET",
+    label: "Deslocar (Pistão)",
+    shortLabel: "Deslocar",
+    example: "ex.: cone de caixa de som ou tecla 3D",
+    targetKind: "NODE",
+    usesAxis: true,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Deslocamento",
+    strengthMin: 0.01,
+    strengthMax: 1.5,
+    strengthStep: 0.01,
+    strengthUnit: "",
+    defaultStrength: 0.15,
+    defaultSmoothing: 0.24,
+    defaultAxis: "Z",
+  },
+  NODE_ROTATE_SPIN: {
+    targetType: "NODE_ROTATE_SPIN",
+    label: "Girar Contínuo",
+    shortLabel: "Girar",
+    example: "ex.: ventoinha na CPU ou roda na música",
+    targetKind: "NODE",
+    usesAxis: true,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Velocidade Giro",
+    strengthMin: 0.2,
+    strengthMax: 8,
+    strengthStep: 0.2,
+    strengthUnit: "rad/s",
+    defaultStrength: 2.4,
+    defaultSmoothing: 0.14,
+    defaultAxis: "Z",
+  },
+  NODE_SCALE_PULSE: {
+    targetType: "NODE_SCALE_PULSE",
+    label: "Pulso de Escala",
+    shortLabel: "Pulso Escala",
+    example: "ex.: peça ou modelo pulsa no grave",
+    targetKind: "NODE",
+    usesAxis: false,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Pulso de Escala",
+    strengthMin: 0.02,
+    strengthMax: 0.45,
+    strengthStep: 0.01,
+    strengthUnit: "×",
+    defaultStrength: 0.16,
+    defaultSmoothing: 0.2,
+  },
+  MORPH_WEIGHT: {
+    targetType: "MORPH_WEIGHT",
+    label: "Morph / Shape Key",
+    shortLabel: "Morph",
+    example: "ex.: boca abre nos médios ou expressão",
+    targetKind: "MORPH",
+    usesAxis: false,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Peso Morph",
+    strengthMin: 0.1,
+    strengthMax: 1,
+    strengthStep: 0.05,
+    strengthUnit: "",
+    defaultStrength: 1,
+    defaultSmoothing: 0.2,
+  },
+  EMISSIVE_GLOW: {
+    targetType: "EMISSIVE_GLOW",
+    label: "Brilho Emissivo",
+    shortLabel: "Brilho LED",
+    example: "ex.: LED ou neon acende no teclado/áudio",
+    targetKind: "MATERIAL",
+    usesAxis: false,
+    usesStrength: true,
+    usesSmoothing: true,
+    usesInvertXY: false,
+    strengthLabel: "Intensidade Brilho",
+    strengthMin: 0.2,
+    strengthMax: 4,
+    strengthStep: 0.1,
+    strengthUnit: "",
+    defaultStrength: 1.4,
+    defaultSmoothing: 0.16,
+  },
+  PLAY_CLIP: {
+    targetType: "PLAY_CLIP",
+    label: "Tocar Animação",
+    shortLabel: "Animação",
+    example: "ex.: dispara clip .glb no clique ou hover",
+    targetKind: "CLIP",
+    usesAxis: false,
+    usesStrength: false,
+    usesSmoothing: false,
+    usesInvertXY: false,
+    strengthLabel: "Peso",
+    strengthMin: 0.1,
+    strengthMax: 1,
+    strengthStep: 0.1,
+    strengthUnit: "",
+    defaultStrength: 1,
+    defaultSmoothing: 0.15,
+  },
+};
+
+export const SCENE3D_ACTION_LIST: readonly Scene3DActionMeta[] = [
+  SCENE3D_ACTION_META.NODE_LOOK_AT,
+  SCENE3D_ACTION_META.NODE_ROTATE_SWING,
+  SCENE3D_ACTION_META.NODE_MOVE_OFFSET,
+  SCENE3D_ACTION_META.NODE_ROTATE_SPIN,
+  SCENE3D_ACTION_META.NODE_SCALE_PULSE,
+  SCENE3D_ACTION_META.MORPH_WEIGHT,
+  SCENE3D_ACTION_META.EMISSIVE_GLOW,
+  SCENE3D_ACTION_META.PLAY_CLIP,
+];
+
+export interface Scene3DBindingValidation {
+  valid: boolean;
+  missingObject: boolean;
+  missingTarget: boolean;
+  missingSourceNode: boolean;
+  reasons: string[];
+}
+
+/**
+ * Validates that a binding's `objectId`, `targetName` (strictly for its action's target kind)
+ * and raycast `sourceNode` exist on the loaded scene, without ever throwing or breaking render.
+ */
+export function validateReactiveBinding3D(
+  binding: ReactiveBinding3D,
+  objects: readonly Scene3DObject[],
+  objInfo?: Scene3DObjectInspectInfo | Scene3DInspectInfo | null,
+  extraNodeNames?: ReadonlySet<string> | null
+): Scene3DBindingValidation {
+  const reasons: string[] = [];
+  const hasExplicitObj = Boolean(binding.objectId);
+  const resolvedObj = hasExplicitObj
+    ? objects.find((o) => o.id === binding.objectId) ?? null
+    : objects[0] ?? null;
+  const missingObject = !resolvedObj;
+  if (missingObject) {
+    reasons.push(
+      hasExplicitObj
+        ? `Objeto "${binding.objectId}" não existe mais na sala.`
+        : "Sala sem objeto alvo disponível."
+    );
+  }
+
+  let missingTarget = false;
+  let missingSourceNode = false;
+  if (!missingObject && objInfo) {
+    const meta = SCENE3D_ACTION_META[binding.targetType];
+    if (!meta) {
+      missingTarget = true;
+      reasons.push(`Tipo de ação desconhecido: "${String(binding.targetType)}".`);
+    } else {
+      const t = binding.targetName || "";
+      if (meta.targetKind === "NODE") {
+        if (t && t !== "__ROOT__") {
+          const found =
+            objInfo.boneNames.includes(t) ||
+            objInfo.meshNames.includes(t) ||
+            Boolean(extraNodeNames?.has(t));
+          if (!found) {
+            missingTarget = true;
+            reasons.push(`Peça/osso "${t}" não encontrado no objeto.`);
+          }
+        }
+      } else if (meta.targetKind === "MORPH") {
+        if (!t) {
+          missingTarget = true;
+          reasons.push(
+            objInfo.morphNames.length === 0
+              ? "Objeto não possui Shape Keys / Morphs."
+              : "Selecione um Morph válido."
+          );
+        } else if (!objInfo.morphNames.includes(t)) {
+          missingTarget = true;
+          reasons.push(`Morph "${t}" não encontrado no objeto.`);
+        }
+      } else if (meta.targetKind === "MATERIAL") {
+        if (t && t !== "*" && !objInfo.materialNames.includes(t)) {
+          missingTarget = true;
+          reasons.push(`Material "${t}" não encontrado no objeto.`);
+        }
+      } else if (meta.targetKind === "CLIP") {
+        if (!t) {
+          missingTarget = true;
+          reasons.push(
+            objInfo.clipNames.length === 0
+              ? "Objeto não possui clips de animação."
+              : "Selecione uma animação válida."
+          );
+        } else if (!objInfo.clipNames.includes(t)) {
+          missingTarget = true;
+          reasons.push(`Animação "${t}" não encontrada no objeto.`);
+        }
+      }
+    }
+
+    if (
+      (binding.source === "HOVER_MESH" || binding.source === "CLICK_MESH") &&
+      binding.sourceNode &&
+      binding.sourceNode !== "*"
+    ) {
+      const hitMesh =
+        objInfo.meshNames.includes(binding.sourceNode) ||
+        Boolean(extraNodeNames?.has(binding.sourceNode));
+      if (!hitMesh) {
+        missingSourceNode = true;
+        reasons.push(`Malha gatilho "${binding.sourceNode}" não encontrada.`);
+      }
+    }
+  }
+
+  return {
+    valid: !missingObject && !missingTarget && !missingSourceNode,
+    missingObject,
+    missingTarget,
+    missingSourceNode,
+    reasons,
+  };
+}
+
+/** Creates a new ReactiveBinding3D for any of the 8 action types with sensible defaults. */
+export function createBindingForTargetType(
+  targetType: Scene3DBindingTarget,
+  info?: Scene3DObjectInspectInfo | Scene3DInspectInfo | null,
+  objectId?: string
+): ReactiveBinding3D {
+  const id = `b3d-${Math.random().toString(36).slice(2, 9)}`;
+  const objPatch = objectId ? { objectId } : {};
+  const meta = SCENE3D_ACTION_META[targetType];
+
+  if (targetType === "NODE_LOOK_AT") {
+    const head =
+      info?.boneNames.find((b) => /head|neck|eye|cabeca|pescoco/i.test(b)) ??
+      info?.boneNames[0] ??
+      "__ROOT__";
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "CURSOR_LOOK",
+      sourceNode: "*",
+      targetType,
+      targetName: head,
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+      invertX: false,
+      invertY: false,
+    };
+  }
+  if (targetType === "NODE_ROTATE_SWING") {
+    const names = [...(info?.boneNames ?? []), ...(info?.meshNames ?? [])];
+    const hinge =
+      names.find((n) => /wing|asa|jaw|mandib|arm|braco|lid|tampa|needle|agulha|tail|cauda/i.test(n)) ??
+      "__ROOT__";
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "AUDIO_BASS",
+      sourceNode: "*",
+      targetType,
+      targetName: hinge,
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+      axis: meta.defaultAxis ?? "Z",
+      invertAxis: false,
+    };
+  }
+  if (targetType === "NODE_MOVE_OFFSET") {
+    const names = [...(info?.meshNames ?? []), ...(info?.boneNames ?? [])];
+    const piston =
+      names.find((n) => /speaker|woofer|cone|caixa|alto.?falante|key|tecla|piston/i.test(n)) ??
+      "__ROOT__";
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "AUDIO_BASS",
+      sourceNode: "*",
+      targetType,
+      targetName: piston,
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+      axis: meta.defaultAxis ?? "Z",
+      invertAxis: false,
+    };
+  }
+  if (targetType === "NODE_ROTATE_SPIN") {
+    const names = [...(info?.boneNames ?? []), ...(info?.meshNames ?? [])];
+    const spinner =
+      names.find((n) => /fan|ventoinha|rotor|wheel|roda|propeller|turntable|vinyl/i.test(n)) ??
+      "__ROOT__";
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: /wheel|roda|turntable|vinyl/i.test(spinner) ? "MEDIA_PLAYING" : "CPU_USAGE",
+      sourceNode: "*",
+      targetType,
+      targetName: spinner,
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+      axis: meta.defaultAxis ?? "Z",
+      invertAxis: false,
+    };
+  }
+  if (targetType === "NODE_SCALE_PULSE") {
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "AUDIO_BASS",
+      sourceNode: "*",
+      targetType,
+      targetName: "__ROOT__",
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+    };
+  }
+  if (targetType === "MORPH_WEIGHT") {
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "AUDIO_MID",
+      sourceNode: "*",
+      targetType,
+      targetName: info?.morphNames[0] ?? "",
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+    };
+  }
+  if (targetType === "EMISSIVE_GLOW") {
+    return {
+      id,
+      enabled: true,
+      ...objPatch,
+      source: "KEY_PULSE",
+      sourceNode: "*",
+      targetType,
+      targetName: info?.materialNames[0] ?? "*",
+      strength: meta.defaultStrength,
+      smoothing: meta.defaultSmoothing,
+    };
+  }
+  return {
+    id,
+    enabled: true,
+    ...objPatch,
+    source: "CLICK_MESH",
+    sourceNode: "*",
+    targetType: "PLAY_CLIP",
+    targetName: info?.clipNames[0] ?? "",
+    strength: meta.defaultStrength,
+    smoothing: meta.defaultSmoothing,
+  };
 }
 
 /** Default `strength` per target (same fallbacks the Scene3DLayer runtime uses) */

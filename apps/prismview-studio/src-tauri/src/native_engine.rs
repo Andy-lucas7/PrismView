@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -24,40 +25,36 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const ACTIVE_SCENE_FILE: &str = "active_scene.json";
 /// Preferência de energia lida pelo motor ao iniciar (mesmo arquivo que ele grava no IPC).
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
+/// Preferência de exibição da engine na bandeja do sistema (`"1"` / `"0"`, padrão: `"1"`).
+const TRAY_ENABLED_FILE: &str = "tray_enabled.txt";
 /// Marcador: o usuário desligou o início com o Windows (não reativar sozinho no "Aplicar").
 const AUTOSTART_OPT_OUT_FILE: &str = "autostart_disabled";
 /// Valor em `HKCU\...\Run` que sobe o motor no login.
 pub const ENGINE_RUN_VALUE: &str = "PrismViewEngine";
 const POWER_PREFERENCES: [&str; 5] = ["AUTO", "NORMAL", "ECO", "ULTRA", "FROZEN"];
+/// Win32 `ERROR_PIPE_BUSY`: o servidor está vivo e reciclando a instância do pipe.
+const ERROR_PIPE_BUSY: i32 = 231;
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+const PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
+const PIPE_RETRY_INTERVAL: Duration = Duration::from_millis(12);
+const START_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 pub struct NativeEngine {
     child: Mutex<Option<Child>>,
+    /// Serializa escrita de `active_scene.json` + `LOAD_SCENE_FILE` (evita corrida entre autosave e clique).
+    apply_lock: Mutex<()>,
+    /// Export `.prism` em background coalescido (último projeto vence, sem travar "Aplicar").
+    pending_export: Mutex<Option<Value>>,
+    export_worker_active: AtomicBool,
 }
 
 pub type SharedEngine = Arc<NativeEngine>;
 
-/// Envia um pedido e devolve a resposta JSON. `Err` se o pipe não existe ou a resposta é
-/// `{"status":"ERROR"}`.
-fn pipe_request(request: &Value) -> Result<Value, String> {
-    let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
-
-    // Entre uma conexão e outra o servidor recria a instância do pipe: tenta por um instante.
-    let deadline = Instant::now() + PIPE_CONNECT_TIMEOUT;
-    let mut pipe = loop {
-        match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
-            Ok(file) => break file,
-            Err(err) if Instant::now() >= deadline => {
-                return Err(format!("engine_unreachable: {err}"));
-            }
-            Err(_) => sleep(Duration::from_millis(40)),
-        }
-    };
-
-    pipe.write_all(&payload).map_err(|e| format!("pipe_write: {e}"))?;
+fn exchange_pipe(mut pipe: fs::File, payload: &[u8]) -> Result<Value, String> {
+    pipe.write_all(payload).map_err(|e| format!("pipe_write: {e}"))?;
     let mut buf = vec![0u8; 64 * 1024];
     let read = pipe.read(&mut buf).map_err(|e| format!("pipe_read: {e}"))?;
     if read == 0 {
@@ -73,6 +70,46 @@ fn pipe_request(request: &Value) -> Result<Value, String> {
         return Err(message.to_string());
     }
     Ok(response)
+}
+
+/// Tentativa instantânea em `pipe_path`: falha imediatamente (< 1ms) se o pipe não existe;
+/// só aguarda brevemente se receber `ERROR_PIPE_BUSY` (servidor vivo reciclando o pipe).
+fn pipe_try_once_at(pipe_path: &str, request: &Value) -> Result<Value, String> {
+    let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + PIPE_BUSY_TIMEOUT;
+    let pipe = loop {
+        match OpenOptions::new().read(true).write(true).open(pipe_path) {
+            Ok(file) => break file,
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
+                sleep(Duration::from_millis(10));
+            }
+            Err(err) => return Err(format!("engine_unreachable: {err}")),
+        }
+    };
+    exchange_pipe(pipe, &payload)
+}
+
+fn pipe_try_once(request: &Value) -> Result<Value, String> {
+    pipe_try_once_at(PIPE_PATH, request)
+}
+
+/// Envia um pedido com retentativa curta (usar quando o motor já deveria estar respondendo).
+fn pipe_request(request: &Value) -> Result<Value, String> {
+    let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+
+    // Entre uma conexão e outra o servidor recria a instância do pipe: tenta com polling curto.
+    let deadline = Instant::now() + PIPE_CONNECT_TIMEOUT;
+    let pipe = loop {
+        match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
+            Ok(file) => break file,
+            Err(err) if Instant::now() >= deadline => {
+                return Err(format!("engine_unreachable: {err}"));
+            }
+            Err(_) => sleep(PIPE_RETRY_INTERVAL),
+        }
+    };
+
+    exchange_pipe(pipe, &payload)
 }
 
 fn engine_exe() -> Result<PathBuf, String> {
@@ -135,7 +172,7 @@ pub fn has_active_scene() -> bool {
 /// Remove o wallpaper nativo: encerra o motor (o Windows volta a pintar o próprio fundo) e apaga
 /// a cena ativa para o login seguinte não reaplicar. Não precisa do handle do processo filho.
 pub fn clear_desktop() -> Result<(), String> {
-    let _ = pipe_request(&json!({ "cmd": "SHUTDOWN" }));
+    let _ = pipe_try_once(&json!({ "cmd": "SHUTDOWN" }));
     let dir = state_dir()?;
     match fs::remove_file(dir.join(ACTIVE_SCENE_FILE)) {
         Ok(()) => Ok(()),
@@ -144,11 +181,96 @@ pub fn clear_desktop() -> Result<(), String> {
     }
 }
 
+/// Pausa ou retoma o motor nativo se estiver rodando (tentativa instantânea, sem bloquear).
+pub fn set_paused(paused: bool) {
+    let _ = pipe_try_once(&json!({ "cmd": "SET_PAUSED", "paused": paused }));
+}
+
+/// Checagem instantânea (< 1ms) se o motor nativo está respondendo no pipe.
+pub fn is_running_fast() -> bool {
+    pipe_try_once(&json!({ "cmd": "PING" })).is_ok()
+}
+
+/// Lê a preferência persistida de ícone da engine na bandeja (padrão: `true`).
+pub fn get_tray_enabled() -> bool {
+    let Ok(dir) = state_dir() else {
+        return true;
+    };
+    match fs::read_to_string(dir.join(TRAY_ENABLED_FILE)) {
+        Ok(raw) => {
+            let t = raw.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
+/// Persiste a visibilidade da bandeja da engine e sincroniza em tempo real via IPC se rodando.
+pub fn set_tray_visible(visible: bool) -> Result<bool, String> {
+    let path = state_dir()?.join(TRAY_ENABLED_FILE);
+    fs::write(&path, if visible { b"1" } else { b"0" })
+        .map_err(|e| format!("tray_enabled_write: {e}"))?;
+    let _ = pipe_try_once(&json!({ "cmd": "SET_TRAY_VISIBLE", "visible": visible }));
+    Ok(visible)
+}
+
+/// Agenda a atualização do `.prism` em `packages/` numa única thread em background (coalescida:
+/// aplicações rápidas em sequência só compactam o estado mais recente, sem bloquear o "Aplicar").
+fn schedule_background_archive(engine: &SharedEngine, project: Value) {
+    if let Ok(mut slot) = engine.pending_export.lock() {
+        *slot = Some(project);
+    }
+    if engine
+        .export_worker_active
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let engine_bg = Arc::clone(engine);
+    std::thread::spawn(move || loop {
+        let next = engine_bg
+            .pending_export
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        match next {
+            Some(proj) => {
+                if let Err(err) = crate::export_prism_archive_sync(proj, None) {
+                    eprintln!("[native_engine] export background .prism: {err}");
+                }
+            }
+            None => {
+                engine_bg.export_worker_active.store(false, Ordering::Release);
+                // Re-checa após baixar a flag para não perder item enfileirado na janela.
+                let has_more = engine_bg
+                    .pending_export
+                    .lock()
+                    .map(|slot| slot.is_some())
+                    .unwrap_or(false);
+                if has_more
+                    && engine_bg
+                        .export_worker_active
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            }
+        }
+    });
+}
+
 impl NativeEngine {
-    /// Fluxo "Aplicar no Desktop": converte o projeto, exporta o `.prism` otimizado, grava a cena
-    /// ativa em disco (o motor a relê sozinho se reiniciar), sobe o motor se preciso e manda
-    /// `LOAD_SCENE_FILE` para recarregar na hora. Depois disso o Studio pode ser fechado.
-    pub fn apply_project(&self, project: &Value) -> Result<(), String> {
+    /// Fluxo "Aplicar no Desktop": converte o projeto, materializa assets (hardlink/cache), grava a
+    /// cena ativa atomicamente, garante o motor no ar e manda `LOAD_SCENE_FILE` na hora (< 300ms).
+    /// O pacote `.prism` em `packages/` é atualizado depois em background sem travar a UI.
+    pub fn apply_project(self: &Arc<Self>, project: &Value) -> Result<(), String> {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| "native_engine_apply_poisoned".to_string())?;
         // 1) Converte antes de qualquer efeito colateral (todo tipo de camada é suportado).
         let mut scene = crate::native_scene::project_to_scene(project)?;
         // 1b) Mídia/fontes/modelos → caminhos absolutos reais, espelhados em `native/assets/`
@@ -158,26 +280,26 @@ impl NativeEngine {
         for warning in crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets")) {
             eprintln!("[native_engine] {warning}");
         }
-        // 2) `.prism` otimizado em `packages/` (mídias empacotadas, reimportável pelo Studio).
-        crate::export_prism_archive_sync(project.clone(), None)?;
-        // 3) Cena ativa: escrita atômica (tmp + rename) para o motor nunca ler pela metade.
-        let dir = state_dir()?;
-        let final_path = dir.join(ACTIVE_SCENE_FILE);
-        let tmp_path = dir.join(format!("{ACTIVE_SCENE_FILE}.tmp"));
+        // 2) Cena ativa: escrita atômica (tmp + rename) para o motor nunca ler pela metade.
+        let final_path = state.join(ACTIVE_SCENE_FILE);
+        let tmp_path = state.join(format!("{ACTIVE_SCENE_FILE}.tmp"));
         let json = serde_json::to_vec(&scene).map_err(|e| e.to_string())?;
         fs::write(&tmp_path, json).map_err(|e| format!("native_scene_write: {e}"))?;
         fs::rename(&tmp_path, &final_path).map_err(|e| format!("native_scene_rename: {e}"))?;
-        // 4) Motor no ar (reaproveita o que já responde no pipe) + recarga instantânea.
-        self.start()?;
+        // 3) Motor no ar (check instantâneo sem sleep de 1,5s) + recarga imediata.
+        self.ensure_started()?;
         pipe_request(&json!({
             "cmd": "LOAD_SCENE_FILE",
             "path": final_path.to_string_lossy(),
         }))?;
+        drop(_guard);
+        // 4) Atualiza o `.prism` otimizado em `packages/` fora do caminho crítico.
+        schedule_background_archive(self, project.clone());
         Ok(())
     }
 
     /// Grava a preferência no arquivo que o motor lê ao iniciar e, se ele estiver no ar, aplica na
-    /// hora pelo pipe. Motor parado não é erro: a escolha vale no próximo início.
+    /// hora pelo pipe (sem esperar 1,5s se o motor estiver parado).
     fn set_power(&self, preference: &str) -> Result<Value, String> {
         let preference = preference.trim().to_ascii_uppercase();
         if !POWER_PREFERENCES.contains(&preference.as_str()) {
@@ -185,10 +307,11 @@ impl NativeEngine {
         }
         let path = state_dir()?.join(POWER_PREFERENCE_FILE);
         fs::write(&path, preference.as_bytes()).map_err(|e| format!("power_preference_write: {e}"))?;
-        if pipe_request(&json!({ "cmd": "PING" })).is_ok() {
-            pipe_request(&json!({ "cmd": "SET_POWER_PREFERENCE", "preference": preference }))?;
+        if pipe_try_once(&json!({ "cmd": "SET_POWER_PREFERENCE", "preference": preference })).is_ok() {
+            Ok(self.status())
+        } else {
+            Ok(json!({ "running": false }))
         }
-        Ok(self.status())
     }
 
     /// Garante o motor no ar com a cena ativa (abertura do Studio após o motor ter caído).
@@ -196,7 +319,7 @@ impl NativeEngine {
         if !has_active_scene() {
             return Ok(());
         }
-        self.start().map(|_| ())
+        self.ensure_started()
     }
 
     fn lock_child(&self) -> Result<std::sync::MutexGuard<'_, Option<Child>>, String> {
@@ -204,7 +327,7 @@ impl NativeEngine {
     }
 
     fn status(&self) -> Value {
-        match pipe_request(&json!({ "cmd": "GET_STATUS" })) {
+        match pipe_try_once(&json!({ "cmd": "GET_STATUS" })) {
             Ok(response) => {
                 let mut engine = response.get("engine").cloned().unwrap_or_else(|| json!({}));
                 if let Some(map) = engine.as_object_mut() {
@@ -216,12 +339,17 @@ impl NativeEngine {
         }
     }
 
-    fn start(&self) -> Result<Value, String> {
-        if pipe_request(&json!({ "cmd": "PING" })).is_ok() {
-            return Ok(self.status()); // já há um engine respondendo no pipe
+    /// Garante que existe um processo do motor respondendo no pipe (sem roundtrip extra de status).
+    fn ensure_started(&self) -> Result<(), String> {
+        if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
+            return Ok(()); // já há um engine respondendo no pipe (< 1ms)
         }
 
         let mut child_slot = self.lock_child()?;
+        // Re-checa sob o lock para evitar spawn duplo com a thread de startup.
+        if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
+            return Ok(());
+        }
         if let Some(child) = child_slot.as_mut() {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 *child_slot = None; // processo anterior já morreu
@@ -241,7 +369,7 @@ impl NativeEngine {
 
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            if pipe_request(&json!({ "cmd": "PING" })).is_ok() {
+            if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
                 break;
             }
             if let Some(child) = child_slot.as_mut() {
@@ -257,21 +385,25 @@ impl NativeEngine {
                 }
                 return Err("engine_start_timeout".into());
             }
-            sleep(Duration::from_millis(100));
+            sleep(START_POLL_INTERVAL);
         }
-        drop(child_slot);
+        Ok(())
+    }
+
+    fn start(&self) -> Result<Value, String> {
+        self.ensure_started()?;
         Ok(self.status())
     }
 
     fn stop(&self) -> Result<Value, String> {
-        let was_running = pipe_request(&json!({ "cmd": "SHUTDOWN" })).is_ok();
+        let was_running = pipe_try_once(&json!({ "cmd": "SHUTDOWN" })).is_ok();
         let mut child_slot = self.lock_child()?;
         if let Some(mut child) = child_slot.take() {
             let deadline = Instant::now() + STOP_TIMEOUT;
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(50)),
+                    Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(30)),
                     _ => {
                         let _ = child.kill();
                         let _ = child.wait();
@@ -297,7 +429,7 @@ pub fn new_state() -> SharedEngine {
 async fn blocking<T, F>(engine: &State<'_, SharedEngine>, job: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce(&NativeEngine) -> Result<T, String> + Send + 'static,
+    F: FnOnce(&SharedEngine) -> Result<T, String> + Send + 'static,
 {
     let engine = Arc::clone(engine.inner());
     tauri::async_runtime::spawn_blocking(move || job(&engine))
@@ -352,4 +484,21 @@ pub async fn native_engine_set_power(
     preference: String,
 ) -> Result<Value, String> {
     blocking(&engine, move |e| e.set_power(&preference)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_try_once_fails_immediately_when_pipe_missing() {
+        let start = Instant::now();
+        let res = pipe_try_once_at(r"\\.\pipe\prismview_ipc_nonexistent_test", &json!({ "cmd": "PING" }));
+        assert!(res.is_err());
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "pipe_try_once deveria falhar instantaneamente, levou {:?}",
+            start.elapsed()
+        );
+    }
 }

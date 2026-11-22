@@ -32,6 +32,8 @@ interface TreeCacheEntry {
   tree: Scene3DObjectTree;
   /** Parallel to `tree.flat`: the live Object3D of every node */
   objects: Object3D[];
+  /** Reverse lookup: live Object3D → `node.id` */
+  nodeIds: Map<Object3D, number>;
 }
 
 // Keyed by the model index: a reloaded/replaced model gets a new index and the old entry is collected.
@@ -46,6 +48,7 @@ function nodeType(obj: Object3D): Scene3DTreeNodeType {
 function buildEntry(idx: ModelSceneIndex): TreeCacheEntry {
   const flat: Scene3DTreeNode[] = [];
   const objects: Object3D[] = [];
+  const nodeIds = new Map<Object3D, number>();
   const roots: Scene3DTreeNode[] = [];
   let boneCount = 0;
   let meshCount = 0;
@@ -80,6 +83,7 @@ function buildEntry(idx: ModelSceneIndex): TreeCacheEntry {
     };
     flat.push(node);
     objects.push(obj);
+    nodeIds.set(obj, node.id);
     siblings.push(node);
     for (const child of obj.children) visit(child, depth + 1, node.id, node.children);
   };
@@ -87,7 +91,7 @@ function buildEntry(idx: ModelSceneIndex): TreeCacheEntry {
   // The holder itself is the model root ("__ROOT__"): the outliner lists what hangs under it
   for (const child of idx.holder.children) visit(child, 0, -1, roots);
 
-  return { tree: { roots, flat, boneCount, meshCount }, objects };
+  return { tree: { roots, flat, boneCount, meshCount }, objects, nodeIds };
 }
 
 function entryFor(idx: ModelSceneIndex): TreeCacheEntry {
@@ -107,4 +111,9 @@ export function getModelTree(idx: ModelSceneIndex): Scene3DObjectTree {
 /** Live Object3D behind a tree node id (null if the id is out of range). */
 export function getTreeNodeObject(idx: ModelSceneIndex, nodeId: number): Object3D | null {
   return entryFor(idx).objects[nodeId] ?? null;
+}
+
+/** Tree node id of a live Object3D under `idx.holder` (null if not in the tree). */
+export function getTreeNodeId(idx: ModelSceneIndex, obj: Object3D): number | null {
+  return entryFor(idx).nodeIds.get(obj) ?? null;
 }

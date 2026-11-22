@@ -1,5 +1,6 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   AlignCenter,
   AlignLeft,
   AlignRight,
@@ -8,7 +9,9 @@ import {
   EyeOff,
   Palette,
   Plus,
+  Search,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
   Upload,
   Variable,
@@ -18,7 +21,7 @@ import {
   BUILTIN_SVG_ICONS,
   ClickAction,
   clampScene3DFps,
-  createBinding3D,
+  createBindingForTargetType,
   createLayer,
   createScene3DObject,
   defaultScene3D,
@@ -26,29 +29,39 @@ import {
   GLASS_STYLE_PRESETS,
   GlobalVar,
   LayerKind,
+  normalizeReactiveBinding3D,
   normalizeScene3DObjects,
   PrismProject,
   ReactiveBinding3D,
   removeScene3DObject,
+  SCENE3D_ACTION_LIST,
+  SCENE3D_ACTION_META,
+  SCENE3D_BINDING_SMOOTHING_MAX,
+  SCENE3D_BINDING_SMOOTHING_MIN,
+  Scene3DAutoSuggestion,
   Scene3DAxis,
   Scene3DBackgroundMode,
   Scene3DBindingSource,
   Scene3DBindingTarget,
+  Scene3DBindingTargetKind,
   Scene3DConfig,
   Scene3DDynamicTexture,
   Scene3DEnvPreset,
   Scene3DInspectInfo,
   Scene3DObject,
   Scene3DObjectInspectInfo,
+  Scene3DPickedPart,
   Scene3DShowcaseVariant,
   SCENE3D_FPS_MAX,
   SCENE3D_FPS_MIN,
   SCENE3D_FPS_STEP,
   SceneLayer,
+  validateReactiveBinding3D,
 } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
 import { Scene3DOutliner } from "./Scene3DOutliner";
 import type { Scene3DEditorApi } from "./Scene3DLayer";
+import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
 function toHexColorInput(raw?: string, fallback = "#FFFFFF"): string {
   const s = (raw || "").trim();
@@ -129,6 +142,11 @@ export interface StudioInspectorProps {
   editorApiRef?: React.MutableRefObject<Scene3DEditorApi | null>;
   /** Bumped when the editor API appears or a model (re)loads */
   outlinerRev?: number;
+  pickedPart3d?: Scene3DPickedPart | null;
+  onPickPart3d?: (part: Scene3DPickedPart | null) => void;
+  onInteractPickedPart?: (part: Scene3DPickedPart) => void;
+  selectedBindingId?: string | null;
+  onSelectBindingId?: (id: string | null) => void;
   onAdd3dGlbObject?: () => void;
   test3dMode?: boolean;
   onToggleTest3d?: () => void;
@@ -164,6 +182,11 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   room3dMode = false,
   editorApiRef,
   outlinerRev = 0,
+  pickedPart3d = null,
+  onPickPart3d,
+  onInteractPickedPart,
+  selectedBindingId = null,
+  onSelectBindingId,
   onAdd3dGlbObject,
   test3dMode = false,
   onToggleTest3d,
@@ -184,6 +207,43 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 }) => {
   const [layerTab, setLayerTab] = useState<LayerTab>("CONTENT");
   const [showOptics, setShowOptics] = useState(false);
+  const [selectedDynTexId, setSelectedDynTexId] = useState<string | null>(null);
+  const bindingsSectionRef = useRef<HTMLDivElement | null>(null);
+  const dynTexSectionRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!selectedBindingId) return;
+    setLayerTab("CONTENT");
+    const raf = requestAnimationFrame(() => {
+      const container = bindingsSectionRef.current;
+      if (!container) return;
+      const cards = container.querySelectorAll<HTMLElement>("[data-binding-id]");
+      for (const el of cards) {
+        if (el.dataset.bindingId === selectedBindingId) {
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          break;
+        }
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [selectedBindingId]);
+
+  useEffect(() => {
+    if (!selectedDynTexId) return;
+    setLayerTab("CONTENT");
+    const raf = requestAnimationFrame(() => {
+      const container = dynTexSectionRef.current;
+      if (!container) return;
+      const cards = container.querySelectorAll<HTMLElement>("[data-dyntex-id]");
+      for (const el of cards) {
+        if (el.dataset.dyntexId === selectedDynTexId) {
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          break;
+        }
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [selectedDynTexId]);
 
   const sliderHandlers = {
     onBeginTx,
@@ -1264,7 +1324,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   );
 
                 const activeObjInfo: Scene3DObjectInspectInfo | Scene3DInspectInfo | null =
-                  scene3dInfo?.byObject?.[activeObj.id] ?? scene3dInfo;
+                  scene3dInfo?.byObject?.[activeObj.id] ??
+                  (activeObj.id === objs[0]?.id ? scene3dInfo : null);
                 const activeVariant: Scene3DShowcaseVariant =
                   activeObj.showcaseVariant ?? s3d.showcaseVariant ?? "MONOLITH";
                 const variantLabel =
@@ -1299,6 +1360,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   s3d.renderScale <= 0.72 && !fpsFollowsMonitor && fpsValue <= 30;
                 const bgMode: Scene3DBackgroundMode = s3d.backgroundMode ?? "TRANSPARENT";
                 const activeDynTex = activeObj.dynamicTextures ?? [];
+                const activeSuggestions: Scene3DAutoSuggestion[] =
+                  scene3dInfo?.byObject?.[activeObj.id]?.suggestions ?? [];
 
                 return (
                   <div className="space-y-3">
@@ -1553,6 +1616,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                               roomMode={room3dMode}
                               editorApiRef={editorApiRef}
                               rev={outlinerRev}
+                              pickedPart={pickedPart3d}
+                              onPickPart={onPickPart3d}
+                              onInteractPart={onInteractPickedPart}
                             />
                           </div>
                         )}
@@ -1587,7 +1653,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         label="Escala"
                         value={activeObj.scale}
                         step={0.05}
-                        min={0.01}
+                        min={0.05}
                         onCommit={(v) => patchActiveObj((o) => ({ ...o, scale: v }))}
                         onRecordStep={onRecordStep}
                         onFlushSave={onFlushSave}
@@ -1916,7 +1982,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </div>
 
                     {/* Phase 2: Reactive 3D Mouse, Bone Look-At & Raycast Bindings */}
-                    <div className="space-y-2.5 pt-2 border-t border-white/10">
+                    <div ref={bindingsSectionRef} className="space-y-2.5 pt-2 border-t border-white/10">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[11px] font-medium text-[#A1A1AA]">
                           Interações 3D (Mouse & Raycast)
@@ -1934,82 +2000,196 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         )}
                       </div>
 
+                      {activeSuggestions.length > 0 && (
+                        <div className="space-y-1.5 rounded-xl bg-white/[0.03] border border-white/10 p-2">
+                          <div className="flex items-center gap-1.5 text-[10px] font-medium text-amber-200/90">
+                            <Sparkles className="w-3 h-3 shrink-0" />
+                            <span>Sugestões detectadas ({activeObj.name})</span>
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {activeSuggestions.map((sug) => (
+                              <button
+                                key={sug.id}
+                                type="button"
+                                title={sug.detail}
+                                onClick={() => {
+                                  if (sug.kind === "BINDING" && sug.binding) {
+                                    const b: ReactiveBinding3D = {
+                                      ...sug.binding,
+                                      id: `b3d-${Math.random().toString(36).slice(2, 9)}`,
+                                      objectId: activeObj.id,
+                                    };
+                                    patch3d(
+                                      (c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }),
+                                      "discrete"
+                                    );
+                                    onSelectBindingId?.(b.id);
+                                  } else if (sug.kind === "DYNAMIC_TEXTURE" && sug.dynamicTexture) {
+                                    const existing = (activeObj.dynamicTextures ?? []).find(
+                                      (dt) =>
+                                        dt.source === sug.dynamicTexture!.source &&
+                                        dt.materialName === sug.dynamicTexture!.materialName
+                                    );
+                                    if (existing) {
+                                      setSelectedDynTexId(existing.id);
+                                    } else {
+                                      const nextItem: Scene3DDynamicTexture = {
+                                        ...sug.dynamicTexture,
+                                        id: `dt-${Math.random().toString(36).slice(2, 9)}`,
+                                      };
+                                      patchActiveObj(
+                                        (o) => ({
+                                          ...o,
+                                          dynamicTextures: [...(o.dynamicTextures ?? []), nextItem],
+                                        }),
+                                        "discrete"
+                                      );
+                                      setSelectedDynTexId(nextItem.id);
+                                    }
+                                  }
+                                }}
+                                className="px-2 py-1 rounded-full text-[10px] bg-amber-400/15 hover:bg-amber-400/25 border border-amber-300/30 text-amber-100 transition"
+                              >
+                                + {sug.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       <div className="grid grid-cols-2 gap-1">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("LOOK_AT", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Olhar Mouse
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("AUDIO_BASS", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Graves (Áudio)
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("KEY_PULSE", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Pulso Teclado
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("CLICK_CLIP", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Clique / Hover 3D
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("AUDIO_SWING", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          title="Balança uma peça (asa, mandíbula, braço, agulha) no ritmo do grave"
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Balanço no Grave
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const b = createBinding3D("AUDIO_PISTON", activeObjInfo, activeObj.id);
-                            patch3d((c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }), "discrete");
-                          }}
-                          title="Empurra uma peça (cone de caixa de som, tecla) no ritmo do grave"
-                          className="prism-pill-idle py-1.5 rounded-xl text-[10px]"
-                        >
-                          + Pistão no Grave
-                        </button>
+                        {SCENE3D_ACTION_LIST.map((actionMeta) => (
+                          <button
+                            key={actionMeta.targetType}
+                            type="button"
+                            title={`${actionMeta.label} — ${actionMeta.example}`}
+                            onClick={() => {
+                              const b = createBindingForTargetType(
+                                actionMeta.targetType,
+                                activeObjInfo,
+                                activeObj.id
+                              );
+                              patch3d(
+                                (c) => ({ ...c, bindings: [...(c.bindings ?? []), b] }),
+                                "discrete"
+                              );
+                              onSelectBindingId?.(b.id);
+                            }}
+                            className="prism-pill-idle py-1.5 px-2 rounded-xl text-[10px] truncate"
+                          >
+                            + {actionMeta.shortLabel}
+                          </button>
+                        ))}
                       </div>
 
                       {(s3d.bindings ?? []).length === 0 ? (
                         <p className="text-[11px] text-[#71717A]">
-                          Adicione regras acima para reagir ao mouse, batidas de áudio (WASAPI), ritmo do teclado (anônimo), música ou CPU.
+                          Adicione uma das 8 ações acima para reagir ao mouse, áudio (WASAPI), teclado (anônimo), música ou CPU.
                         </p>
                       ) : (
                         <div className="space-y-2">
                           {(s3d.bindings ?? []).map((b) => {
-                            const bObjId = b.objectId || objs[0]?.id || "";
+                            const hasExplicitObj = Boolean(b.objectId);
+                            const resolvedObj = hasExplicitObj
+                              ? objs.find((o) => o.id === b.objectId) ?? null
+                              : objs[0] ?? null;
+                            const bObjId = resolvedObj?.id ?? b.objectId ?? "";
                             const bObjInfo: Scene3DObjectInspectInfo | Scene3DInspectInfo | null =
-                              (bObjId ? scene3dInfo?.byObject?.[bObjId] : undefined) ??
-                              scene3dInfo;
+                              resolvedObj
+                                ? scene3dInfo?.byObject?.[resolvedObj.id] ??
+                                  (resolvedObj.id === objs[0]?.id ? scene3dInfo : null)
+                                : null;
+                            const bTree: Scene3DObjectTree | null =
+                              room3dMode && resolvedObj
+                                ? editorApiRef?.current?.getObjectTree(resolvedObj.id) ?? null
+                                : null;
+
+                            // Collect valid target options strictly for this action's target kind (from E3-L3 tree + inspect fallback)
+                            const treeNodeNames = new Set<string>();
+                            const nodeOptions: BindingTargetOption[] = [
+                              { value: "__ROOT__", label: "Modelo Inteiro (__ROOT__)" },
+                            ];
+                            const seenNodes = new Set<string>(["__ROOT__"]);
+                            const morphOptions: BindingTargetOption[] = [];
+                            const seenMorphs = new Set<string>();
+                            const materialOptions: BindingTargetOption[] = [
+                              { value: "*", label: "Todos os materiais (*)" },
+                            ];
+                            const seenMaterials = new Set<string>(["*"]);
+                            const clipOptions: BindingTargetOption[] = [];
+                            const seenClips = new Set<string>();
+
+                            if (bTree) {
+                              for (const n of bTree.flat) {
+                                if (n.name && n.name !== "(sem nome)") {
+                                  treeNodeNames.add(n.name);
+                                  if (!seenNodes.has(n.name)) {
+                                    seenNodes.add(n.name);
+                                    const kindTag =
+                                      n.type === "bone"
+                                        ? "Osso"
+                                        : n.type === "mesh"
+                                        ? "Malha"
+                                        : "Grupo";
+                                    nodeOptions.push({
+                                      value: n.name,
+                                      label: `${kindTag} · ${n.name}`,
+                                    });
+                                  }
+                                }
+                                for (const mp of n.morphs) {
+                                  if (mp && !seenMorphs.has(mp)) {
+                                    seenMorphs.add(mp);
+                                    morphOptions.push({ value: mp, label: `Morph · ${mp}` });
+                                  }
+                                }
+                                for (const mat of n.materials) {
+                                  if (mat && !seenMaterials.has(mat)) {
+                                    seenMaterials.add(mat);
+                                    materialOptions.push({ value: mat, label: `Mat · ${mat}` });
+                                  }
+                                }
+                              }
+                            }
+                            for (const n of bObjInfo?.boneNames ?? []) {
+                              if (n && !seenNodes.has(n)) {
+                                seenNodes.add(n);
+                                nodeOptions.push({ value: n, label: `Osso · ${n}` });
+                              }
+                            }
+                            for (const n of bObjInfo?.meshNames ?? []) {
+                              if (n && !seenNodes.has(n)) {
+                                seenNodes.add(n);
+                                nodeOptions.push({ value: n, label: `Malha · ${n}` });
+                              }
+                            }
+                            for (const mp of bObjInfo?.morphNames ?? []) {
+                              if (mp && !seenMorphs.has(mp)) {
+                                seenMorphs.add(mp);
+                                morphOptions.push({ value: mp, label: `Morph · ${mp}` });
+                              }
+                            }
+                            for (const mat of bObjInfo?.materialNames ?? []) {
+                              if (mat && !seenMaterials.has(mat)) {
+                                seenMaterials.add(mat);
+                                materialOptions.push({ value: mat, label: `Mat · ${mat}` });
+                              }
+                            }
+                            for (const clip of bObjInfo?.clipNames ?? []) {
+                              if (clip && !seenClips.has(clip)) {
+                                seenClips.add(clip);
+                                clipOptions.push({ value: clip, label: `Clip · ${clip}` });
+                              }
+                            }
+
+                            const actionMeta =
+                              SCENE3D_ACTION_META[b.targetType] ?? SCENE3D_ACTION_META.NODE_SCALE_PULSE;
+                            const validation = validateReactiveBinding3D(
+                              b,
+                              objs,
+                              bObjInfo,
+                              treeNodeNames.size > 0 ? treeNodeNames : null
+                            );
 
                             const updateBinding = (
                               patch: Partial<ReactiveBinding3D>,
@@ -2019,13 +2199,16 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 (c) => ({
                                   ...c,
                                   bindings: (c.bindings ?? []).map((item) =>
-                                    item.id === b.id ? { ...item, ...patch } : item
+                                    item.id === b.id
+                                      ? normalizeReactiveBinding3D({ ...item, ...patch })
+                                      : item
                                   ),
                                 }),
                                 commit
                               );
 
-                            const removeBinding = () =>
+                            const removeBinding = () => {
+                              if (selectedBindingId === b.id) onSelectBindingId?.(null);
                               patch3d(
                                 (c) => ({
                                   ...c,
@@ -2033,37 +2216,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 }),
                                 "discrete"
                               );
-
-                            const nodeOptions = [
-                              { value: "__ROOT__", label: "Modelo Inteiro" },
-                              ...(bObjInfo?.boneNames ?? []).map((n) => ({
-                                value: n,
-                                label: `Osso · ${n}`,
-                              })),
-                              ...(bObjInfo?.meshNames ?? []).map((n) => ({
-                                value: n,
-                                label: `Malha · ${n}`,
-                              })),
-                            ];
-
-                            const strengthMeta =
-                              b.targetType === "NODE_LOOK_AT"
-                                ? { label: "Ângulo Máx.", min: 2, max: 65, step: 1, unit: "°" }
-                                : b.targetType === "EMISSIVE_GLOW"
-                                ? { label: "Intensidade Brilho", min: 0.2, max: 4, step: 0.1, unit: "" }
-                                : b.targetType === "NODE_SCALE_PULSE"
-                                ? { label: "Pulso de Escala", min: 0.02, max: 0.45, step: 0.01, unit: "×" }
-                                : b.targetType === "NODE_ROTATE_SPIN"
-                                ? { label: "Velocidade Giro", min: 0.2, max: 8, step: 0.2, unit: "" }
-                                : b.targetType === "NODE_ROTATE_SWING"
-                                ? { label: "Ângulo do Balanço", min: 2, max: 120, step: 1, unit: "°" }
-                                : b.targetType === "NODE_MOVE_OFFSET"
-                                ? { label: "Deslocamento", min: 0.01, max: 1.5, step: 0.01, unit: "" }
-                                : { label: "Peso Morph", min: 0.1, max: 1, step: 0.05, unit: "" };
-                            const usesAxis =
-                              b.targetType === "NODE_ROTATE_SWING" ||
-                              b.targetType === "NODE_MOVE_OFFSET" ||
-                              b.targetType === "NODE_ROTATE_SPIN";
+                            };
 
                             const sourceTitleMap: Record<Scene3DBindingSource, string> = {
                               CURSOR_LOOK: "Cursor → Olhar",
@@ -2077,147 +2230,236 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                               CPU_USAGE: "Uso de CPU",
                             };
 
+                            const targetOptions =
+                              actionMeta.targetKind === "NODE"
+                                ? nodeOptions
+                                : actionMeta.targetKind === "MORPH"
+                                ? morphOptions
+                                : actionMeta.targetKind === "MATERIAL"
+                                ? materialOptions
+                                : clipOptions;
+                            const targetLabel =
+                              actionMeta.targetKind === "NODE"
+                                ? "Alvo (Osso / Malha / Grupo)"
+                                : actionMeta.targetKind === "MORPH"
+                                ? "Alvo (Morph / Shape Key)"
+                                : actionMeta.targetKind === "MATERIAL"
+                                ? "Alvo (Material)"
+                                : "Alvo (Animação / Clip)";
+                            const targetEmptyLabel =
+                              actionMeta.targetKind === "MORPH"
+                                ? "(Objeto sem Shape Keys / Morphs)"
+                                : actionMeta.targetKind === "CLIP"
+                                ? "(Objeto sem clips de animação)"
+                                : "(Sem alvos disponíveis)";
+                            const effectiveTargetValue =
+                              actionMeta.targetKind === "NODE"
+                                ? b.targetName || "__ROOT__"
+                                : actionMeta.targetKind === "MATERIAL"
+                                ? b.targetName || "*"
+                                : b.targetName;
+
+                            const isSelectedBinding = selectedBindingId === b.id;
+
                             return (
-                              <div key={b.id} className="frosted-chrome-card p-2.5 space-y-2">
-                                <div className="flex items-center justify-between gap-2">
-                                  <label className="flex items-center gap-1.5 text-[11px] text-white font-medium">
+                              <div
+                                key={b.id}
+                                data-binding-id={b.id}
+                                onClick={() => onSelectBindingId?.(b.id)}
+                                className={`frosted-chrome-card p-2.5 space-y-2 transition ${
+                                  !validation.valid
+                                    ? "border-red-400/50 bg-red-500/[0.06]"
+                                    : ""
+                                } ${
+                                  isSelectedBinding
+                                    ? "ring-1 ring-amber-300/80 border-amber-300/60"
+                                    : ""
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-1.5">
+                                  <label className="flex items-center gap-1.5 text-[11px] text-white font-medium min-w-0">
                                     <input
                                       type="checkbox"
                                       checked={b.enabled}
                                       onChange={(e) => updateBinding({ enabled: e.target.checked })}
                                     />
-                                    <span>{sourceTitleMap[b.source] ?? b.source}</span>
+                                    <span className="truncate">
+                                      {sourceTitleMap[b.source] ?? b.source}
+                                    </span>
                                   </label>
-                                  <button
-                                    type="button"
-                                    onClick={removeBinding}
-                                    className="p-1 text-[#A1A1AA] hover:text-white"
-                                    title="Remover regra"
-                                  >
-                                    <Trash2 className="w-3 h-3" />
-                                  </button>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {!validation.valid && (
+                                      <span
+                                        title={validation.reasons.join(" ")}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-red-500/20 border border-red-400/40 text-[9px] font-medium text-red-200"
+                                      >
+                                        <AlertTriangle className="w-2.5 h-2.5 shrink-0" />
+                                        Inválido
+                                      </span>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        removeBinding();
+                                      }}
+                                      className="p-1 text-[#A1A1AA] hover:text-white"
+                                      title="Remover regra"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
                                 </div>
 
-                                {objs.length > 1 && (
-                                  <label className="block text-[10px] text-[#A1A1AA]">
-                                    Objeto Alvo na Sala
-                                    <select
-                                      value={bObjId}
-                                      onChange={(e) => updateBinding({ objectId: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                    >
-                                      {objs.map((o) => (
-                                        <option key={o.id} value={o.id}>
-                                          {o.name}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  </label>
+                                {!validation.valid && (
+                                  <div className="rounded-lg bg-red-500/10 border border-red-400/30 px-2 py-1 text-[10px] text-red-200 leading-snug">
+                                    {validation.reasons.join(" ")}
+                                  </div>
                                 )}
 
-                                <div className="grid grid-cols-2 gap-1.5">
+                                <label className="block text-[10px] text-[#A1A1AA]">
+                                  Objeto na Sala
                                   <select
-                                    value={b.source}
-                                    onChange={(e) => {
-                                      const nextSrc = e.target.value as Scene3DBindingSource;
-                                      const nextTarget: Scene3DBindingTarget =
-                                        nextSrc === "CURSOR_LOOK"
-                                          ? "NODE_LOOK_AT"
-                                          : b.targetType === "NODE_LOOK_AT"
-                                          ? "NODE_SCALE_PULSE"
-                                          : b.targetType;
-                                      updateBinding({ source: nextSrc, targetType: nextTarget });
-                                    }}
-                                    className="bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
+                                    value={bObjId}
+                                    onChange={(e) => updateBinding({ objectId: e.target.value })}
+                                    className={`mt-1 w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
+                                      validation.missingObject
+                                        ? "border-red-400/60"
+                                        : "border-white/15"
+                                    }`}
                                   >
-                                    <option value="CURSOR_LOOK">Mouse (Olhar)</option>
-                                    <option value="HOVER_MESH">Hover em Malha</option>
-                                    <option value="CLICK_MESH">Clique em Malha</option>
-                                    <option value="AUDIO_BASS">Áudio · Graves</option>
-                                    <option value="AUDIO_MID">Áudio · Médios</option>
-                                    <option value="AUDIO_TREBLE">Áudio · Agudos</option>
-                                    <option value="KEY_PULSE">Teclado (Anônimo)</option>
-                                    <option value="MEDIA_PLAYING">Música Tocando</option>
-                                    <option value="CPU_USAGE">Uso de CPU</option>
+                                    {validation.missingObject && bObjId && (
+                                      <option value={bObjId}>
+                                        ⚠ Objeto ausente ({bObjId})
+                                      </option>
+                                    )}
+                                    {objs.map((o) => (
+                                      <option key={o.id} value={o.id}>
+                                        {o.name}
+                                      </option>
+                                    ))}
                                   </select>
+                                </label>
 
-                                  <select
-                                    value={b.targetType}
-                                    onChange={(e) => {
-                                      const nextType = e.target.value as Scene3DBindingTarget;
-                                      let nextTargetName = b.targetName;
-                                      let nextStrength = b.strength;
-                                      if (nextType === "NODE_LOOK_AT") {
-                                        nextTargetName = nodeOptions[0]?.value ?? "__ROOT__";
-                                        nextStrength = 22;
-                                      } else if (nextType === "PLAY_CLIP") {
-                                        nextTargetName = bObjInfo?.clipNames[0] ?? "";
-                                        nextStrength = 1;
-                                      } else if (nextType === "EMISSIVE_GLOW") {
-                                        nextTargetName = bObjInfo?.materialNames[0] ?? "*";
-                                        nextStrength = 1.4;
-                                      } else if (nextType === "NODE_SCALE_PULSE") {
-                                        nextTargetName = "__ROOT__";
-                                        nextStrength = 0.14;
-                                      } else if (nextType === "NODE_ROTATE_SPIN") {
-                                        nextTargetName = "__ROOT__";
-                                        nextStrength = 2.4;
-                                      } else if (nextType === "NODE_ROTATE_SWING") {
-                                        nextTargetName =
-                                          b.targetType === "NODE_LOOK_AT" ||
-                                          b.targetType === "NODE_SCALE_PULSE" ||
-                                          b.targetType === "NODE_ROTATE_SPIN" ||
-                                          b.targetType === "NODE_MOVE_OFFSET"
-                                            ? b.targetName || "__ROOT__"
-                                            : "__ROOT__";
-                                        nextStrength = 25;
-                                      } else if (nextType === "NODE_MOVE_OFFSET") {
-                                        nextTargetName =
-                                          b.targetType === "NODE_LOOK_AT" ||
-                                          b.targetType === "NODE_SCALE_PULSE" ||
-                                          b.targetType === "NODE_ROTATE_SPIN" ||
-                                          b.targetType === "NODE_ROTATE_SWING"
-                                            ? b.targetName || "__ROOT__"
-                                            : "__ROOT__";
-                                        nextStrength = 0.15;
-                                      } else if (nextType === "MORPH_WEIGHT") {
-                                        nextTargetName = bObjInfo?.morphNames[0] ?? "";
-                                        nextStrength = 1;
-                                      }
-                                      updateBinding({
-                                        source:
-                                          nextType === "NODE_LOOK_AT"
-                                            ? "CURSOR_LOOK"
-                                            : b.source === "CURSOR_LOOK"
-                                            ? "AUDIO_BASS"
-                                            : b.source,
-                                        targetType: nextType,
-                                        targetName: nextTargetName,
-                                        strength: nextStrength,
-                                      });
-                                    }}
-                                    className="bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                  >
-                                    <option value="NODE_LOOK_AT">Olhar p/ Cursor</option>
-                                    <option value="NODE_SCALE_PULSE">Pulso de Escala</option>
-                                    <option value="EMISSIVE_GLOW">Brilho Emissivo</option>
-                                    <option value="NODE_ROTATE_SPIN">Girar / Impulso</option>
-                                    <option value="NODE_ROTATE_SWING">Balançar (Dobradiça)</option>
-                                    <option value="NODE_MOVE_OFFSET">Deslocar (Pistão)</option>
-                                    <option value="PLAY_CLIP">Tocar Animação</option>
-                                    <option value="MORPH_WEIGHT">Morph / Shape Key</option>
-                                  </select>
+                                <div className="space-y-1">
+                                  <div className="grid grid-cols-2 gap-1.5">
+                                    <label className="block text-[10px] text-[#A1A1AA]">
+                                      Fonte do Sinal
+                                      <select
+                                        value={b.source}
+                                        onChange={(e) => {
+                                          const nextSrc = e.target.value as Scene3DBindingSource;
+                                          const nextTarget: Scene3DBindingTarget =
+                                            nextSrc === "CURSOR_LOOK"
+                                              ? "NODE_LOOK_AT"
+                                              : b.targetType === "NODE_LOOK_AT"
+                                              ? "NODE_ROTATE_SWING"
+                                              : b.targetType;
+                                          const nextMeta = SCENE3D_ACTION_META[nextTarget];
+                                          const patch: Partial<ReactiveBinding3D> = {
+                                            source: nextSrc,
+                                            targetType: nextTarget,
+                                          };
+                                          if (nextTarget !== b.targetType) {
+                                            patch.strength = nextMeta.defaultStrength;
+                                            patch.smoothing = nextMeta.defaultSmoothing;
+                                            if (nextMeta.usesAxis && !b.axis) {
+                                              patch.axis = nextMeta.defaultAxis ?? "Z";
+                                            }
+                                            if (actionMeta.targetKind !== nextMeta.targetKind) {
+                                              patch.targetName = "__ROOT__";
+                                            }
+                                          }
+                                          updateBinding(patch);
+                                        }}
+                                        className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
+                                      >
+                                        <option value="CURSOR_LOOK">Mouse (Olhar)</option>
+                                        <option value="HOVER_MESH">Hover em Malha</option>
+                                        <option value="CLICK_MESH">Clique em Malha</option>
+                                        <option value="AUDIO_BASS">Áudio · Graves</option>
+                                        <option value="AUDIO_MID">Áudio · Médios</option>
+                                        <option value="AUDIO_TREBLE">Áudio · Agudos</option>
+                                        <option value="KEY_PULSE">Teclado (Anônimo)</option>
+                                        <option value="MEDIA_PLAYING">Música Tocando</option>
+                                        <option value="CPU_USAGE">Uso de CPU</option>
+                                      </select>
+                                    </label>
+
+                                    <label className="block text-[10px] text-[#A1A1AA]">
+                                      Ação 3D
+                                      <select
+                                        value={b.targetType}
+                                        onChange={(e) => {
+                                          const nextType = e.target.value as Scene3DBindingTarget;
+                                          const nextMeta = SCENE3D_ACTION_META[nextType];
+                                          let nextTargetName = b.targetName;
+                                          if (nextMeta.targetKind !== actionMeta.targetKind) {
+                                            if (nextMeta.targetKind === "NODE") {
+                                              nextTargetName = "__ROOT__";
+                                            } else if (nextMeta.targetKind === "CLIP") {
+                                              nextTargetName = clipOptions[0]?.value ?? "";
+                                            } else if (nextMeta.targetKind === "MATERIAL") {
+                                              nextTargetName =
+                                                materialOptions[1]?.value ??
+                                                materialOptions[0]?.value ??
+                                                "*";
+                                            } else {
+                                              nextTargetName = morphOptions[0]?.value ?? "";
+                                            }
+                                          }
+                                          updateBinding({
+                                            source:
+                                              nextType === "NODE_LOOK_AT"
+                                                ? "CURSOR_LOOK"
+                                                : b.source === "CURSOR_LOOK"
+                                                ? "AUDIO_BASS"
+                                                : b.source,
+                                            targetType: nextType,
+                                            targetName: nextTargetName,
+                                            strength: nextMeta.defaultStrength,
+                                            smoothing: nextMeta.defaultSmoothing,
+                                            axis: nextMeta.usesAxis
+                                              ? b.axis ?? nextMeta.defaultAxis ?? "Z"
+                                              : undefined,
+                                            invertAxis: nextMeta.usesAxis
+                                              ? Boolean(b.invertAxis)
+                                              : undefined,
+                                          });
+                                        }}
+                                        className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
+                                      >
+                                        {SCENE3D_ACTION_LIST.map((m) => (
+                                          <option key={m.targetType} value={m.targetType}>
+                                            {m.label}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </label>
+                                  </div>
+                                  <p className="text-[10px] text-[#71717A] leading-tight">
+                                    {actionMeta.example}
+                                  </p>
                                 </div>
 
                                 {(b.source === "HOVER_MESH" || b.source === "CLICK_MESH") && (
                                   <label className="block text-[10px] text-[#A1A1AA]">
                                     Malha Gatilho (Raycast)
                                     <select
-                                      value={b.sourceNode}
+                                      value={b.sourceNode || "*"}
                                       onChange={(e) => updateBinding({ sourceNode: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
+                                      className={`mt-1 w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
+                                        validation.missingSourceNode
+                                          ? "border-red-400/60"
+                                          : "border-white/15"
+                                      }`}
                                     >
                                       <option value="*">Qualquer malha do modelo (*)</option>
+                                      {validation.missingSourceNode && b.sourceNode && (
+                                        <option value={b.sourceNode}>
+                                          ⚠ Inválido: {b.sourceNode}
+                                        </option>
+                                      )}
                                       {(bObjInfo?.meshNames ?? []).map((m) => (
                                         <option key={m} value={m}>
                                           {m}
@@ -2227,98 +2469,42 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   </label>
                                 )}
 
-                                <label className="block text-[10px] text-[#A1A1AA]">
-                                  Alvo da Ação
-                                  {b.targetType === "NODE_LOOK_AT" ||
-                                  b.targetType === "NODE_SCALE_PULSE" ||
-                                  b.targetType === "NODE_ROTATE_SPIN" ||
-                                  b.targetType === "NODE_ROTATE_SWING" ||
-                                  b.targetType === "NODE_MOVE_OFFSET" ? (
-                                    <select
-                                      value={b.targetName || "__ROOT__"}
-                                      onChange={(e) => updateBinding({ targetName: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                    >
-                                      {nodeOptions.map((opt) => (
-                                        <option key={opt.value} value={opt.value}>
-                                          {opt.label}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  ) : b.targetType === "PLAY_CLIP" ? (
-                                    <select
-                                      value={b.targetName}
-                                      onChange={(e) => updateBinding({ targetName: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                    >
-                                      {(bObjInfo?.clipNames ?? []).length === 0 ? (
-                                        <option value="">(Modelo sem clips de animação)</option>
-                                      ) : (
-                                        (bObjInfo?.clipNames ?? []).map((clip) => (
-                                          <option key={clip} value={clip}>
-                                            {clip}
-                                          </option>
-                                        ))
-                                      )}
-                                    </select>
-                                  ) : b.targetType === "EMISSIVE_GLOW" ? (
-                                    <select
-                                      value={b.targetName || "*"}
-                                      onChange={(e) => updateBinding({ targetName: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                    >
-                                      <option value="*">Todos os materiais (*)</option>
-                                      {(bObjInfo?.materialNames ?? []).map((mat) => (
-                                        <option key={mat} value={mat}>
-                                          {mat}
-                                        </option>
-                                      ))}
-                                    </select>
-                                  ) : (
-                                    <select
-                                      value={b.targetName}
-                                      onChange={(e) => updateBinding({ targetName: e.target.value })}
-                                      className="mt-1 w-full bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
-                                    >
-                                      {(bObjInfo?.morphNames ?? []).length === 0 ? (
-                                        <option value="">(Modelo sem Shape Keys / Morphs)</option>
-                                      ) : (
-                                        (bObjInfo?.morphNames ?? []).map((mp) => (
-                                          <option key={mp} value={mp}>
-                                            {mp}
-                                          </option>
-                                        ))
-                                      )}
-                                    </select>
-                                  )}
-                                </label>
+                                <BindingTargetPicker
+                                  label={targetLabel}
+                                  targetKind={actionMeta.targetKind}
+                                  value={effectiveTargetValue}
+                                  options={targetOptions}
+                                  invalid={validation.missingTarget}
+                                  emptyLabel={targetEmptyLabel}
+                                  onChange={(nextVal) => updateBinding({ targetName: nextVal })}
+                                />
 
-                                {b.targetType !== "PLAY_CLIP" && (
+                                {actionMeta.usesStrength && (
                                   <InspectorSlider
-                                    label={strengthMeta.label}
+                                    label={actionMeta.strengthLabel}
                                     value={b.strength}
-                                    min={strengthMeta.min}
-                                    max={strengthMeta.max}
-                                    step={strengthMeta.step}
-                                    unit={strengthMeta.unit}
+                                    min={actionMeta.strengthMin}
+                                    max={actionMeta.strengthMax}
+                                    step={actionMeta.strengthStep}
+                                    unit={actionMeta.strengthUnit}
                                     {...sliderHandlers}
                                     onChange={(v) => updateBinding({ strength: v }, "raw")}
                                   />
                                 )}
 
-                                {b.targetType !== "PLAY_CLIP" && (
+                                {actionMeta.usesSmoothing && (
                                   <InspectorSlider
                                     label="Suavidade Spring"
                                     value={b.smoothing}
-                                    min={0.03}
-                                    max={0.3}
+                                    min={SCENE3D_BINDING_SMOOTHING_MIN}
+                                    max={SCENE3D_BINDING_SMOOTHING_MAX}
                                     step={0.01}
                                     {...sliderHandlers}
                                     onChange={(v) => updateBinding({ smoothing: v }, "raw")}
                                   />
                                 )}
 
-                                {usesAxis && (
+                                {actionMeta.usesAxis && (
                                   <div className="flex items-center justify-between gap-2 text-[11px] text-[#A1A1AA]">
                                     <span>Eixo</span>
                                     <div className="flex items-center gap-1">
@@ -2328,7 +2514,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                           type="button"
                                           onClick={() => updateBinding({ axis: ax })}
                                           className={`w-7 py-0.5 rounded-lg text-[10px] font-mono-fx ${
-                                            (b.axis ?? "Y") === ax ? "prism-pill-active" : "prism-pill-idle"
+                                            (b.axis ?? "Y") === ax
+                                              ? "prism-pill-active"
+                                              : "prism-pill-idle"
                                           }`}
                                         >
                                           {ax}
@@ -2338,7 +2526,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         <input
                                           type="checkbox"
                                           checked={Boolean(b.invertAxis)}
-                                          onChange={(e) => updateBinding({ invertAxis: e.target.checked })}
+                                          onChange={(e) =>
+                                            updateBinding({ invertAxis: e.target.checked })
+                                          }
                                         />
                                         Inverter
                                       </label>
@@ -2346,7 +2536,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   </div>
                                 )}
 
-                                {b.targetType === "NODE_LOOK_AT" && (
+                                {actionMeta.usesInvertXY && (
                                   <div className="flex items-center gap-4 text-[11px] text-[#A1A1AA]">
                                     <label className="flex items-center gap-1.5">
                                       <input
@@ -2374,7 +2564,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </div>
 
                     {/* Phase 3: Dynamic 3D Material Textures (Live Media Album Cover / Custom Image) */}
-                    <div className="space-y-2 pt-2 border-t border-white/10">
+                    <div ref={dynTexSectionRef} className="space-y-2 pt-2 border-t border-white/10">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-[11px] font-medium text-[#A1A1AA]">
                           Texturas Dinâmicas ({activeObj.name})
@@ -2418,7 +2608,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 }),
                                 "discrete"
                               );
-                            const removeDt = () =>
+                            const removeDt = () => {
+                              if (selectedDynTexId === dt.id) setSelectedDynTexId(null);
                               patchActiveObj(
                                 (o) => ({
                                   ...o,
@@ -2428,8 +2619,19 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 }),
                                 "discrete"
                               );
+                            };
+                            const isSelectedDynTex = selectedDynTexId === dt.id;
                             return (
-                              <div key={dt.id} className="frosted-chrome-card p-2.5 space-y-2">
+                              <div
+                                key={dt.id}
+                                data-dyntex-id={dt.id}
+                                onClick={() => setSelectedDynTexId(dt.id)}
+                                className={`frosted-chrome-card p-2.5 space-y-2 transition ${
+                                  isSelectedDynTex
+                                    ? "ring-1 ring-amber-300/80 border-amber-300/60"
+                                    : ""
+                                }`}
+                              >
                                 <div className="flex items-center justify-between gap-2">
                                   <span className="text-[11px] text-white font-medium truncate">
                                     Material: {dt.materialName === "*" ? "Todos (*)" : dt.materialName}
@@ -3529,6 +3731,101 @@ const InspectorSlider: React.FC<InspectorSliderProps> = ({
         onBlur={onCommitTx}
         className="prism-slider"
       />
+    </div>
+  );
+};
+
+interface BindingTargetOption {
+  value: string;
+  label: string;
+}
+
+interface BindingTargetPickerProps {
+  label: string;
+  targetKind: Scene3DBindingTargetKind;
+  value: string;
+  options: BindingTargetOption[];
+  invalid: boolean;
+  emptyLabel: string;
+  onChange: (next: string) => void;
+}
+
+const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
+  label,
+  targetKind,
+  value,
+  options,
+  invalid,
+  emptyLabel,
+  onChange,
+}) => {
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    setQuery("");
+  }, [targetKind]);
+
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? options.filter(
+        (opt) => opt.label.toLowerCase().includes(q) || opt.value.toLowerCase().includes(q)
+      )
+    : options;
+  const currentInAll = options.find((opt) => opt.value === value);
+  const currentInFiltered = filtered.some((opt) => opt.value === value);
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2 text-[10px] text-[#A1A1AA]">
+        <span>{label}</span>
+        {q && (
+          <span className="font-mono-fx text-[9px] text-[#71717A]">
+            {filtered.length}/{options.length}
+          </span>
+        )}
+      </div>
+      {options.length > 1 && (
+        <div className="relative">
+          <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Buscar alvo…"
+            className="w-full bg-black/40 border border-white/10 rounded-lg pl-6 pr-2 py-1 text-[10px] text-white placeholder:text-[#71717A] outline-none focus:border-white/30"
+          />
+        </div>
+      )}
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={`w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
+          invalid ? "border-red-400/60" : "border-white/15"
+        }`}
+      >
+        {invalid && value && !currentInAll && (
+          <option value={value}>⚠ Inválido: {value}</option>
+        )}
+        {!invalid && currentInAll && !currentInFiltered && (
+          <option value={currentInAll.value}>{currentInAll.label}</option>
+        )}
+        {filtered.length === 0 ? (
+          !value ? (
+            <option value="">
+              {q ? "(Nenhum alvo corresponde à busca)" : emptyLabel}
+            </option>
+          ) : (
+            <option disabled value="__NO_MATCH__">
+              (Nenhum alvo corresponde à busca)
+            </option>
+          )
+        ) : (
+          filtered.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))
+        )}
+      </select>
     </div>
   );
 };

@@ -6,6 +6,7 @@ import {
   Material,
   Mesh,
   MeshBasicMaterial,
+  PerspectiveCamera,
   PlaneGeometry,
   PMREMGenerator,
   PointLight,
@@ -158,8 +159,6 @@ const DAY_NIGHT_KEYS: DayNightKeyframe[] = [
 const dnAmbTmp = new Color();
 const dnKeyTmp = new Color();
 const dnRimTmp = new Color();
-const solidBgTmp = new Color();
-const envBgTmp = new Color();
 const dnBgTmp = new Color();
 
 function dayNightSegment(hourRaw: number): { k0: DayNightKeyframe; k1: DayNightKeyframe; ease: number } {
@@ -192,15 +191,18 @@ export function sampleDayNightBackground(hour: number): Color {
  */
 export function applySceneBackground(scene: Scene, cfg: Scene3DConfig, dayNightBg?: Color): void {
   if (cfg.backgroundMode === "SOLID") {
-    solidBgTmp.set(cfg.backgroundColor || "#07080b");
-    scene.background = solidBgTmp;
+    const hex = cfg.backgroundColor || "#07080b";
+    if (scene.background instanceof Color) scene.background.set(hex);
+    else scene.background = new Color(hex);
   } else if (cfg.backgroundMode === "ENVIRONMENT") {
     if (cfg.autoDayNight && dayNightBg) {
-      envBgTmp.copy(dayNightBg);
+      if (scene.background instanceof Color) scene.background.copy(dayNightBg);
+      else scene.background = dayNightBg.clone();
     } else {
-      envBgTmp.set((ENV_SPECS[cfg.envPreset] ?? ENV_SPECS.STUDIO_DARK).bgHex);
+      const hex = (ENV_SPECS[cfg.envPreset] ?? ENV_SPECS.STUDIO_DARK).bgHex;
+      if (scene.background instanceof Color) scene.background.set(hex);
+      else scene.background = new Color(hex);
     }
-    scene.background = envBgTmp;
   } else {
     scene.background = null;
   }
@@ -266,4 +268,28 @@ export function computeConfigCameraView(
     target: [tx, ty, tz],
     fov: Math.max(20, Math.min(85, cam.fov || 42)),
   };
+}
+
+/** Zero-allocation per-frame version of `computeConfigCameraView` for the render loop. */
+export function applyConfigCamera(
+  cfg: Scene3DConfig,
+  orbitAzDeg: number,
+  orbitElDeg: number,
+  camera: PerspectiveCamera
+): void {
+  const cam = cfg.camera;
+  const t = cam.target;
+  const tx = t && Number.isFinite(t[0]) ? t[0] : 0;
+  const ty = t && Number.isFinite(t[1]) ? t[1] : cam.targetY || 0;
+  const tz = t && Number.isFinite(t[2]) ? t[2] : 0;
+  const azRad = ((cam.azimuthDeg + orbitAzDeg) * Math.PI) / 180;
+  const elRad = (Math.max(-80, Math.min(80, cam.elevationDeg + orbitElDeg)) * Math.PI) / 180;
+  const dist = Math.max(0.3, cam.distance || 4.8);
+  const cosEl = Math.cos(elRad);
+  camera.position.set(
+    tx + Math.sin(azRad) * cosEl * dist,
+    ty + Math.sin(elRad) * dist,
+    tz + Math.cos(azRad) * cosEl * dist
+  );
+  camera.lookAt(tx, ty, tz);
 }
