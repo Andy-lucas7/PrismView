@@ -890,6 +890,34 @@ function stripLegacyScene3DKeys(cfg: Scene3DConfig): Scene3DConfig {
   return out;
 }
 
+/**
+ * True when `parentId` of `index` points to a missing object or its ancestor chain comes back
+ * to it. A chain that loops further up (not through `index`) is left to that loop's members.
+ */
+function hasBrokenParent(objects: Scene3DObject[], index: number): boolean {
+  let parentId = objects[index].parentId;
+  for (let steps = 0; parentId !== undefined; steps++) {
+    if (steps >= objects.length) return false;
+    const parent = objects.find((p) => p.id === parentId);
+    if (!parent || parent === objects[index]) return true;
+    parentId = parent.parentId;
+  }
+  return false;
+}
+
+/** Drops dangling/cyclic `parentId`s (objects become roots); same array when already valid */
+function sanitizeScene3DParents(objects: Scene3DObject[]): Scene3DObject[] {
+  let out = objects;
+  for (let i = 0; i < out.length; i++) {
+    if (!hasBrokenParent(out, i)) continue;
+    if (out === objects) out = objects.slice();
+    const root = { ...out[i] };
+    delete root.parentId;
+    out[i] = root;
+  }
+  return out;
+}
+
 function isBackgroundMode(v: unknown): v is Scene3DBackgroundMode {
   return v === "TRANSPARENT" || v === "SOLID" || v === "ENVIRONMENT";
 }
@@ -981,24 +1009,17 @@ export function normalizeScene3DConfig(raw: Scene3DConfig | undefined | null): S
     Array.isArray(raw.camera.target) &&
     raw.camera.targetY === raw.camera.target[1] &&
     !hasLegacyScene3DKeys(raw) &&
-    raw.objects.every(
-      (o, i) =>
-        normalizeScene3DObject(o, i, false) === o &&
-        (o.parentId === undefined || raw.objects.some((p) => p.id === o.parentId))
-    )
+    raw.objects.every((o, i) => normalizeScene3DObject(o, i, false) === o) &&
+    sanitizeScene3DParents(raw.objects) === raw.objects
   ) {
     return raw;
   }
   // Pre-v3 projects: legacy single-model fields → objects[0], old 0.22 spin → 0, transparent backdrop
   const migrating = !isCurrent;
   const rawObjects = hasObjects ? raw.objects : [legacyPrimaryObject(raw)];
-  const objects = rawObjects.map((o, i) => normalizeScene3DObject(o, i, migrating));
-  const linkedObjects = objects.map((o) => {
-    if (o.parentId === undefined || objects.some((p) => p.id === o.parentId)) return o;
-    const orphan = { ...o };
-    delete orphan.parentId;
-    return orphan;
-  });
+  const linkedObjects = sanitizeScene3DParents(
+    rawObjects.map((o, i) => normalizeScene3DObject(o, i, migrating))
+  );
   const cam = { ...base.camera, ...(raw.camera ?? {}) };
   const targetY = finiteOr(cam.targetY, 0);
   const target = Array.isArray(cam.target)
