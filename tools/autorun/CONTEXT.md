@@ -44,4 +44,42 @@ interface Scene3DObject {
 Se já existir campo equivalente, reutilize e registre no CONTRATO FINAL.
 
 ## CONTRATO FINAL
-(E1-L1 preenche)
+Fonte: `apps/prismview-studio/src/types/prism.ts`. `SCENE3D_SCHEMA_VERSION = 3`.
+```ts
+type Scene3DObjectKind = "GLB" | "SHOWCASE";          // DISPLAY_SLAB = SHOWCASE + showcaseVariant "KINETIC_SLAB"; FLOOR_GRID não existe (grade = helper do editor)
+type Scene3DShowcaseVariant = "MONOLITH" | "GYROSCOPE" | "KINETIC_SLAB";
+type Scene3DBackgroundMode = "TRANSPARENT" | "SOLID" | "ENVIRONMENT";
+type Scene3DAxis = "X" | "Y" | "Z";
+type Scene3DBindingTarget = "NODE_LOOK_AT" | "PLAY_CLIP" | "EMISSIVE_GLOW" | "NODE_SCALE_PULSE"
+  | "MORPH_WEIGHT" | "NODE_ROTATE_SPIN" | "NODE_ROTATE_SWING" | "NODE_MOVE_OFFSET";
+interface Scene3DObject {
+  id: string; name: string; kind: Scene3DObjectKind;
+  modelSrc: string;                         // "" p/ SHOWCASE
+  showcaseVariant?: Scene3DShowcaseVariant; // só SHOWCASE
+  position: [n,n,n]; rotation: [n,n,n] /*graus, Euler*/; scale: [n,n,n];
+  visible: boolean;
+  autoRotateSpeed: number;                  // rad/s, padrão 0
+  playback: { clipName: string /* "" = nenhum */; speed: number; loop: boolean };
+  dynamicTextures?: Scene3DDynamicTexture[]; // normalizado sempre vira []
+  parentId?: string;                         // transform local ao pai; pendente/cíclico → raiz
+}
+interface Scene3DCamera {                    // câmera persistida do wallpaper (órbita)
+  fov: number; distance: number; azimuthDeg: number; elevationDeg: number;
+  target?: [n,n,n];                          // sempre preenchido pelo normalize
+  targetY: number;                           // @deprecated = target[1]
+  orbitParallaxX: number; orbitParallaxY: number; // parallax do cursor (graus)
+  damping: number;
+}                                            // position = target + esférico(distance, azimuth, elevation)
+interface Scene3DConfig {
+  schemaVersion?: number; objects: Scene3DObject[] /* ≥1 */;
+  backgroundMode: Scene3DBackgroundMode; backgroundColor: string /* SOLID */;
+  envPreset; envIntensity; exposure; renderScale /*0.5–1*/; maxFps /*5–200*/; fpsMode?: "CAP"|"MONITOR";
+  autoDayNight?; dayNightHourOverride?; camera: Scene3DCamera; bindings?: ReactiveBinding3D[];
+  // @deprecated (≤v2, nunca mais salvos): modelSrc, showcaseVariant, autoRotateSpeed, modelScale, modelOffsetY, playback, dynamicTextures
+}
+interface ReactiveBinding3D {
+  id; enabled; objectId?: string /* vazio = objects[0] */; source; sourceNode; targetType; targetName;
+  strength; smoothing; invertX?; invertY?; axis?: Scene3DAxis /* padrão "Y" */; invertAxis?: boolean;
+}
+```
+Migração: `normalizeScene3DConfig` (idempotente, mesma ref se atual) ← `normalizeProjectScene3D` em load/import/save/bridge. ≤v2: legado → `objects[0]` id `obj-primary` (escala uniforme `modelScale`, `position[1]=modelOffsetY`), spin 0.22→0, `backgroundMode=TRANSPARENT`. Helpers: `createScene3DObject`, `normalizeScene3DObjects`, `setScene3DObjectTransform`, `duplicateScene3DObject`, `removeScene3DObject`.
