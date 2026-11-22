@@ -3,8 +3,13 @@
 //! Fluxo por quadro (determinístico, drift-free — PLANO_NATIVO §1.5):
 //! 1. `Pose::reset_to_rest` copia a pose de repouso (nada acumula entre quadros);
 //! 2. `sample_clip` sobrescreve os canais animados no tempo `t`;
-//! 3. (Fase 4) bindings reativos somam offsets sobre a pose amostrada;
-//! 4. `Pose::world_matrices` resolve a hierarquia (ordem pai→filho pré-calculada).
+//! 3. `Pose::store_animated` guarda a pose amostrada (sem bindings);
+//! 4. `AdditiveLayer::apply` soma os offsets dos bindings reativos (Fase 4) por cima;
+//! 5. `Pose::world_matrices` resolve a hierarquia (ordem pai→filho pré-calculada).
+//!
+//! Quando só os bindings mudam (clipe parado/sem clipe), `Pose::restore_animated` **desfaz** o
+//! offset do quadro anterior copiando de volta a pose animada guardada — nada é invertido
+//! numericamente (sem `q⁻¹`/subtração), então não há deriva acumulada nem após milhões de quadros.
 //!
 //! Todos os `Vec` são dimensionados em `Pose::new` (carregamento do modelo) e só são reescritos.
 
@@ -37,6 +42,9 @@ pub struct Pose {
     rest_weights: Vec<f32>,
     /// Pesos de morph de todos os nós com malha morfável; faixa de cada nó em `weight_range`.
     pub weights: Vec<f32>,
+    /// Pose amostrada do clipe **antes** dos bindings (base limpa para desfazer offsets).
+    animated: Vec<NodePose>,
+    animated_weights: Vec<f32>,
     /// `(início, quantidade)` em `weights` por nó (quantidade 0 = nó sem morph).
     pub weight_range: Vec<(u32, u32)>,
     /// Índices dos nós em ordem pai→filho (todos os nós, inclusive fora da cena).
@@ -114,8 +122,10 @@ impl Pose {
 
         Self {
             nodes: rest.clone(),
+            animated: rest.clone(),
             rest,
             weights: rest_weights.clone(),
+            animated_weights: rest_weights.clone(),
             rest_weights,
             weight_range,
             order,
@@ -134,6 +144,28 @@ impl Pose {
         self.weights.copy_from_slice(&self.rest_weights);
     }
 
+    /// Guarda a pose atual (recém-amostrada) como base limpa dos bindings. Sem alocar.
+    pub fn store_animated(&mut self) {
+        self.animated.copy_from_slice(&self.nodes);
+        self.animated_weights.copy_from_slice(&self.weights);
+    }
+
+    /// Desfaz os offsets do quadro anterior: volta à última pose amostrada. Sem alocar.
+    pub fn restore_animated(&mut self) {
+        self.nodes.copy_from_slice(&self.animated);
+        self.weights.copy_from_slice(&self.animated_weights);
+    }
+
+    #[inline]
+    pub fn parent_of(&self, node: usize) -> Option<u32> {
+        self.parent.get(node).copied().flatten()
+    }
+
+    pub fn weight_count(&self) -> usize {
+        self.weights.len()
+    }
+
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn node_weights(&self, node: usize) -> &[f32] {
         match self.weight_range.get(node) {
             Some(&(start, len)) => {
@@ -284,6 +316,218 @@ pub fn sample_clip(clip: &AnimationClip, t: f32, pose: &mut Pose) {
                         *w = sample_component(ch, i, j, u, dt, c);
                     }
                 }
+            }
+        }
+    }
+}
+
+// ───────────────────────── Camada aditiva (bindings) ─────────────────────────
+
+/// Offsets dos bindings reativos de um quadro, aplicados sobre a pose animada.
+///
+/// Reescrita do zero a cada quadro (`begin` → acumula → `finish`): o valor nunca realimenta a
+/// pose base, por isso o pipeline é drift-free. Só os nós/pesos tocados são zerados no `begin`
+/// (listas `nodes`/`morphs`), então o custo é O(bindings), não O(nós). Tudo pré-alocado em `new`.
+#[derive(Clone, Debug)]
+pub struct AdditiveLayer {
+    rot: Vec<Quat>,
+    pos: Vec<Vec3>,
+    scale: Vec<f32>,
+    node_mark: Vec<bool>,
+    nodes: Vec<u32>,
+    morph: Vec<f32>,
+    morph_mark: Vec<bool>,
+    morphs: Vec<u32>,
+    /// Brilho emissivo extra por material da instância.
+    glow: Vec<f32>,
+    /// Transformação extra do modelo inteiro (`__ROOT__`), em torno do centro normalizado.
+    pub root_rot: Quat,
+    pub root_pos: Vec3,
+    pub root_scale: f32,
+    moving: bool,
+    was_active: bool,
+}
+
+impl AdditiveLayer {
+    pub fn new(node_count: usize, weight_count: usize, material_count: usize) -> Self {
+        Self {
+            rot: vec![Quat::IDENTITY; node_count],
+            pos: vec![Vec3::ZERO; node_count],
+            scale: vec![0.0; node_count],
+            node_mark: vec![false; node_count],
+            nodes: Vec::with_capacity(node_count),
+            morph: vec![0.0; weight_count],
+            morph_mark: vec![false; weight_count],
+            morphs: Vec::with_capacity(weight_count),
+            glow: vec![0.0; material_count],
+            root_rot: Quat::IDENTITY,
+            root_pos: Vec3::ZERO,
+            root_scale: 0.0,
+            moving: false,
+            was_active: false,
+        }
+    }
+
+    /// Zera os offsets do quadro anterior (só os tocados).
+    pub fn begin(&mut self) {
+        self.was_active = self.is_active();
+        for &n in &self.nodes {
+            let n = n as usize;
+            if let Some(r) = self.rot.get_mut(n) {
+                *r = Quat::IDENTITY;
+            }
+            if let Some(p) = self.pos.get_mut(n) {
+                *p = Vec3::ZERO;
+            }
+            if let Some(s) = self.scale.get_mut(n) {
+                *s = 0.0;
+            }
+            if let Some(m) = self.node_mark.get_mut(n) {
+                *m = false;
+            }
+        }
+        self.nodes.clear();
+        for &i in &self.morphs {
+            let i = i as usize;
+            if let Some(v) = self.morph.get_mut(i) {
+                *v = 0.0;
+            }
+            if let Some(m) = self.morph_mark.get_mut(i) {
+                *m = false;
+            }
+        }
+        self.morphs.clear();
+        self.glow.iter_mut().for_each(|g| *g = 0.0);
+        self.root_rot = Quat::IDENTITY;
+        self.root_pos = Vec3::ZERO;
+        self.root_scale = 0.0;
+        self.moving = false;
+    }
+
+    #[inline]
+    fn touch(&mut self, node: u32) -> Option<usize> {
+        let n = node as usize;
+        let mark = self.node_mark.get_mut(n)?;
+        if !*mark {
+            *mark = true;
+            self.nodes.push(node);
+        }
+        Some(n)
+    }
+
+    /// Algum binding ainda está em movimento (mola, giro, pulso) → refazer a pose.
+    #[inline]
+    pub fn mark_moving(&mut self) {
+        self.moving = true;
+    }
+
+    /// Rotação local extra (pós-multiplicada, no espaço do nó, como `node.quaternion.multiply`).
+    pub fn add_rotation(&mut self, node: u32, q: Quat) {
+        if let Some(n) = self.touch(node) {
+            if let Some(r) = self.rot.get_mut(n) {
+                *r *= q;
+            }
+        }
+    }
+
+    /// Deslocamento extra em unidades locais do nó.
+    pub fn add_offset(&mut self, node: u32, v: Vec3) {
+        if let Some(n) = self.touch(node) {
+            if let Some(p) = self.pos.get_mut(n) {
+                *p += v;
+            }
+        }
+    }
+
+    /// Escala relativa extra (`0.1` = +10 %).
+    pub fn add_scale(&mut self, node: u32, ratio: f32) {
+        if let Some(n) = self.touch(node) {
+            if let Some(s) = self.scale.get_mut(n) {
+                *s += ratio;
+            }
+        }
+    }
+
+    /// Peso de morph mínimo (`max` entre bindings e com a animação, como no Estúdio).
+    pub fn max_morph(&mut self, weight_index: u32, value: f32) {
+        let i = weight_index as usize;
+        let (Some(v), Some(m)) = (self.morph.get_mut(i), self.morph_mark.get_mut(i)) else {
+            return;
+        };
+        if *m {
+            *v = v.max(value);
+        } else {
+            *m = true;
+            *v = value;
+            self.morphs.push(weight_index);
+        }
+    }
+
+    pub fn add_glow(&mut self, material: u32, amount: f32) {
+        if let Some(g) = self.glow.get_mut(material as usize) {
+            *g += amount;
+        }
+    }
+
+    pub fn add_glow_all(&mut self, amount: f32) {
+        self.glow.iter_mut().for_each(|g| *g += amount);
+    }
+
+    #[inline]
+    pub fn glow(&self, material: u32) -> f32 {
+        self.glow.get(material as usize).copied().unwrap_or(0.0)
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.nodes.is_empty()
+            || !self.morphs.is_empty()
+            || self.root_scale != 0.0
+            || self.root_pos != Vec3::ZERO
+            || self.root_rot != Quat::IDENTITY
+            || self.glow.iter().any(|g| *g != 0.0)
+    }
+
+    /// Fecha o quadro. `true` se o resultado muda (algo se moveu ou a camada acabou de zerar).
+    pub fn finish(&mut self) -> bool {
+        self.moving || self.was_active != self.is_active()
+    }
+
+    /// Tem offsets de nó/morph (exige refazer a pose); raiz e brilho não tocam a pose.
+    pub fn touches_pose(&self) -> bool {
+        !self.nodes.is_empty() || !self.morphs.is_empty()
+    }
+
+    /// Matriz extra do modelo inteiro (`__ROOT__`).
+    pub fn root_matrix(&self) -> Mat4 {
+        if self.root_scale == 0.0 && self.root_pos == Vec3::ZERO && self.root_rot == Quat::IDENTITY {
+            return Mat4::IDENTITY;
+        }
+        let s = (1.0 + self.root_scale).max(0.05);
+        Mat4::from_scale_rotation_translation(Vec3::splat(s), self.root_rot.normalize(), self.root_pos)
+    }
+
+    /// Soma os offsets na pose (já restaurada/amostrada). Sem alocar.
+    pub fn apply(&self, pose: &mut Pose) {
+        for &n in &self.nodes {
+            let n = n as usize;
+            let (Some(r), Some(p), Some(s)) = (self.rot.get(n), self.pos.get(n), self.scale.get(n)) else {
+                continue;
+            };
+            let Some(node) = pose.nodes.get_mut(n) else {
+                continue;
+            };
+            if *r != Quat::IDENTITY {
+                node.rotation = (node.rotation * *r).normalize();
+            }
+            node.translation += *p;
+            if *s != 0.0 {
+                node.scale *= (1.0 + *s).max(0.05);
+            }
+        }
+        for &i in &self.morphs {
+            let i = i as usize;
+            if let (Some(v), Some(w)) = (self.morph.get(i), pose.weights.get_mut(i)) {
+                *w = w.max(v.clamp(0.0, 1.0));
             }
         }
     }

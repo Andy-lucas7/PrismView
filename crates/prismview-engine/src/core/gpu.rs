@@ -176,6 +176,7 @@ impl GpuContext {
     }
 
     /// O device aceita texturas BC (usar em `LoaderConfig::allow_bc7`).
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn supports_bc(&self) -> bool {
         self.device
             .features()

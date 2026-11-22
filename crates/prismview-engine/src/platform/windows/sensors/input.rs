@@ -10,6 +10,11 @@
 //!   (`RIDEV_REMOVE` ao sair) → sem demanda o Windows não entrega nada e a thread dorme em
 //!   `GetMessageW`.
 //!
+//! - Toque no desktop (`DESKTOP_TAP`, Fase 4): botão esquerdo solto perto de onde desceu e em
+//!   pouco tempo (não é arrasto/seleção) e sobre o fundo do desktop (`desktop_hit`) →
+//!   `SignalBus::publish_desktop_tap`. Só observa: `RIDEV_INPUTSINK` não consome o clique e nada
+//!   aqui ativa janela, então o foco continua onde estava (o Explorer recebe o clique normal).
+//!
 //! O buffer do `GetRawInputData` é decodificado à mão (offsets do SDK) para não depender do
 //! formato dos tipos `RAWMOUSE`/`RAWKEYBOARD` entre versões do crate `windows`.
 
@@ -33,6 +38,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW,
 };
 
+use super::super::desktop_hit::{classify_point, DesktopPoint};
 use super::super::util::valid_hwnd;
 use super::Shared;
 use crate::engine_core::signals::{buttons, SignalKind};
@@ -42,6 +48,9 @@ const CLASS_NAME: PCWSTR = w!("PrismEngineRawInputSink");
 pub(super) const WM_INPUT_DEMAND: u32 = WM_APP + 0x51;
 
 const CURSOR_POLL: Duration = Duration::from_millis(4);
+/// Toque = soltar a até `TAP_SLOP_PX` de onde desceu, em até `TAP_MAX` (senão é arrasto/seleção).
+const TAP_SLOP_PX: i32 = 6;
+const TAP_MAX: Duration = Duration::from_millis(600);
 
 const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
 const HID_USAGE_MOUSE: u16 = 0x02;
@@ -79,6 +88,8 @@ struct InputState {
     keys_down: Cell<[u64; 4]>,
     last_cursor_poll: Cell<Option<Instant>>,
     last_cursor: Cell<(i32, i32)>,
+    /// Botão esquerdo desceu em `(x, y)` neste instante (candidato a toque).
+    left_press: Cell<Option<(i32, i32, Instant)>>,
 }
 
 std::thread_local! {
@@ -107,6 +118,7 @@ pub(super) fn run(shared: Arc<Shared>, hwnd_out: Arc<AtomicIsize>) {
             keys_down: Cell::new([0; 4]),
             last_cursor_poll: Cell::new(None),
             last_cursor: Cell::new((0, 0)),
+            left_press: Cell::new(None),
         };
         STATE.with(|s| s.set(&state as *const InputState));
 
@@ -171,7 +183,11 @@ fn device(usage: u16, flags: RAWINPUTDEVICE_FLAGS, hwnd: HWND) -> RAWINPUTDEVICE
 
 /// Registra/remove mouse e teclado conforme a demanda atual.
 unsafe fn sync_registration(hwnd: HWND, state: &InputState) {
-    let wanted = state.shared.bus.demand() & SignalKind::INPUT;
+    let demand = state.shared.bus.demand();
+    let mut wanted = demand & SignalKind::INPUT;
+    if demand.contains(SignalKind::DESKTOP_TAP) {
+        wanted |= SignalKind::MOUSE; // toques vêm do mesmo dispositivo
+    }
     let current = state.registered.get();
     let mut now = current;
     let size = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
@@ -290,12 +306,38 @@ fn handle_mouse(state: &InputState, raw: &[u8]) {
             bus.update_buttons(down, up);
             // Clique: força cursor exato no instante do clique.
             poll_cursor(state, now, true);
+            detect_desktop_tap(state, down, up, now);
         }
         if button_flags & RI_WHEEL != 0 {
             bus.add_wheel(button_data as i32);
         }
     }
     bus.commit_input(SignalKind::MOUSE);
+}
+
+/// Clique curto do botão esquerdo sobre o fundo do desktop → `publish_desktop_tap`.
+fn detect_desktop_tap(state: &InputState, down: u32, up: u32, now: Instant) {
+    let bus = &state.shared.bus;
+    if down & buttons::LEFT != 0 {
+        let (x, y) = state.last_cursor.get();
+        state.left_press.set(Some((x, y, now)));
+    }
+    if up & buttons::LEFT == 0 {
+        return;
+    }
+    let Some((px, py, at)) = state.left_press.take() else {
+        return;
+    };
+    if !bus.is_demanded(SignalKind::DESKTOP_TAP) || now.duration_since(at) > TAP_MAX {
+        return;
+    }
+    let (x, y) = state.last_cursor.get();
+    if (x - px).abs() > TAP_SLOP_PX || (y - py).abs() > TAP_SLOP_PX {
+        return;
+    }
+    if classify_point(x, y) == DesktopPoint::Background {
+        bus.publish_desktop_tap(x, y);
+    }
 }
 
 fn handle_keyboard(state: &InputState, raw: &[u8]) {

@@ -32,6 +32,8 @@ pub enum QuadKind {
     Mask = 2,
     /// Sombra suave baseada em SDF.
     Shadow = 3,
+    /// Textura opaca (frame de vídeo BGRA sem alpha garantido): amostra com a = 1.
+    Opaque = 4,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +482,21 @@ impl Compositor2D {
     /// Registra (ou atualiza, se `existing` for `Some`) uma view pertencente a outro módulo
     /// (ex.: textura de um slot de texto). O dono deve manter a textura viva enquanto o id for
     /// usado; ao realocar a textura, chame de novo para refazer o bind group.
+    /// Como `bind_view`, mas guarda a view: `texture_view(id)` passa a devolvê-la (o vidro óptico
+    /// a usa como backdrop — saída 3D, frames de vídeo).
+    pub fn bind_owned_view(
+        &mut self,
+        device: &wgpu::Device,
+        existing: Option<TextureId>,
+        view: wgpu::TextureView,
+    ) -> TextureId {
+        let id = self.bind_view(device, existing, &view);
+        if let Some(slot) = self.textures.get_mut(id.0 as usize) {
+            slot.view = Some(view);
+        }
+        id
+    }
+
     pub fn bind_view(
         &mut self,
         device: &wgpu::Device,
@@ -648,6 +665,43 @@ struct GlobalsRaw {
 
 const INITIAL_CAPACITY: usize = 256;
 
+/// Caixa orientada da camada 3D nesta saída (px físicos), refeita junto com a lista. Usada para
+/// dimensionar o viewport do `Scene3dRenderer` e mapear cliques/cursor para 0..1 da camada.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scene3dPlacement {
+    pub center: [f32; 2],
+    pub half: [f32; 2],
+    /// Colunas X/Y da afim (rotação·escala), como `QuadInstance`.
+    pub basis: [f32; 4],
+}
+
+impl Scene3dPlacement {
+    /// Tamanho em px do alvo de render (caixa sem rotação, com a escala da afim).
+    pub fn pixel_size(&self) -> (u32, u32) {
+        let sx = self.basis[0].hypot(self.basis[1]);
+        let sy = self.basis[2].hypot(self.basis[3]);
+        let w = (self.half[0] * 2.0 * sx).round();
+        let h = (self.half[1] * 2.0 * sy).round();
+        let clamp = |v: f32| if v.is_finite() { v.clamp(1.0, 8192.0) as u32 } else { 1 };
+        (clamp(w), clamp(h))
+    }
+
+    /// Ponto `p` (px locais da saída) → coordenada normalizada 0..1 da camada (`None` = fora).
+    pub fn to_local(&self, p: [f32; 2]) -> Option<[f32; 2]> {
+        let [a, b, c, d] = self.basis; // colunas (a,b) e (c,d)
+        let det = a * d - c * b;
+        if !det.is_finite() || det.abs() < 1e-8 || self.half[0] <= 0.0 || self.half[1] <= 0.0 {
+            return None;
+        }
+        let (dx, dy) = (p[0] - self.center[0], p[1] - self.center[1]);
+        let lx = (d * dx - c * dy) / det;
+        let ly = (-b * dx + a * dy) / det;
+        let u = lx / (self.half[0] * 2.0) + 0.5;
+        let v = ly / (self.half[1] * 2.0) + 0.5;
+        ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some([u, v])
+    }
+}
+
 pub struct Canvas {
     viewport: (u32, u32),
     globals: wgpu::Buffer,
@@ -665,6 +719,10 @@ pub struct Canvas {
     pub built_scale: f32,
     /// Vidros ópticos desta saída (cada um é um marcador na ordem Z; ver `core::glass`).
     pub glass: Option<GlassLayer>,
+    /// Regiões tocáveis (controles de mídia) desta saída, refeitas junto com a lista.
+    pub hits: super::interaction::HitMap,
+    /// Camada 3D desenhada nesta saída (a primeira visível da cena), se houver.
+    pub scene3d: Option<Scene3dPlacement>,
 }
 
 impl Canvas {
@@ -690,6 +748,8 @@ impl Canvas {
             built_size: (0, 0),
             built_scale: 0.0,
             glass: None,
+            hits: super::interaction::HitMap::default(),
+            scene3d: None,
         }
     }
 
@@ -727,6 +787,8 @@ impl Canvas {
         self.viewport = (width.max(1), height.max(1));
         self.items.clear();
         self.seq = 0;
+        self.hits.clear();
+        self.scene3d = None;
     }
 
     /// Enfileira um quad. A ordem final é `(z, ordem de chamada)`: Z maior fica por cima.

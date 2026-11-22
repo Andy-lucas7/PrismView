@@ -1063,7 +1063,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           const boxTop = full ? 0 : candidate.y * size.h - bh * 0.5;
           return {
             backdrop: {
-              key: `3d|${candidate.id}|${candidate.scene3d?.modelSrc || "default"}`,
+              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}`,
               kind: "canvas",
               live: true,
               element: el,

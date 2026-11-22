@@ -154,6 +154,9 @@ pub struct TextSystem {
     renderer: TextRenderer,
     /// `font_id` → nome real da família no banco (`None` = usar a sans-serif genérica).
     families: HashMap<String, Option<String>>,
+    /// `font_id` → família do arquivo de fonte do projeto (`TextContent::font_path`). Sobrevive a
+    /// `fonts_changed` (é a origem, não um cache).
+    aliases: HashMap<String, String>,
     /// Incrementa quando o banco de fontes muda: todo slot refaz o shaping.
     font_generation: u64,
     system_fonts_loaded: bool,
@@ -179,6 +182,7 @@ impl TextSystem {
             viewport,
             renderer,
             families: HashMap::new(),
+            aliases: HashMap::new(),
             font_generation: 0,
             system_fonts_loaded: false,
             slots: HashMap::new(),
@@ -210,6 +214,39 @@ impl TextSystem {
         self.fonts_changed();
     }
 
+    /// Registra o arquivo `path` (se ainda não estiver no banco) e faz `font_id` resolver para a
+    /// família contida nele — o nome que o Estúdio dá à fonte importada não precisa coincidir
+    /// com o nome interno do arquivo. `false` se o arquivo não pôde ser lido.
+    pub fn register_font_alias(&mut self, font_id: &str, path: &Path) -> bool {
+        let mut family = self.family_of_file(path);
+        if family.is_none() && self.font_system.db_mut().load_font_file(path).is_ok() {
+            family = self.family_of_file(path);
+        }
+        let Some(family) = family else {
+            return false;
+        };
+        if self.aliases.get(font_id) != Some(&family) {
+            self.aliases.insert(font_id.to_owned(), family);
+            self.fonts_changed();
+        }
+        true
+    }
+
+    fn family_of_file(&self, path: &Path) -> Option<String> {
+        self.font_system.db().faces().find_map(|face| {
+            let src = match &face.source {
+                fontdb::Source::File(p) => p.as_path(),
+                fontdb::Source::SharedFile(p, _) => p.as_path(),
+                _ => return None,
+            };
+            if src == path {
+                face.families.first().map(|(name, _)| name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     fn fonts_changed(&mut self) {
         self.families.clear();
         self.font_generation += 1;
@@ -220,6 +257,12 @@ impl TextSystem {
     fn resolve_family(&mut self, font_id: &str) -> Option<String> {
         if let Some(hit) = self.families.get(font_id) {
             return hit.clone();
+        }
+        if let Some(alias) = self.aliases.get(font_id) {
+            if let Some(found) = find_family(self.font_system.db(), alias) {
+                self.families.insert(font_id.to_owned(), Some(found.clone()));
+                return Some(found);
+            }
         }
         let mut found = find_family(self.font_system.db(), font_id);
         if found.is_none() && !self.system_fonts_loaded {
@@ -433,6 +476,7 @@ impl TextSystem {
     }
 
     /// Há slots esperando raster?
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn has_pending(&self) -> bool {
         self.slots.values().any(|s| s.needs_raster)
     }

@@ -12,6 +12,10 @@
 //! Regras PLANO_NATIVO: nada de `unwrap/expect`; zero alocação no quadro (listas de draw, staging
 //! e uniforms pré-alocados e reaproveitados com `.clear()`); render targets recriados só em
 //! resize; ambiente (PMREM) só em troca de preset/HDRI; `needs_frame()` falso = loop pode dormir.
+//!
+//! Fase 4: `set_signals` entrega o `SignalSnapshot` do quadro; `update` roda o `BindingSolver3d`
+//! depois de avançar os clipes (desfaz → anima → reaplica, ver `core::bindings`). Hover/clique em
+//! malha usam `pick` (raio × AABB de mundo de cada draw, sem alocar).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +25,10 @@ use std::time::Duration;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
+
+use crate::engine_core::assets::Aabb;
+use crate::engine_core::bindings::{BindingSolver3d, InstanceAccess, PickHit};
+use crate::engine_core::signals::{SignalKind, SignalSnapshot};
 
 use super::config::{Scene3dBackgroundMode, Scene3dConfig, Scene3dEnvPreset, Scene3dObject, Scene3dObjectKind};
 use super::culling::Frustum;
@@ -59,6 +67,8 @@ struct FrameUniform {
 struct DrawGpu {
     model: [f32; 16],
     normal: [f32; 16],
+    /// x = brilho emissivo extra dos bindings (`EMISSIVE_GLOW`); yzw livres.
+    glow: [f32; 4],
 }
 
 #[repr(C)]
@@ -242,7 +252,7 @@ struct Targets {
     hdr_view: wgpu::TextureView,
     _depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
-    _output: wgpu::Texture,
+    output: wgpu::Texture,
     output_view: wgpu::TextureView,
     tonemap_bind: wgpu::BindGroup,
 }
@@ -306,6 +316,8 @@ pub struct Scene3dRenderer {
     draw_capacity: usize,
     tonemap_buffer: wgpu::Buffer,
     targets: Option<Targets>,
+    /// Incrementa a cada (re)criação dos alvos: o compositor refaz o bind da `output_view`.
+    output_generation: u64,
     viewport: (u32, u32),
     render_scale_cap: f32,
 
@@ -319,6 +331,45 @@ pub struct Scene3dRenderer {
     dirty: bool,
     animating: bool,
     stats: Scene3dStats,
+
+    // Fase 4: bindings reativos.
+    solver: BindingSolver3d,
+    signals: SignalSnapshot,
+    /// Cursor da última consulta de hover (re-pick só se mudou).
+    hover_pointer: Option<[f32; 2]>,
+}
+
+/// Visão das instâncias para o `BindingSolver3d` (campos disjuntos do renderer).
+struct SlotAccess<'a> {
+    slots: &'a mut [ObjectSlot],
+    objects: &'a [Scene3dObject],
+}
+
+impl InstanceAccess for SlotAccess<'_> {
+    fn object_count(&self) -> usize {
+        self.slots.len()
+    }
+    fn object_index(&self, object_id: &str) -> Option<usize> {
+        self.objects.iter().position(|o| o.id == object_id)
+    }
+    fn instance(&self, object: usize) -> Option<&ModelInstance> {
+        self.slots.get(object).and_then(|s| s.instance.as_ref())
+    }
+    fn instance_mut(&mut self, object: usize) -> Option<&mut ModelInstance> {
+        self.slots.get_mut(object).and_then(|s| s.instance.as_mut())
+    }
+}
+
+/// Raio × AABB (slabs). Distância de entrada (≥ 0) ou `None`.
+fn ray_aabb(origin: Vec3, inv_dir: Vec3, b: &Aabb) -> Option<f32> {
+    if b.is_empty() {
+        return None;
+    }
+    let t1 = (b.min - origin) * inv_dir;
+    let t2 = (b.max - origin) * inv_dir;
+    let t_near = t1.min(t2).max_element().max(0.0);
+    let t_far = t1.max(t2).min_element();
+    (t_far.is_finite() && t_far >= t_near).then_some(t_near)
 }
 
 impl Scene3dRenderer {
@@ -375,6 +426,7 @@ impl Scene3dRenderer {
             draw_capacity: 16,
             tonemap_buffer,
             targets: None,
+            output_generation: 0,
             viewport: (0, 0),
             render_scale_cap: 1.0,
             draw_staging: Vec::with_capacity(16),
@@ -385,6 +437,9 @@ impl Scene3dRenderer {
             dirty: true,
             animating: false,
             stats: Scene3dStats::default(),
+            solver: BindingSolver3d::new(),
+            signals: SignalSnapshot::default(),
+            hover_pointer: None,
         };
         this.write_tonemap(gpu.queue());
         this
@@ -471,6 +526,9 @@ impl Scene3dRenderer {
         self.object_world = vec![Mat4::IDENTITY; objects.len()];
         self.objects = objects;
 
+        self.solver.set_specs(&config.bindings);
+        self.hover_pointer = None;
+
         let preset_changed = self.config.env_preset != config.env_preset;
         let day_night_changed = self.config.auto_day_night != config.auto_day_night;
         self.config = config;
@@ -543,6 +601,8 @@ impl Scene3dRenderer {
                 }
                 if matched {
                     self.ensure_draw_capacity(gpu.device());
+                    self.solver.invalidate();
+                    self.hover_pointer = None;
                     self.dirty = true;
                 }
                 matched
@@ -560,6 +620,7 @@ impl Scene3dRenderer {
     }
 
     /// Erros por objeto (`id`, mensagem): modelo que falhou, SHOWCASE, caminho inválido.
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn object_errors(&self) -> impl Iterator<Item = (&str, &str)> {
         self.slots
             .iter()
@@ -567,6 +628,7 @@ impl Scene3dRenderer {
     }
 
     /// Algum modelo ainda carregando.
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn is_loading(&self) -> bool {
         self.slots.iter().any(|s| s.ticket.is_some())
     }
@@ -748,8 +810,114 @@ impl Scene3dRenderer {
             animating = true;
         }
 
+        // Bindings reativos: desfaz o delta anterior → (clipes já avançados acima) → reaplica.
+        if !self.solver.is_empty() {
+            if self.solver.wants_hover() && (self.pointer != self.hover_pointer || !settled) {
+                self.hover_pointer = self.pointer;
+                let hit = self.pointer.and_then(|p| self.pick(p));
+                self.solver.set_hover(hit);
+            }
+            let mut access = SlotAccess {
+                slots: &mut self.slots,
+                objects: &self.objects,
+            };
+            if self.solver.solve(&mut access, &self.signals, self.pointer, dt) {
+                self.dirty = true;
+            }
+            animating |= self.solver.is_animating();
+            // Override de clipe (PLAY_CLIP) iniciado agora também pede quadros.
+            animating |= self
+                .slots
+                .iter()
+                .any(|s| s.instance.as_ref().is_some_and(ModelInstance::is_animating));
+        }
+
         self.animating = animating;
         self.dirty || animating
+    }
+
+    /// Snapshot de sinais do quadro (copiado; ~400 B). Chamar antes de `update`.
+    pub fn set_signals(&mut self, snap: &SignalSnapshot) {
+        self.signals = *snap;
+    }
+
+    /// Sinais que os bindings desta cena consomem (para `SignalBus::set_demand`).
+    pub fn signal_demand(&self) -> SignalKind {
+        self.solver.demand()
+    }
+
+    /// Clique normalizado (0..1 sobre a camada) para bindings `CLICK_MESH`. `true` se disparou.
+    pub fn click(&mut self, pointer: [f32; 2]) -> bool {
+        if !self.solver.wants_click() {
+            return false;
+        }
+        let Some(hit) = self.pick(pointer) else {
+            return false;
+        };
+        let mut access = SlotAccess {
+            slots: &mut self.slots,
+            objects: &self.objects,
+        };
+        let fired = self.solver.click(&mut access, hit);
+        if fired {
+            self.dirty = true;
+        }
+        fired
+    }
+
+    /// Objeto/nó sob o cursor normalizado (raio da câmera × AABB de mundo de cada draw). Usa as
+    /// matrizes do último `render`. Sem alocação.
+    pub fn pick(&self, pointer: [f32; 2]) -> Option<PickHit> {
+        if !pointer[0].is_finite() || !pointer[1].is_finite() {
+            return None;
+        }
+        let (w, h) = self.viewport;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let aspect = w as f32 / h as f32;
+        let (eye, target, fov) = self.camera_view();
+        let fwd = (target - eye).normalize_or_zero();
+        let right = fwd.cross(Vec3::Y).normalize_or_zero();
+        if fwd == Vec3::ZERO || right == Vec3::ZERO {
+            return None;
+        }
+        let up = right.cross(fwd);
+        let t = (fov.to_radians() * 0.5).tan();
+        let nx = pointer[0] * 2.0 - 1.0;
+        let ny = 1.0 - pointer[1] * 2.0;
+        let dir = (fwd + right * (nx * t * aspect) + up * (ny * t)).normalize_or_zero();
+        let safe = |v: f32| if v.abs() < 1e-9 { 1e-9_f32.copysign(v) } else { v };
+        let inv = Vec3::new(1.0 / safe(dir.x), 1.0 / safe(dir.y), 1.0 / safe(dir.z));
+
+        let mut best: Option<(f32, PickHit)> = None;
+        for (oi, slot) in self.slots.iter().enumerate() {
+            let Some(instance) = &slot.instance else {
+                continue;
+            };
+            if !self.visible.get(oi).copied().unwrap_or(false) {
+                continue;
+            }
+            let object = self.object_world.get(oi).copied().unwrap_or(Mat4::IDENTITY);
+            let base = object * instance.root_matrix() * instance.normalize;
+            for draw in &instance.draws {
+                let Some(prim) = instance.primitive(draw) else {
+                    continue;
+                };
+                let (model, bounds) = if draw.skinned {
+                    (base, instance.skinned_bounds)
+                } else {
+                    (base * instance.node_world(draw.node), prim.bounds)
+                };
+                let Some(dist) = ray_aabb(eye, inv, &bounds.transformed(&model)) else {
+                    continue;
+                };
+                if best.map_or(true, |(d, _)| dist < d) {
+                    best = Some((dist, PickHit { object: oi, node: draw.node }));
+                }
+            }
+        }
+        best.map(|(_, hit)| hit)
     }
 
     /// `true` se o próximo `render` produziria algo novo.
@@ -785,8 +953,31 @@ impl Scene3dRenderer {
         self.targets.as_ref().map(|t| &t.output_view)
     }
 
+    /// Textura de saída (o compositor cria a própria view dela: backdrop do vidro).
+    pub fn output_texture(&self) -> Option<&wgpu::Texture> {
+        self.targets.as_ref().map(|t| &t.output)
+    }
+
+    /// Muda sempre que `output_view` passa a apontar para uma textura nova.
+    pub fn output_generation(&self) -> u64 {
+        self.output_generation
+    }
+
+    /// Órbita por cursor configurada (o loop precisa do mouse mesmo sem bindings).
+    pub fn wants_cursor(&self) -> bool {
+        let cam = &self.config.camera;
+        cam.orbit_parallax_x.abs() > 1e-3 || cam.orbit_parallax_y.abs() > 1e-3
+    }
+
     pub fn output_size(&self) -> Option<(u32, u32)> {
         self.targets.as_ref().map(|t| t.size)
+    }
+
+    /// Hibernação de VRAM (Fase 5): solta MSAA/HDR/profundidade/saída. O próximo `render`
+    /// recria tudo (`dirty`), mantendo cena, modelos e ambiente.
+    pub fn release_targets(&mut self) {
+        self.targets = None;
+        self.dirty = true;
     }
 
     fn render_size(&self) -> (u32, u32) {
@@ -857,9 +1048,10 @@ impl Scene3dRenderer {
             depth_view: view(&depth),
             _depth: depth,
             output_view: view(&output),
-            _output: output,
+            output,
             tonemap_bind,
         });
+        self.output_generation = self.output_generation.wrapping_add(1);
     }
 
     fn camera_view(&self) -> (Vec3, Vec3, f32) {
@@ -979,7 +1171,8 @@ impl Scene3dRenderer {
                 continue;
             }
             let object = self.object_world.get(oi).copied().unwrap_or(Mat4::IDENTITY);
-            let base = object * instance.normalize;
+            // `__ROOT__` dos bindings: em torno do centro do modelo normalizado.
+            let base = object * instance.root_matrix() * instance.normalize;
             for (di, draw) in instance.draws.iter().enumerate() {
                 let Some(prim) = instance.primitive(draw) else {
                     continue;
@@ -1011,6 +1204,7 @@ impl Scene3dRenderer {
                 self.draw_staging.push(DrawGpu {
                     model: model.to_cols_array(),
                     normal: normal.to_cols_array(),
+                    glow: [instance.glow(prim.material), 0.0, 0.0, 0.0],
                 });
                 // Espelhado (det < 0) inverte o winding: usa a variante sem culling.
                 let double = material.double_sided || det < 0.0;

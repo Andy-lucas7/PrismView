@@ -5,8 +5,10 @@
 //! descreve o layout **descomprimido** dentro de um buffer de fallback; o loader grava o resultado
 //! naquele buffer, de modo que os accessors leem os dados como se nunca tivessem sido comprimidos.
 //!
-//! Usa `meshopt::ffi` (strides dinâmicos, sem genéricos). Os filtros OCTAHEDRAL/QUATERNION/
-//! EXPONENTIAL também vêm da biblioteca. Nenhum `unwrap/expect`.
+//! Usa `meshopt::ffi` (strides dinâmicos, sem genéricos) para os decoders de vértice/índice.
+//! Os filtros OCTAHEDRAL/QUATERNION/EXPONENTIAL são implementados aqui em Rust puro (port do
+//! caminho escalar de `vertexfilter.cpp`): `meshopt` 0.4 não exporta `meshopt_decodeFilter*`,
+//! o que gerava LNK2019. Nenhum `unwrap/expect`.
 
 use std::ffi::c_void;
 
@@ -183,31 +185,146 @@ impl MeshoptView {
 
     fn apply_filter(&self, data: &mut [u8]) -> Result<(), AssetError> {
         let stride = self.byte_stride;
-        let ptr = data.as_mut_ptr().cast::<c_void>();
         match self.filter {
             MeshoptFilter::None => {}
-            MeshoptFilter::Octahedral => {
-                if stride != 4 && stride != 8 {
-                    return Err(AssetError::Format("meshopt: OCTAHEDRAL exige stride 4 ou 8".into()));
-                }
-                // SAFETY: `data` tem `count * stride` bytes.
-                unsafe { ::meshopt::ffi::meshopt_decodeFilterOct(ptr, self.count, stride) };
-            }
+            MeshoptFilter::Octahedral => match stride {
+                4 => decode_filter_oct_i8(data, self.count),
+                8 => decode_filter_oct_i16(data, self.count),
+                _ => return Err(AssetError::Format("meshopt: OCTAHEDRAL exige stride 4 ou 8".into())),
+            },
             MeshoptFilter::Quaternion => {
                 if stride != 8 {
                     return Err(AssetError::Format("meshopt: QUATERNION exige stride 8".into()));
                 }
-                // SAFETY: idem.
-                unsafe { ::meshopt::ffi::meshopt_decodeFilterQuat(ptr, self.count, stride) };
+                decode_filter_quat(data, self.count);
             }
             MeshoptFilter::Exponential => {
                 if stride % 4 != 0 {
                     return Err(AssetError::Format("meshopt: EXPONENTIAL exige stride múltiplo de 4".into()));
                 }
-                // SAFETY: idem.
-                unsafe { ::meshopt::ffi::meshopt_decodeFilterExp(ptr, self.count, stride) };
+                decode_filter_exp(data, self.count * (stride / 4));
             }
         }
         Ok(())
+    }
+}
+
+/// Arredondamento float→int com sinal, igual ao `int(v + (v >= 0 ? 0.5 : -0.5))` do C++.
+#[inline]
+fn round_signed(v: f32) -> i32 {
+    (v + if v >= 0.0 { 0.5 } else { -0.5 }) as i32
+}
+
+/// OCTAHEDRAL, componentes i8 (stride 4): x, y, z(=1.0 codificado), w intacto.
+fn decode_filter_oct_i8(data: &mut [u8], count: usize) {
+    const MAX: f32 = 127.0;
+    for v in data.chunks_exact_mut(4).take(count) {
+        let (x, y, z) = oct_decode(
+            f32::from(v[0] as i8),
+            f32::from(v[1] as i8),
+            f32::from(v[2] as i8),
+            MAX,
+        );
+        v[0] = x as i8 as u8;
+        v[1] = y as i8 as u8;
+        v[2] = z as i8 as u8;
+    }
+}
+
+/// OCTAHEDRAL, componentes i16 LE (stride 8).
+fn decode_filter_oct_i16(data: &mut [u8], count: usize) {
+    const MAX: f32 = 32767.0;
+    for v in data.chunks_exact_mut(8).take(count) {
+        let (x, y, z) = oct_decode(
+            f32::from(read_i16(v, 0)),
+            f32::from(read_i16(v, 1)),
+            f32::from(read_i16(v, 2)),
+            MAX,
+        );
+        write_i16(v, 0, x as i16);
+        write_i16(v, 1, y as i16);
+        write_i16(v, 2, z as i16);
+    }
+}
+
+#[inline]
+fn oct_decode(mut x: f32, mut y: f32, zin: f32, max: f32) -> (i32, i32, i32) {
+    // z codifica 1.0 na mesma escala; reconstrói z e desfaz a dobra do octaedro para z < 0.
+    let z = zin - x.abs() - y.abs();
+    let t = if z < 0.0 { z } else { 0.0 };
+    x += if x >= 0.0 { t } else { -t };
+    y += if y >= 0.0 { t } else { -t };
+    let l = (x * x + y * y + z * z).sqrt();
+    let s = if l > 0.0 { max / l } else { 0.0 };
+    (round_signed(x * s), round_signed(y * s), round_signed(z * s))
+}
+
+/// QUATERNION (stride 8, i16 LE): 3 componentes + (escala << 2 | índice do maior componente).
+fn decode_filter_quat(data: &mut [u8], count: usize) {
+    let scale = 1.0 / 2f32.sqrt();
+    for v in data.chunks_exact_mut(8).take(count) {
+        let c3 = read_i16(v, 3);
+        let sf = i32::from(c3) | 3;
+        let ss = scale / sf as f32;
+        let x = f32::from(read_i16(v, 0)) * ss;
+        let y = f32::from(read_i16(v, 1)) * ss;
+        let z = f32::from(read_i16(v, 2)) * ss;
+        let ww = 1.0 - x * x - y * y - z * z;
+        let w = if ww >= 0.0 { ww } else { 0.0 }.sqrt();
+        let xf = round_signed(x * 32767.0);
+        let yf = round_signed(y * 32767.0);
+        let zf = round_signed(z * 32767.0);
+        let wf = (w * 32767.0 + 0.5) as i32;
+        let qc = (i32::from(c3) & 3) as usize;
+        write_i16(v, (qc + 1) & 3, xf as i16);
+        write_i16(v, (qc + 2) & 3, yf as i16);
+        write_i16(v, (qc + 3) & 3, zf as i16);
+        write_i16(v, qc & 3, wf as i16);
+    }
+}
+
+/// EXPONENTIAL: cada u32 LE = expoente i8 (bits 24..32) + mantissa i24 → `ldexp(m, e)` em f32.
+fn decode_filter_exp(data: &mut [u8], words: usize) {
+    for w in data.chunks_exact_mut(4).take(words) {
+        let v = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let m = ((v << 8) as i32) >> 8;
+        let e = (v as i32) >> 24;
+        let scale = f32::from_bits(((e + 127) as u32).wrapping_shl(23));
+        let out = (scale * m as f32).to_bits();
+        w.copy_from_slice(&out.to_le_bytes());
+    }
+}
+
+#[inline]
+fn read_i16(v: &[u8], i: usize) -> i16 {
+    i16::from_le_bytes([v[i * 2], v[i * 2 + 1]])
+}
+
+#[inline]
+fn write_i16(v: &mut [u8], i: usize, x: i16) {
+    let b = x.to_le_bytes();
+    v[i * 2] = b[0];
+    v[i * 2 + 1] = b[1];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exp_filter_matches_ldexp() {
+        // m = 3, e = -1 → 1.5
+        let raw: u32 = ((-1i32 as u32) << 24) | 3;
+        let mut d = raw.to_le_bytes().to_vec();
+        decode_filter_exp(&mut d, 1);
+        assert_eq!(f32::from_le_bytes([d[0], d[1], d[2], d[3]]), 1.5);
+    }
+
+    #[test]
+    fn oct_filter_unit_z() {
+        // (0, 0, 127) codifica +Z.
+        let mut d = vec![0u8, 0, 127, 0];
+        decode_filter_oct_i8(&mut d, 1);
+        assert_eq!(d, vec![0, 0, 127, 0]);
     }
 }

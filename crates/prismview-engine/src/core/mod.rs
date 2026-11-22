@@ -5,9 +5,12 @@
 
 pub mod assets;
 pub mod audio;
+pub mod bindings;
 pub mod compositor;
 pub mod glass;
+pub mod governor;
 pub mod gpu;
+pub mod interaction;
 pub mod scene2d;
 pub mod scene3d;
 pub mod signals;

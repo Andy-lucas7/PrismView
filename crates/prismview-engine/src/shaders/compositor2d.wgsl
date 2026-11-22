@@ -51,6 +51,7 @@ const KIND_SOLID: u32 = 0u;
 const KIND_TEXTURE: u32 = 1u;
 const KIND_MASK: u32 = 2u;
 const KIND_SHADOW: u32 = 3u;
+const KIND_OPAQUE: u32 = 4u;
 const TAU: f32 = 6.28318530718;
 
 struct VOut {
@@ -135,6 +136,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         if (kind == KIND_TEXTURE) {
             // Textura pré-multiplicada × tint (rgb) × opacidade (a).
             rgba = t * vec4<f32>(inst.color.rgb, 1.0) * inst.color.a;
+        } else if (kind == KIND_OPAQUE) {
+            // Vídeo: alpha da textura não é garantido → força a = 1 (rgb já na codificação da tela).
+            rgba = vec4<f32>(t.rgb * inst.color.rgb, 1.0) * inst.color.a;
         } else if (kind == KIND_MASK) {
             // Preenchimento (sólido/gradiente) recortado pelo alpha da textura.
             rgba = vec4<f32>(fill.rgb * fill.a, fill.a) * t.a;

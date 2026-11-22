@@ -3303,8 +3303,48 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <option value="MEDIA_PLAY_PAUSE">Mídia · Play / Pause</option>
                     <option value="MEDIA_NEXT">Mídia · Próxima Faixa</option>
                     <option value="MEDIA_PREV">Mídia · Faixa Anterior</option>
+                    <option value="OPEN_URL">Abrir URL</option>
+                    <option value="OPEN_APP">Abrir App / Arquivo</option>
+                    <option value="TOGGLE_GLOBAL">Alternar Variável (liga/desliga)</option>
+                    <option value="SET_GLOBAL">Definir Variável</option>
+                    <option value="NEXT_GLOBAL_LIST">Próximo Valor da Lista</option>
                   </select>
                 </label>
+                {(() => {
+                  const action = selectedLayer.clickAction ?? "NONE";
+                  const field = (
+                    key: "clickUrl" | "clickTarget" | "clickGlobal" | "clickValue",
+                    label: string,
+                    placeholder: string
+                  ) => (
+                    <label key={key} className="block text-xs text-[#A1A1AA]">
+                      {label}
+                      <input
+                        value={selectedLayer[key] ?? ""}
+                        placeholder={placeholder}
+                        onChange={(e) =>
+                          onPatchLayer(selectedLayer.id, (l) => ({ ...l, [key]: e.target.value }), "discrete")
+                        }
+                        className="mt-1 w-full bg-black border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
+                      />
+                    </label>
+                  );
+                  if (action === "OPEN_URL") return field("clickUrl", "URL", "https://…");
+                  if (action === "OPEN_APP") return field("clickTarget", "Caminho", "C:/Programas/app.exe");
+                  if (action === "TOGGLE_GLOBAL" || action === "NEXT_GLOBAL_LIST")
+                    return field("clickGlobal", "Variável", "nome");
+                  if (action === "SET_GLOBAL")
+                    return (
+                      <>
+                        {field("clickGlobal", "Variável", "nome")}
+                        {field("clickValue", "Valor", "1")}
+                      </>
+                    );
+                  return null;
+                })()}
+                {selectedLayer.clickAction && !selectedLayer.clickAction.startsWith("MEDIA") && selectedLayer.clickAction !== "NONE" && (
+                  <p className="text-[10px] text-[#71717A]">Executado pelo motor nativo ao tocar no desktop.</p>
+                )}
               </div>
 
               <div className="space-y-2.5 pt-2.5 border-t border-white/10">

@@ -173,6 +173,7 @@ impl<T> Vault<T> {
     }
 
     /// Remove uma entrada ociosa (p.ex. asset trocado no Estúdio). `false` se está em uso/ausente.
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn evict(&self, hash: AssetHash) -> bool {
         let mut inner = self.lock();
         let idle = inner
@@ -252,6 +253,7 @@ impl AssetVault {
     }
 
     /// Total em memória de CPU (modelos + texturas).
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn total_bytes(&self) -> usize {
         self.models.stats().bytes + self.textures.stats().bytes
     }

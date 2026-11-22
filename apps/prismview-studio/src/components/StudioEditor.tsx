@@ -58,6 +58,7 @@ import {
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
+import { friendlyError } from "../utils/friendlyError";
 import {
   cloneLayerWithFreshIds,
   collectAllLayerIds,
@@ -96,6 +97,10 @@ interface StudioEditorProps {
   onBack: () => void;
   onApply: () => void;
   onExport: () => void;
+  /** Aplicar/fixar em andamento: trava o botão contra clique duplo. */
+  applying?: boolean;
+  /** Exportação em andamento. */
+  exporting?: boolean;
 }
 
 interface TreeDragState {
@@ -152,6 +157,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   onBack,
   onApply,
   onExport,
+  applying = false,
+  exporting = false,
 }) => {
   const [selectedIds, setSelectedIds] = useState<string[]>(() =>
     project.layers.length > 0 ? [project.layers[project.layers.length - 1].id] : []
@@ -732,8 +739,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       if (imported?.layers) {
         importWidgetAsGroup(imported);
       }
-    } catch {
-      /* cancelled or browser mode */
+    } catch (err) {
+      flashHint(friendlyError(err, "Não foi possível importar o widget."));
     }
   };
 
@@ -1137,13 +1144,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 ...l,
                 scene3d: {
                   ...prev,
-                  modelSrc: nextObjs[0]?.modelSrc ?? "",
                   objects: nextObjs,
-                  autoRotateSpeed: replacingDefault ? 0 : prev.autoRotateSpeed,
                   camera: replacingDefault
                     ? { ...prev.camera, azimuthDeg: 0, elevationDeg: 8 }
                     : prev.camera,
-                  playback: { ...prev.playback, clipName: "" },
                 },
               };
             },
@@ -1151,8 +1155,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           );
           flashHint(`Modelo 3D carregado: ${picked.file_name}`);
         }
-      } catch {
-        /* dialog cancelled or Tauri error */
+      } catch (err) {
+        flashHint(friendlyError(err, "Não foi possível carregar o arquivo escolhido."));
       }
       return;
     }
@@ -1236,13 +1240,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               ...l,
               scene3d: {
                 ...prev,
-                modelSrc: nextObjs[0]?.modelSrc ?? "",
                 objects: nextObjs,
-                autoRotateSpeed: replacingDefault ? 0 : prev.autoRotateSpeed,
                 camera: replacingDefault
                   ? { ...prev.camera, azimuthDeg: 0, elevationDeg: 8 }
                   : prev.camera,
-                playback: { ...prev.playback, clipName: "" },
               },
             };
           },
@@ -1277,7 +1278,6 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             ...l,
             scene3d: {
               ...prev,
-              modelSrc: nextObjs[0]?.modelSrc ?? "",
               objects: nextObjs,
             },
           };
@@ -1295,8 +1295,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         });
         if (!picked) return;
         appendModel(picked.path, picked.file_name);
-      } catch {
-        /* dialog cancelled */
+      } catch (err) {
+        flashHint(friendlyError(err, "Não foi possível adicionar o modelo."));
       }
       return;
     }
@@ -1584,14 +1584,27 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           )}
           <button
             onClick={onExport}
-            className="frosted-chrome rounded-full px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5"
+            disabled={exporting || applying}
+            aria-busy={exporting}
+            className="frosted-chrome rounded-full px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-[#A1A1AA]"
           >
-            <Download className="w-3.5 h-3.5" />
-            Exportar
+            <Download className={`w-3.5 h-3.5 ${exporting ? "animate-pulse" : ""}`} />
+            {exporting ? "Exportando…" : "Exportar"}
           </button>
-          <button onClick={onApply} className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2">
-            <Sparkles className="w-3.5 h-3.5" />
-            {project.packageType === "WIDGET" ? "Fixar Widget na Tela" : "Aplicar no Desktop"}
+          <button
+            onClick={onApply}
+            disabled={applying || exporting}
+            aria-busy={applying}
+            className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <Sparkles className={`w-3.5 h-3.5 ${applying ? "animate-spin" : ""}`} />
+            {applying
+              ? project.packageType === "WIDGET"
+                ? "Fixando…"
+                : "Aplicando…"
+              : project.packageType === "WIDGET"
+                ? "Fixar Widget na Tela"
+                : "Aplicar no Desktop"}
           </button>
         </div>
       </header>
@@ -2037,14 +2050,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                     scene3d: {
                       ...s3d,
                       objects: nextObjs,
-                      dynamicTextures: nextObjs[0]?.dynamicTextures ?? [],
                     },
                   };
                 },
                 "discrete"
               );
-            } catch {
-              /* cancelled */
+            } catch (err) {
+              flashHint(friendlyError(err, "Não foi possível carregar a imagem."));
             }
           }
         }}

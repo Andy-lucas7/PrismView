@@ -21,9 +21,11 @@
 //! event_loop::run(&mut host, &mut renderer);
 //! ```
 
+mod desktop_hit;
 pub mod event_loop;
 pub mod monitors;
 pub mod sensors;
+mod shell;
 mod signals;
 mod util;
 pub mod video;
@@ -46,6 +48,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
+pub use shell::shell_open;
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
 pub use workerw::{DesktopLayer, ShellLayout};
 

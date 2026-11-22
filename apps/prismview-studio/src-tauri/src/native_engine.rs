@@ -4,10 +4,10 @@
 //! pedido, mesmo protocolo de `prism-core::schema::IpcRequest/IpcResponse`). Este crate não
 //! depende de `prism-core`: os pedidos são montados como `serde_json::Value`.
 
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -18,7 +18,17 @@ use tauri::State;
 
 const PIPE_PATH: &str = r"\\.\pipe\prismview_ipc";
 const ENGINE_EXE: &str = "prismview-engine.exe";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// O motor sobrevive ao Studio: processo destacado, sem console e em grupo próprio.
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+const ACTIVE_SCENE_FILE: &str = "active_scene.json";
+/// Preferência de energia lida pelo motor ao iniciar (mesmo arquivo que ele grava no IPC).
+const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
+/// Marcador: o usuário desligou o início com o Windows (não reativar sozinho no "Aplicar").
+const AUTOSTART_OPT_OUT_FILE: &str = "autostart_disabled";
+/// Valor em `HKCU\...\Run` que sobe o motor no login.
+pub const ENGINE_RUN_VALUE: &str = "PrismViewEngine";
+const POWER_PREFERENCES: [&str; 5] = ["AUTO", "NORMAL", "ECO", "ULTRA", "FROZEN"];
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -28,7 +38,7 @@ pub struct NativeEngine {
     child: Mutex<Option<Child>>,
 }
 
-type SharedEngine = Arc<NativeEngine>;
+pub type SharedEngine = Arc<NativeEngine>;
 
 /// Envia um pedido e devolve a resposta JSON. `Err` se o pipe não existe ou a resposta é
 /// `{"status":"ERROR"}`.
@@ -87,7 +97,108 @@ fn engine_exe() -> Result<PathBuf, String> {
     }
 }
 
+/// `%APPDATA%\PrismView\native`: estado lido pelo próprio motor (cena ativa, preferência de energia).
+fn state_dir() -> Result<PathBuf, String> {
+    let base = std::env::var_os("APPDATA").ok_or("APPDATA ausente")?;
+    let dir = PathBuf::from(base).join("PrismView").join("native");
+    fs::create_dir_all(&dir).map_err(|e| format!("native_state_dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Linha de comando do login: `--login` faz o motor sair na hora se não houver cena ativa
+/// (não cobre o wallpaper do Windows com preto).
+pub fn login_command() -> Result<String, String> {
+    Ok(format!("\"{}\" --native --login", engine_exe()?.display()))
+}
+
+pub fn autostart_opted_out() -> bool {
+    state_dir().map(|d| d.join(AUTOSTART_OPT_OUT_FILE).is_file()).unwrap_or(false)
+}
+
+pub fn set_autostart_opt_out(opt_out: bool) {
+    let Ok(dir) = state_dir() else {
+        return;
+    };
+    let marker = dir.join(AUTOSTART_OPT_OUT_FILE);
+    if opt_out {
+        let _ = fs::write(marker, b"1");
+    } else {
+        let _ = fs::remove_file(marker);
+    }
+}
+
+/// Há cena aplicada que o motor relê sozinho (login / reinício).
+pub fn has_active_scene() -> bool {
+    state_dir().map(|d| d.join(ACTIVE_SCENE_FILE).is_file()).unwrap_or(false)
+}
+
+/// Remove o wallpaper nativo: encerra o motor (o Windows volta a pintar o próprio fundo) e apaga
+/// a cena ativa para o login seguinte não reaplicar. Não precisa do handle do processo filho.
+pub fn clear_desktop() -> Result<(), String> {
+    let _ = pipe_request(&json!({ "cmd": "SHUTDOWN" }));
+    let dir = state_dir()?;
+    match fs::remove_file(dir.join(ACTIVE_SCENE_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("native_scene_remove: {e}")),
+    }
+}
+
 impl NativeEngine {
+    /// Fluxo "Aplicar no Desktop": converte o projeto, exporta o `.prism` otimizado, grava a cena
+    /// ativa em disco (o motor a relê sozinho se reiniciar), sobe o motor se preciso e manda
+    /// `LOAD_SCENE_FILE` para recarregar na hora. Depois disso o Studio pode ser fechado.
+    pub fn apply_project(&self, project: &Value) -> Result<(), String> {
+        // 1) Converte antes de qualquer efeito colateral (todo tipo de camada é suportado).
+        let mut scene = crate::native_scene::project_to_scene(project)?;
+        // 1b) Mídia/fontes/modelos → caminhos absolutos reais, espelhados em `native/assets/`
+        //     (a cena ativa não depende de onde o Estúdio guardou os arquivos).
+        let state = state_dir()?;
+        let data_root = state.parent().map(Path::to_path_buf).unwrap_or_else(|| state.clone());
+        for warning in crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets")) {
+            eprintln!("[native_engine] {warning}");
+        }
+        // 2) `.prism` otimizado em `packages/` (mídias empacotadas, reimportável pelo Studio).
+        crate::export_prism_archive_sync(project.clone(), None)?;
+        // 3) Cena ativa: escrita atômica (tmp + rename) para o motor nunca ler pela metade.
+        let dir = state_dir()?;
+        let final_path = dir.join(ACTIVE_SCENE_FILE);
+        let tmp_path = dir.join(format!("{ACTIVE_SCENE_FILE}.tmp"));
+        let json = serde_json::to_vec(&scene).map_err(|e| e.to_string())?;
+        fs::write(&tmp_path, json).map_err(|e| format!("native_scene_write: {e}"))?;
+        fs::rename(&tmp_path, &final_path).map_err(|e| format!("native_scene_rename: {e}"))?;
+        // 4) Motor no ar (reaproveita o que já responde no pipe) + recarga instantânea.
+        self.start()?;
+        pipe_request(&json!({
+            "cmd": "LOAD_SCENE_FILE",
+            "path": final_path.to_string_lossy(),
+        }))?;
+        Ok(())
+    }
+
+    /// Grava a preferência no arquivo que o motor lê ao iniciar e, se ele estiver no ar, aplica na
+    /// hora pelo pipe. Motor parado não é erro: a escolha vale no próximo início.
+    fn set_power(&self, preference: &str) -> Result<Value, String> {
+        let preference = preference.trim().to_ascii_uppercase();
+        if !POWER_PREFERENCES.contains(&preference.as_str()) {
+            return Err(format!("invalid_power_preference: {preference}"));
+        }
+        let path = state_dir()?.join(POWER_PREFERENCE_FILE);
+        fs::write(&path, preference.as_bytes()).map_err(|e| format!("power_preference_write: {e}"))?;
+        if pipe_request(&json!({ "cmd": "PING" })).is_ok() {
+            pipe_request(&json!({ "cmd": "SET_POWER_PREFERENCE", "preference": preference }))?;
+        }
+        Ok(self.status())
+    }
+
+    /// Garante o motor no ar com a cena ativa (abertura do Studio após o motor ter caído).
+    pub fn ensure_running(&self) -> Result<(), String> {
+        if !has_active_scene() {
+            return Ok(());
+        }
+        self.start().map(|_| ())
+    }
+
     fn lock_child(&self) -> Result<std::sync::MutexGuard<'_, Option<Child>>, String> {
         self.child.lock().map_err(|_| "native_engine_state_poisoned".to_string())
     }
@@ -122,7 +233,7 @@ impl NativeEngine {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .creation_flags(CREATE_NO_WINDOW)
+                .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
                 .spawn()
                 .map_err(|e| format!("engine_spawn_failed: {e}"))?;
             *child_slot = Some(child);
@@ -219,4 +330,26 @@ pub async fn native_engine_clear(
 #[tauri::command]
 pub async fn native_engine_status(engine: State<'_, SharedEngine>) -> Result<Value, String> {
     blocking(&engine, |e| Ok(e.status())).await
+}
+
+/// "Aplicar no Desktop" pelo motor nativo (o `apply_desktop_wallpaper` já faz isso por padrão).
+#[tauri::command]
+pub async fn native_engine_apply(
+    engine: State<'_, SharedEngine>,
+    project: Value,
+) -> Result<Value, String> {
+    blocking(&engine, move |e| {
+        e.apply_project(&project)?;
+        Ok(e.status())
+    })
+    .await
+}
+
+/// Preferência de energia do motor: `AUTO|NORMAL|ECO|ULTRA|FROZEN` (persistida pelo motor).
+#[tauri::command]
+pub async fn native_engine_set_power(
+    engine: State<'_, SharedEngine>,
+    preference: String,
+) -> Result<Value, String> {
+    blocking(&engine, move |e| e.set_power(&preference)).await
 }

@@ -14,7 +14,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-use super::animation::{sample_clip, ClipPlayer, Pose};
+use super::animation::{sample_clip, AdditiveLayer, ClipPlayer, Pose};
 use super::config::Scene3dPlayback;
 use super::gpu_model::{GpuModel, GpuPrimitive, DEFORM_STRIDE};
 use crate::engine_core::assets::Aabb;
@@ -135,6 +135,15 @@ struct DeformState {
     jobs: Vec<DeformJob>,
 }
 
+/// Clipe tocado por um binding `PLAY_CLIP` por cima do clipe base.
+#[derive(Clone, Copy, Debug)]
+struct ClipOverride {
+    /// `true` = segura em loop enquanto o sinal está ativo (hover); `false` = toca 1× (clique).
+    hold: bool,
+    /// Binding dono (só ele devolve ao clipe base ao soltar).
+    owner: Option<u32>,
+}
+
 pub struct ModelInstance {
     pub model: Arc<GpuModel>,
     pose: Pose,
@@ -146,6 +155,16 @@ pub struct ModelInstance {
     /// AABB conservadora (espaço do modelo) para primitivas com skin.
     pub skinned_bounds: Aabb,
     player: ClipPlayer,
+    /// Clipe/loop do `playback` do objeto (volta a ele quando um override de binding termina).
+    base_clip: Option<usize>,
+    base_looping: bool,
+    clip_override: Option<ClipOverride>,
+    /// Offsets dos bindings reativos (Fase 4), refeitos a cada quadro sobre a pose animada.
+    additive: AdditiveLayer,
+    /// Só os bindings mudaram: desfaz (restaura a pose animada) e reaplica, sem reamostrar.
+    binding_dirty: bool,
+    /// A camada tinha offsets de nó/morph no quadro anterior.
+    pose_layer_active: bool,
     skin_bindings: Vec<SkinBinding>,
     joint_staging: Vec<[f32; 16]>,
     deform: Option<DeformState>,
@@ -259,7 +278,14 @@ impl ModelInstance {
             }
         };
 
+        let additive = AdditiveLayer::new(node_count, pose.weight_count(), model.materials.len());
         let mut this = Self {
+            base_clip: None,
+            base_looping: true,
+            clip_override: None,
+            additive,
+            binding_dirty: false,
+            pose_layer_active: false,
             world: vec![Mat4::IDENTITY; node_count],
             joint_staging: vec![[0.0; 16]; joint_total as usize],
             normalize,
@@ -369,21 +395,127 @@ impl ModelInstance {
         }
     }
 
-    /// Aplica `playback` (troca de clipe reinicia o tempo).
+    /// Aplica `playback` (troca de clipe reinicia o tempo). Com um override de binding ativo, só
+    /// atualiza o clipe base (aplicado quando o override termina).
     pub fn set_playback(&mut self, playback: &Scene3dPlayback) {
         let clip = ClipPlayer::select(&self.model.rig.animations, &playback.clip_name);
+        let speed = if playback.speed.is_finite() { playback.speed } else { 1.0 };
+        self.player.speed = speed;
+        self.base_clip = clip;
+        self.base_looping = playback.looping;
+        if self.clip_override.is_some() {
+            return;
+        }
         if clip != self.player.clip {
             self.player.clip = clip;
             self.player.time = 0.0;
             self.player.finished = false;
             self.pose_dirty = true;
         }
-        let speed = if playback.speed.is_finite() { playback.speed } else { 1.0 };
         if self.player.looping != playback.looping {
             self.player.finished = false;
         }
-        self.player.speed = speed;
         self.player.looping = playback.looping;
+    }
+
+    /// Índice do clipe por nome exato (bindings `PLAY_CLIP`).
+    pub fn clip_index(&self, name: &str) -> Option<usize> {
+        self.model
+            .rig
+            .animations
+            .iter()
+            .position(|c| c.name.as_deref() == Some(name))
+    }
+
+    /// Toca `clip` por cima do clipe base (troca seca, sem crossfade). `hold` = loop enquanto o
+    /// binding segurar; senão toca 1× e volta sozinho ao base em `advance`.
+    pub fn play_override(&mut self, clip: usize, hold: bool, owner: Option<u32>) {
+        if self.model.rig.animations.get(clip).is_none() {
+            return;
+        }
+        let same = self.player.clip == Some(clip) && self.clip_override.is_some();
+        self.clip_override = Some(ClipOverride { hold, owner });
+        if same && hold {
+            return; // já segurando este clipe
+        }
+        self.player.clip = Some(clip);
+        self.player.time = 0.0;
+        self.player.finished = false;
+        self.player.looping = hold;
+        self.pose_dirty = true;
+    }
+
+    /// Dono do override atual (`None` = sem override ou override de clique).
+    pub fn override_owner(&self) -> Option<u32> {
+        self.clip_override.and_then(|o| o.owner)
+    }
+
+    /// Encerra o override e volta ao clipe base do `playback`.
+    pub fn return_to_base(&mut self) {
+        if self.clip_override.take().is_none() {
+            return;
+        }
+        self.player.clip = self.base_clip;
+        self.player.time = 0.0;
+        self.player.finished = false;
+        self.player.looping = self.base_looping;
+        self.pose_dirty = true;
+    }
+
+    /// Camada aditiva dos bindings (o solver chama `begin`, acumula e depois `commit_additive`).
+    #[inline]
+    pub fn additive_mut(&mut self) -> &mut AdditiveLayer {
+        &mut self.additive
+    }
+
+    #[inline]
+    pub fn additive(&self) -> &AdditiveLayer {
+        &self.additive
+    }
+
+    /// Fecha o quadro dos bindings. `true` se algo visível mudou (pose, raiz ou brilho).
+    pub fn commit_additive(&mut self) -> bool {
+        let changed = self.additive.finish();
+        // Brilho/raiz não tocam a pose: só refaz pose/skin se nós/morphs estão (ou estavam) ativos.
+        let touches = self.additive.touches_pose();
+        if changed && (touches || self.pose_layer_active) {
+            self.binding_dirty = true;
+        }
+        self.pose_layer_active = touches;
+        changed
+    }
+
+    /// Fator para converter unidades de exibição (modelo normalizado para 2,4) em unidades
+    /// locais do nó (escala do pai × normalização), como `addAxisOffset` do Estúdio.
+    pub fn display_to_node_units(&self, node: u32) -> f32 {
+        let norm = self.normalize.x_axis.truncate().length();
+        let parent = self
+            .pose
+            .parent_of(node as usize)
+            .and_then(|p| self.world.get(p as usize))
+            .map_or(1.0, |m| m.x_axis.truncate().length());
+        let s = norm * parent;
+        if s.is_finite() && s > 1e-6 {
+            1.0 / s
+        } else {
+            1.0
+        }
+    }
+
+    #[inline]
+    pub fn parent_of(&self, node: u32) -> Option<u32> {
+        self.pose.parent_of(node as usize)
+    }
+
+    /// Matriz do modelo inteiro com o extra `__ROOT__` dos bindings (aplicada antes de `normalize`).
+    #[inline]
+    pub fn root_matrix(&self) -> Mat4 {
+        self.additive.root_matrix()
+    }
+
+    #[inline]
+    pub fn glow(&self, material: u32) -> f32 {
+        self.additive.glow(material)
     }
 
     /// Precisa de quadros contínuos (clipe tocando).
@@ -401,18 +533,33 @@ impl ModelInstance {
         if self.player.advance(dt, duration) {
             self.pose_dirty = true;
         }
+        // Override de clique (1×) terminou → volta ao clipe base.
+        if self.player.finished && self.clip_override.is_some_and(|o| !o.hold) {
+            self.return_to_base();
+        }
         self.pose_dirty
     }
 
     /// Recalcula pose → mundo → joints se algo mudou. Sem alocação.
+    ///
+    /// Pipeline drift-free dos bindings (PLANO_NATIVO §1.5 / Fase 4):
+    /// - clipe avançou: repouso → amostra → guarda pose animada → soma bindings;
+    /// - só bindings mudaram: **desfaz** (restaura a pose animada guardada) → soma bindings.
     pub fn refresh_pose(&mut self) {
-        if !self.pose_dirty {
+        if !self.pose_dirty && !self.binding_dirty {
             return;
         }
-        self.pose.reset_to_rest();
-        if let Some(clip) = self.player.clip.and_then(|c| self.model.rig.animations.get(c)) {
-            sample_clip(clip, self.player.time, &mut self.pose);
+        if self.pose_dirty {
+            self.pose.reset_to_rest();
+            if let Some(clip) = self.player.clip.and_then(|c| self.model.rig.animations.get(c)) {
+                sample_clip(clip, self.player.time, &mut self.pose);
+            }
+            self.pose.store_animated();
+        } else {
+            self.pose.restore_animated();
         }
+        self.additive.apply(&mut self.pose);
+        self.binding_dirty = false;
         self.pose.world_matrices(&mut self.world);
 
         for binding in &self.skin_bindings {

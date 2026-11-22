@@ -5,7 +5,6 @@ import {
   invokeCmd,
   isTauriRuntime,
   LiveTelemetry,
-  MonitorInfoDto,
   normalizeProjectScene3D,
   PrismProject,
   ReactiveSignal,
@@ -15,20 +14,18 @@ interface WindowBootstrapDto {
   project: PrismProject | null;
   visible: boolean;
   telemetry: LiveTelemetry;
-  monitor?: MonitorInfoDto | null;
 }
 
 export interface DesktopWindowBridgeOptions {
-  sceneEvent: "prism://wallpaper-scene" | "prism://widget-scene";
-  readyCommand: "wallpaper_window_ready" | "widget_window_ready";
+  sceneEvent: "prism://widget-scene";
+  readyCommand: "widget_window_ready";
   readyArgs?: Record<string, unknown>;
   acceptScene?: (project: PrismProject) => boolean;
-  listenMonitorChange?: boolean;
   onProjectUpdate?: (project: PrismProject) => void;
 }
 
 /**
- * Shared runtime bridge for DesktopWallpaperHost and StandaloneWidgetHost:
+ * Shared runtime bridge for StandaloneWidgetHost (wallpapers são do motor nativo):
  * registers listeners BEFORE firing the ready handshake, guards against stale
  * bootstrap overwrites, freezes telemetry while occluded, and coalesces cursor
  * events to display refresh rate via rAF (zero React re-renders on mouse movement).
@@ -48,7 +45,6 @@ export function useDesktopWindowBridge(options: DesktopWindowBridgeOptions) {
   optionsRef.current = options;
 
   const [project, setProject] = useState<PrismProject | null>(null);
-  const [monitor, setMonitor] = useState<MonitorInfoDto | null>(null);
   const [telemetry, setTelemetry] = useState<LiveTelemetry>(DEFAULT_TELEMETRY);
   const [visible, setVisible] = useState(true);
 
@@ -82,7 +78,6 @@ export function useDesktopWindowBridge(options: DesktopWindowBridgeOptions) {
     let receivedScene = false;
     let receivedVis = false;
     let receivedTelemetry = false;
-    let receivedMonitor = false;
 
     void import("@tauri-apps/api/event")
       .then(async ({ listen }) => {
@@ -153,17 +148,6 @@ export function useDesktopWindowBridge(options: DesktopWindowBridgeOptions) {
           }),
         ];
 
-        if (cfg.listenMonitorChange) {
-          listeners.push(
-            listen<MonitorInfoDto>("prism://monitor-changed", (ev) => {
-              if (!disposed) {
-                receivedMonitor = true;
-                setMonitor(ev.payload);
-              }
-            })
-          );
-        }
-
         const resolved = await Promise.all(listeners);
         if (disposed) {
           resolved.forEach((fn) => fn());
@@ -180,9 +164,6 @@ export function useDesktopWindowBridge(options: DesktopWindowBridgeOptions) {
           }
           if (!receivedTelemetry) {
             setTelemetry(boot.telemetry);
-          }
-          if (!receivedMonitor && boot.monitor) {
-            setMonitor(boot.monitor);
           }
           if (
             !receivedScene &&
@@ -210,12 +191,11 @@ export function useDesktopWindowBridge(options: DesktopWindowBridgeOptions) {
       pendingCursorRef.current = null;
       unsubs.forEach((fn) => fn());
     };
-  }, [options.sceneEvent, options.readyCommand, argsKey, options.listenMonitorChange]);
+  }, [options.sceneEvent, options.readyCommand, argsKey]);
 
   return {
     hostRef,
     project,
-    monitor,
     telemetry,
     visible,
     cursorNormRef,

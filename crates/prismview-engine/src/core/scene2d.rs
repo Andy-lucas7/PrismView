@@ -16,8 +16,14 @@
 //! passe de vidro sobre o fundo (imagem ou frame de vídeo registrado com
 //! `set_video_backdrop`). Sem fundo de mídia (cor sólida), caem no preenchimento com a cor de tint.
 //!
-//! Ainda não renderizados: `Svg`/`Icon` (tesselação), `DepthSubject`, carrossel de fundo,
-//! parallax por mouse (Fase 4), blend modes que leem o backdrop e contorno/blur de sombra em texto.
+//! Vídeo: fundo `BackgroundSource::Video` e camadas `Video` recebem frames zero-copy do decoder
+//! (`set_video_frame`, um `TextureId` por slot do anel, sem bind group por quadro). `Svg`/`Icon`:
+//! `svg_markup` rasterizado por resvg no tamanho da caixa (cache por markup+tamanho). Backdrop do
+//! vidro = última mídia full-bleed desenhada abaixo dele (imagem/vídeo de fundo, vídeo ou cena 3D
+//! full-bleed). Parallax por mouse = bindings `CURSOR_X/Y` (gerados pelo conversor do Estúdio).
+//!
+//! Ainda não renderizados: `DepthSubject`, carrossel de fundo, blend modes que leem o backdrop e
+//! contorno/blur de sombra em texto.
 //!
 //! Regras: sem `unwrap/expect`; nenhum código de SO. Alocações só ao reconstruir a lista.
 
@@ -29,19 +35,24 @@ use chrono::{DateTime, Local, Timelike};
 use prism_core::fx::{EvalContext, FxEngine};
 use prism_core::schema::{
     Anchor, BackgroundSource, BlendMode, DirtyFlags, FillMode, GradientKind as SchemaGradient,
-    LayerKind, LayerNode, PrismScene, ShapeKind, StackDir, StaticOrFx, TextAlign,
+    LayerKind, LayerNode, PrismScene, ShapeKind, StackDir, StaticOrFx, TextAlign, TouchAction,
     VisibilityCondition,
 };
 
+use super::bindings::LayerBindingSolver;
 use super::compositor::{
-    BlendKind, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind, TextureId,
+    BlendKind, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind, Scene3dPlacement,
+    TextureId,
 };
+use super::interaction::{DesktopAction, HitRegion};
+use super::signals::{SignalKind, SignalSnapshot};
 use super::glass::{
     hash_combine, hash_str, GlassBackdrop, GlassDraw, GlassMode, GlassParams, GlassRenderer,
     GlyphSource,
 };
 use super::gpu::{FrameStatus, GpuContext, WindowSurface};
 use super::text::{TextAlignment, TextLayout, TextSpec, TextSystem};
+use crate::platform::GpuVideoFrame;
 
 // ───────────────────────── Geometria ─────────────────────────
 
@@ -250,21 +261,124 @@ struct TextBinding {
 
 // ───────────────────────── SceneRenderer ─────────────────────────
 
-/// Frame de vídeo usado como fundo (e backdrop do vidro). A view pertence ao chamador (decoder).
-#[derive(Clone, Copy)]
-struct VideoState {
-    id: TextureId,
+/// Frames de um vídeo (fundo ou camada). Um `TextureId` por slot do anel do decoder, criado 1×
+/// (a view fica no compositor: serve também de backdrop do vidro). Trocar o frame exibido só troca
+/// o id usado na lista — nenhum bind group novo por quadro.
+struct VideoBinding {
+    slots: Vec<(usize, TextureId)>,
+    generation: u64,
+    current: Option<TextureId>,
     size: (u32, u32),
     content_hash: u64,
-    frame_token: u64,
+}
+
+/// Identidade do backdrop "saída 3D" no cache de blur do vidro.
+const SCENE3D_BACKDROP_HASH: u64 = 0x5CE3_D0B4_CD70_0001;
+
+// ───────────────────────── SVG (resvg) ─────────────────────────
+
+/// Máximo de rasters de SVG mantidos (markup × tamanho); acima disso o cache é esvaziado.
+const SVG_CACHE_MAX: usize = 96;
+/// Lado máximo do raster de um SVG (px físicos).
+const SVG_MAX_PX: u32 = 2048;
+
+#[derive(Default)]
+struct SvgCache {
+    loaded: HashMap<(u64, u32, u32), ImageEntry>,
+    failed: HashSet<u64>,
+}
+
+impl SvgCache {
+    fn get(
+        &mut self,
+        markup: &str,
+        w: u32,
+        h: u32,
+        compositor: &mut Compositor2D,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<ImageEntry> {
+        let hash = hash_str(markup);
+        if self.failed.contains(&hash) {
+            return None;
+        }
+        if let Some(entry) = self.loaded.get(&(hash, w, h)) {
+            return Some(*entry);
+        }
+        if self.loaded.len() >= SVG_CACHE_MAX {
+            self.release_all(compositor);
+        }
+        let Some(rgba) = rasterize_svg(markup, w, h) else {
+            self.failed.insert(hash);
+            return None;
+        };
+        let id = compositor.create_texture_rgba(device, queue, w, h, &rgba)?;
+        let entry = ImageEntry { id, w, h };
+        self.loaded.insert((hash, w, h), entry);
+        Some(entry)
+    }
+
+    fn release_all(&mut self, compositor: &mut Compositor2D) {
+        for (_, entry) in self.loaded.drain() {
+            compositor.release_texture(entry.id);
+        }
+        self.failed.clear();
+    }
+}
+
+/// Rasteriza um documento SVG em `w×h` (contain, centralizado). Saída RGBA8 pré-multiplicada.
+fn rasterize_svg(markup: &str, w: u32, h: u32) -> Option<Vec<u8>> {
+    use resvg::{tiny_skia, usvg};
+    let tree = usvg::Tree::from_str(markup, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let (sw, sh) = (size.width().max(1e-3), size.height().max(1e-3));
+    let mut pixmap = tiny_skia::Pixmap::new(w.max(1), h.max(1))?;
+    let k = (w as f32 / sw).min(h as f32 / sh);
+    let tx = (w as f32 - sw * k) * 0.5;
+    let ty = (h as f32 - sh * k) * 0.5;
+    resvg::render(&tree, tiny_skia::Transform::from_row(k, 0.0, 0.0, k, tx, ty), &mut pixmap.as_mut());
+    Some(pixmap.take())
+}
+
+/// Tamanho de raster em degraus de 4 px (evita refazer o raster por variações sub-pixel).
+fn svg_bucket(px: f32) -> u32 {
+    let v = if px.is_finite() { px.ceil().max(4.0) as u32 } else { 4 };
+    (v.div_ceil(4) * 4).min(SVG_MAX_PX)
+}
+
+/// Resolve um asset da cena: `custom_assets` → absoluto, ou relativo a `asset_root`.
+fn resolve_asset_path(scene: &PrismScene, asset_root: Option<&Path>, raw: &str) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mapped = scene.custom_assets.get(raw).map_or(raw, String::as_str);
+    let path = Path::new(mapped);
+    match asset_root {
+        Some(root) if !path.is_absolute() => Some(root.join(path)),
+        _ => Some(path.to_path_buf()),
+    }
+}
+
+/// Saída do `Scene3dRenderer` registrada no compositor (view pertence ao renderer 3D).
+#[derive(Clone, Copy)]
+struct Scene3dOutput {
+    id: TextureId,
+    size: (u32, u32),
 }
 
 /// Recursos compartilhados por todas as saídas (monitores) de um `GpuContext`.
 pub struct SceneRenderer {
     compositor: Compositor2D,
     glass: GlassRenderer,
-    video: Option<VideoState>,
-    video_view: Option<wgpu::TextureView>,
+    /// Vídeos da cena (fundo e camadas) por caminho resolvido.
+    videos: HashMap<String, VideoBinding>,
+    /// Muda a cada frame novo de fonte viva (vídeo, cena 3D): chave do blur do vidro.
+    live_token: u64,
+    svgs: SvgCache,
+    /// `TouchAction`s não-mídia da cena (índice = `DesktopAction::Custom`) e id da camada → índice.
+    touch_table: Vec<TouchAction>,
+    touch_index: HashMap<String, u32>,
     text: TextSystem,
     images: ImageCache,
     text_bindings: HashMap<String, TextBinding>,
@@ -275,6 +389,10 @@ pub struct SceneRenderer {
     clock_sec: i64,
     clock_min: i64,
     asset_root: Option<PathBuf>,
+    /// Bindings reativos 2D/vidro (Fase 4): deltas somados à base FX em cada rebuild.
+    layer_bindings: LayerBindingSolver,
+    /// Textura final da cena 3D (camada `Scene3d`), se o chamador já renderizou uma.
+    scene3d_out: Option<Scene3dOutput>,
 }
 
 impl SceneRenderer {
@@ -283,8 +401,11 @@ impl SceneRenderer {
         Self {
             compositor: Compositor2D::new(gpu.device(), gpu.queue(), format),
             glass: GlassRenderer::new(gpu.device(), format),
-            video: None,
-            video_view: None,
+            videos: HashMap::new(),
+            live_token: 0,
+            svgs: SvgCache::default(),
+            touch_table: Vec::new(),
+            touch_index: HashMap::new(),
             text: TextSystem::new(gpu.device(), gpu.queue()),
             images: ImageCache::default(),
             text_bindings: HashMap::new(),
@@ -295,7 +416,100 @@ impl SceneRenderer {
             clock_sec: i64::MIN,
             clock_min: i64::MIN,
             asset_root: None,
+            layer_bindings: LayerBindingSolver::new(),
+            scene3d_out: None,
         }
+    }
+
+    /// `Scene3DConfig` (JSON camelCase) da primeira camada 3D da cena, se houver.
+    pub fn scene3d_config(&self) -> Option<&serde_json::Value> {
+        fn find(layers: &[LayerNode]) -> Option<&serde_json::Value> {
+            layers.iter().find_map(|l| {
+                if l.kind == LayerKind::Scene3d && !l.hidden {
+                    if let Some(cfg) = l.scene3d.as_ref() {
+                        return Some(cfg);
+                    }
+                }
+                find(&l.children)
+            })
+        }
+        self.scene.as_ref().and_then(|s| find(&s.layers))
+    }
+
+    /// Registra a view de saída do `Scene3dRenderer`. Chamar só quando a view foi recriada
+    /// (resize/hibernação): reaproveita o `TextureId` e refaz a lista se o tamanho mudou.
+    /// A view fica no compositor: também serve de backdrop do vidro quando o 3D é full-bleed.
+    pub fn set_scene3d_output(&mut self, gpu: &GpuContext, view: wgpu::TextureView, size: (u32, u32)) {
+        let existing = self.scene3d_out.map(|o| o.id);
+        let id = self.compositor.bind_owned_view(gpu.device(), existing, view);
+        let changed = self.scene3d_out.map_or(true, |o| o.id != id || o.size != size);
+        self.scene3d_out = Some(Scene3dOutput { id, size });
+        if changed {
+            self.version += 1;
+        }
+    }
+
+    /// Novo quadro 3D na mesma textura: o blur do vidro que a usa como backdrop é refeito.
+    pub fn scene3d_frame_rendered(&mut self) {
+        self.live_token = self.live_token.wrapping_add(1);
+    }
+
+    /// Esquece a saída 3D (renderer 3D descartado ou hibernado).
+    pub fn clear_scene3d_output(&mut self) {
+        if let Some(out) = self.scene3d_out.take() {
+            self.compositor.release_texture(out.id);
+            self.version += 1;
+        }
+    }
+
+    /// Caixa da camada 3D na última construção de `canvas`.
+    pub fn scene3d_placement(canvas: &Canvas) -> Option<Scene3dPlacement> {
+        canvas.scene3d
+    }
+
+    /// Avança os bindings 2D/vidro com o snapshot do quadro. `true` se a lista precisa ser refeita
+    /// (algum delta mudou). Cena sem bindings = custo zero.
+    pub fn apply_signals(&mut self, snap: &SignalSnapshot, dt: f32) -> bool {
+        if self.scene.is_none() || !self.layer_bindings.solve(snap, dt) {
+            return false;
+        }
+        self.version += 1;
+        true
+    }
+
+    /// Sinais que os bindings 2D consomem (+ `DESKTOP_TAP` se há controles de mídia tocáveis).
+    pub fn signal_demand(&self) -> SignalKind {
+        let mut demand = self.layer_bindings.demand();
+        if self.has_touch_actions() {
+            demand |= SignalKind::DESKTOP_TAP;
+        }
+        // Fórmulas `$mi()$`/`$sys()$`/`$bi()$`: produtores de mídia/telemetria precisam rodar.
+        if self.deps.intersects(DirtyFlags::MEDIA) {
+            demand |= SignalKind::MEDIA;
+        }
+        if self.deps.intersects(DirtyFlags::SYSTEM_METRICS) {
+            demand |= SignalKind::TELEMETRY | SignalKind::POWER;
+        }
+        demand
+    }
+
+    /// Molas 2D ainda em movimento (o loop deve continuar desenhando).
+    pub fn bindings_animating(&self) -> bool {
+        self.layer_bindings.is_animating()
+    }
+
+    fn has_touch_actions(&self) -> bool {
+        fn any(layers: &[LayerNode]) -> bool {
+            layers
+                .iter()
+                .any(|l| l.touch.is_active() || any(&l.children))
+        }
+        self.scene.as_ref().is_some_and(|s| any(&s.layers))
+    }
+
+    /// Ação tocável em `p` (px físicos locais da saída), pela lista do último rebuild de `canvas`.
+    pub fn hit_test(canvas: &Canvas, p: [f32; 2]) -> Option<DesktopAction> {
+        canvas.hits.hit_test(p)
     }
 
     pub fn create_canvas(&self, gpu: &GpuContext) -> Canvas {
@@ -304,54 +518,111 @@ impl SceneRenderer {
         canvas
     }
 
-    /// Registra o frame de vídeo atual como fundo (substitui imagem de fundo) e backdrop do
-    /// vidro. Chamar quando o **slot/view** do frame muda (cria 1 bind group); para frames novos na
-    /// mesma view use `advance_video_frame`. `content_hash` identifica o vídeo.
-    pub fn set_video_backdrop(
-        &mut self,
-        gpu: &GpuContext,
-        view: wgpu::TextureView,
-        size: (u32, u32),
-        content_hash: u64,
-        frame_token: u64,
-    ) {
-        let existing = self.video.map(|v| v.id);
-        let id = self.compositor.bind_view(gpu.device(), existing, &view);
-        let layout_changed = self
-            .video
-            .map_or(true, |v| v.size != size || v.id != id || v.content_hash != content_hash);
-        self.video_view = Some(view);
-        self.video = Some(VideoState {
-            id,
-            size,
-            content_hash,
-            frame_token,
-        });
-        if layout_changed {
-            self.version += 1; // refaz a lista (UV de cover / backdrop do vidro)
-        }
-    }
-
-    /// Novo frame de vídeo na mesma view. `true` se é preciso redesenhar.
-    pub fn advance_video_frame(&mut self, frame_token: u64) -> bool {
-        match self.video.as_mut() {
-            Some(v) if v.frame_token != frame_token => {
-                v.frame_token = frame_token;
-                true
+    /// Vídeos que a cena usa: `(caminho resolvido, é_fundo)`. Raro (troca de cena).
+    pub fn video_sources(&self) -> Vec<(PathBuf, bool)> {
+        fn walk(layers: &[LayerNode], scene: &PrismScene, root: Option<&Path>, out: &mut Vec<(PathBuf, bool)>) {
+            for l in layers {
+                if l.kind == LayerKind::Video && !l.hidden {
+                    let raw = match &l.asset {
+                        StaticOrFx::Static(v) => v.as_str(),
+                        StaticOrFx::Fx { fallback, .. } => fallback.as_str(),
+                    };
+                    if let Some(p) = resolve_asset_path(scene, root, raw) {
+                        if !out.iter().any(|(q, _)| *q == p) {
+                            out.push((p, false));
+                        }
+                    }
+                }
+                walk(&l.children, scene, root, out);
             }
-            _ => false,
         }
+        let mut out = Vec::new();
+        let Some(scene) = self.scene.as_ref() else {
+            return out;
+        };
+        let root = self.asset_root.as_deref();
+        if let BackgroundSource::Video { path, .. } = &scene.background {
+            if let Some(p) = resolve_asset_path(scene, root, path) {
+                out.push((p, true));
+            }
+        }
+        walk(&scene.layers, scene, root, &mut out);
+        out
     }
 
-    pub fn clear_video_backdrop(&mut self) {
-        if let Some(v) = self.video.take() {
-            self.compositor.release_texture(v.id);
-            self.glass.invalidate_backdrop(v.content_hash);
+    /// Frame atual do decoder de `path`. Cria o `TextureId` do slot na 1ª vez que ele aparece
+    /// (5 por vídeo no anel do MF); depois só alterna o id exibido. `true` = redesenhar.
+    pub fn set_video_frame(&mut self, gpu: &GpuContext, path: &Path, frame: &GpuVideoFrame<'_>) -> bool {
+        let key = path.to_string_lossy();
+        if !self.videos.contains_key(&*key) {
+            self.videos.insert(
+                key.to_string(),
+                VideoBinding {
+                    slots: Vec::with_capacity(5),
+                    generation: frame.generation,
+                    current: None,
+                    size: (frame.width, frame.height),
+                    content_hash: hash_str(&key),
+                },
+            );
+        }
+        let Some(entry) = self.videos.get_mut(&*key) else {
+            return false;
+        };
+        if entry.generation != frame.generation {
+            for (_, id) in entry.slots.drain(..) {
+                self.compositor.release_texture(id);
+            }
+            entry.current = None;
+            entry.generation = frame.generation;
+        }
+        let id = match entry.slots.iter().find(|(slot, _)| *slot == frame.slot) {
+            Some(&(_, id)) => id,
+            None => {
+                let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let id = self.compositor.bind_owned_view(gpu.device(), None, view);
+                entry.slots.push((frame.slot, id));
+                id
+            }
+        };
+        let size = (frame.width, frame.height);
+        if entry.current != Some(id) || entry.size != size {
+            entry.current = Some(id);
+            entry.size = size;
             self.version += 1;
         }
-        self.video_view = None;
+        self.live_token = self.live_token.wrapping_add(1);
+        true
     }
 
+    /// Solta as texturas de todos os vídeos (troca de cena / decoders fechados).
+    pub fn clear_videos(&mut self) {
+        if self.videos.is_empty() {
+            return;
+        }
+        for (_, v) in self.videos.drain() {
+            for (_, id) in v.slots {
+                self.compositor.release_texture(id);
+            }
+            self.glass.invalidate_backdrop(v.content_hash);
+        }
+        self.version += 1;
+    }
+
+    /// Ação de toque não-mídia (`DesktopAction::Custom`).
+    pub fn touch_action(&self, index: u32) -> Option<&TouchAction> {
+        self.touch_table.get(index as usize)
+    }
+
+    /// Recalcula as dependências FX (ex.: mídia começou a tocar → `$mi(pos)$` passa a depender
+    /// do segundo). Raro: avalia todas as propriedades uma vez.
+    pub fn refresh_deps(&mut self, ctx: &EvalContext) {
+        if let Some(scene) = self.scene.as_ref() {
+            self.deps = FxEngine::collect_scene_dependencies(scene, ctx);
+        }
+    }
+
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn glass_stats(&self) -> super::glass::GlassStats {
         self.glass.stats()
     }
@@ -359,6 +630,12 @@ impl SceneRenderer {
     /// Hibernação de VRAM (Fase 5): solta pirâmide de blur e mapas de glifo do vidro.
     pub fn release_glass_gpu(&mut self) {
         self.glass.release();
+    }
+
+    /// PowerGovernor: liga/desliga pós-processamento (blur do vidro). `true` se o quadro precisa
+    /// ser refeito.
+    pub fn set_post_processing(&mut self, enabled: bool) -> bool {
+        self.glass.set_blur_enabled(enabled)
     }
 
     /// Pasta base para resolver caminhos relativos de assets (ex.: pacote `.prism` extraído).
@@ -391,6 +668,7 @@ impl SceneRenderer {
 
     fn reset_resources(&mut self) {
         self.images.release_all(&mut self.compositor);
+        self.svgs.release_all(&mut self.compositor);
         for (_, binding) in self.text_bindings.drain() {
             self.compositor.release_texture(binding.id);
         }
@@ -400,15 +678,51 @@ impl SceneRenderer {
     pub fn set_scene(&mut self, scene: PrismScene, ctx: &EvalContext) {
         self.reset_resources();
         self.deps = FxEngine::collect_scene_dependencies(&scene, ctx);
+        self.layer_bindings.set_specs(&scene.bindings);
+        self.index_scene(&scene);
         self.scene = Some(scene);
         self.clock_sec = ctx.now.timestamp();
         self.clock_min = self.clock_sec.div_euclid(60);
         self.version += 1;
     }
 
+    /// Tabela de toques não-mídia + fontes de arquivo do projeto (alias `font_id` → família).
+    fn index_scene(&mut self, scene: &PrismScene) {
+        fn walk(
+            layers: &[LayerNode],
+            table: &mut Vec<TouchAction>,
+            index: &mut HashMap<String, u32>,
+            fonts: &mut Vec<(String, PathBuf)>,
+        ) {
+            for l in layers {
+                if l.touch.is_active() && DesktopAction::from_touch(l.touch.action_type).is_none() {
+                    index.insert(l.id.clone(), u32::try_from(table.len()).unwrap_or(u32::MAX));
+                    table.push(l.touch.clone());
+                }
+                if l.kind == LayerKind::Text && !l.text.font_path.trim().is_empty() {
+                    fonts.push((l.text.font_id.clone(), PathBuf::from(l.text.font_path.trim())));
+                }
+                walk(&l.children, table, index, fonts);
+            }
+        }
+        self.touch_table.clear();
+        self.touch_index.clear();
+        let mut fonts = Vec::new();
+        walk(&scene.layers, &mut self.touch_table, &mut self.touch_index, &mut fonts);
+        for (font_id, path) in fonts {
+            if path.is_file() && !self.text.register_font_alias(&font_id, &path) {
+                eprintln!("[prismview-engine] fonte ilegível: {}", path.display());
+            }
+        }
+    }
+
     pub fn clear_scene(&mut self) {
         self.reset_resources();
+        self.clear_videos();
+        self.touch_table.clear();
+        self.touch_index.clear();
         self.scene = None;
+        self.layer_bindings.clear();
         self.deps = DirtyFlags::NONE;
         self.version += 1;
     }
@@ -501,9 +815,7 @@ impl SceneRenderer {
         let compositor = &self.compositor;
         let text = &self.text;
         let glass = &mut self.glass;
-        let video_id = self.video.map(|v| v.id);
-        let video_view = self.video_view.as_ref();
-        let frame_token = self.video.map_or(0, |v| v.frame_token);
+        let frame_token = self.live_token;
 
         surface.render_with(gpu, |encoder, view| {
             // 1) Blur em cache + mapas de glifo que faltam (fora de qualquer passe de render).
@@ -517,11 +829,7 @@ impl SceneRenderer {
                         frame_token,
                         |id| {
                             let version = compositor.texture_version(id);
-                            if Some(id) == video_id {
-                                video_view.map(|v| (v, version))
-                            } else {
-                                compositor.texture_view(id).map(|v| (v, version))
-                            }
+                            compositor.texture_view(id).map(|v| (v, version))
                         },
                         |key| text.texture_view(key),
                     );
@@ -553,11 +861,13 @@ impl SceneRenderer {
         }
         self.glass.begin_build();
         let serial = self.text.begin_pass();
-        let video = self.video;
 
         if let Some(scene) = self.scene.as_ref() {
             let mut frame = Frame {
-                video,
+                videos: &self.videos,
+                svgs: &mut self.svgs,
+                touch_index: &self.touch_index,
+                scene3d_out: self.scene3d_out,
                 backdrop: None,
                 scene,
                 ctx,
@@ -571,6 +881,7 @@ impl SceneRenderer {
                 canvas_key,
                 scratch: &mut self.key_scratch,
                 asset_root: self.asset_root.as_deref(),
+                fx: &self.layer_bindings,
                 ui,
                 vw: size.0 as f32,
                 vh: size.1 as f32,
@@ -612,7 +923,10 @@ struct FillStyle {
 }
 
 struct Frame<'a> {
-    video: Option<VideoState>,
+    videos: &'a HashMap<String, VideoBinding>,
+    svgs: &'a mut SvgCache,
+    touch_index: &'a HashMap<String, u32>,
+    scene3d_out: Option<Scene3dOutput>,
     /// Backdrop do vidro (mídia de fundo desenhada em `background`), se houver.
     backdrop: Option<GlassBackdrop>,
     scene: &'a PrismScene,
@@ -627,6 +941,8 @@ struct Frame<'a> {
     canvas_key: &'a str,
     scratch: &'a mut String,
     asset_root: Option<&'a Path>,
+    /// Deltas dos bindings reativos por camada (somados à base; nunca gravados nela).
+    fx: &'a LayerBindingSolver,
     ui: f32,
     vw: f32,
     vh: f32,
@@ -685,16 +1001,7 @@ impl Frame<'_> {
     }
 
     fn resolve_asset(&self, raw: &str) -> Option<PathBuf> {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            return None;
-        }
-        let mapped = self.scene.custom_assets.get(raw).map_or(raw, String::as_str);
-        let path = Path::new(mapped);
-        match self.asset_root {
-            Some(root) if !path.is_absolute() => Some(root.join(path)),
-            _ => Some(path.to_path_buf()),
-        }
+        resolve_asset_path(self.scene, self.asset_root, raw)
     }
 
     // ── Vidro óptico ──
@@ -734,9 +1041,10 @@ impl Frame<'_> {
         let c = &layer.crystal;
         let ui = self.ui;
         let tint = self.color(&c.tint_rgba);
+        let g = self.fx.fx(layer.id.as_str()).map(|f| f.glass).unwrap_or_default();
         let mut p = GlassParams {
-            blur_px: (self.f(&c.blur_px) * ui).max(0.0),
-            frost: self.f(&c.frost_amount).clamp(0.0, 0.94),
+            blur_px: ((self.f(&c.blur_px) + g.blur_px) * ui).max(0.0),
+            frost: (self.f(&c.frost_amount) + g.frost).clamp(0.0, 0.94),
             tint: [tint[0], tint[1], tint[2]],
             noise: c.grain.max(0.0),
             saturation: self.f(&c.saturation).max(0.0),
@@ -747,10 +1055,10 @@ impl Frame<'_> {
             ..GlassParams::default()
         };
         if layer.fill == FillMode::OpticalCrystal {
-            p.refraction_px = self.f(&c.refraction) * ui;
-            p.chroma_px = (self.f(&c.dispersion_rgb) * 400.0).max(0.0);
-            p.specular = self.f(&c.fresnel_intensity).max(0.0);
-            p.border = self.f(&c.prismatic_rim_intensity).max(0.0);
+            p.refraction_px = (self.f(&c.refraction) + g.refraction) * ui;
+            p.chroma_px = ((self.f(&c.dispersion_rgb) + g.dispersion) * 400.0).max(0.0);
+            p.specular = (self.f(&c.fresnel_intensity) + g.specular).max(0.0);
+            p.border = (self.f(&c.prismatic_rim_intensity) + g.rim).max(0.0);
         } else {
             // Mantém o véu: o alpha do tint vira parte da opacidade do véu.
             p.frost = (p.frost + tint[3] * 0.5).clamp(0.0, 0.94);
@@ -799,15 +1107,21 @@ impl Frame<'_> {
         let center = [vw * 0.5, vh * 0.5];
         let half = [vw * 0.5, vh * 0.5];
 
-        // Vídeo (frame registrado por `set_video_backdrop`) tem prioridade sobre a imagem; carrossel
-        // ainda não existe; sem mídia de fundo = cor de clear (e vidro cai no tint).
+        // Vídeo (frames de `set_video_frame`) ou imagem; carrossel ainda não existe; sem mídia de
+        // fundo = cor de clear (e o vidro usa a próxima mídia full-bleed ou cai no tint).
         let scene = self.scene;
-        if let Some(video) = self.video {
-            let inst = QuadInstance::new(center, half, Affine::IDENTITY.m, 1.0)
-                .kind(QuadKind::Texture)
-                .uv(cover_uv(video.size.0, video.size.1, vw, vh));
-            self.canvas.push(0, BlendKind::Normal, video.id, inst);
-            self.backdrop = Some(self.backdrop_for(video.id, video.size, video.content_hash, true));
+        let videos = self.videos;
+        if let BackgroundSource::Video { path, .. } = &scene.background {
+            let binding = self
+                .resolve_asset(path)
+                .and_then(|p| videos.get(&*p.to_string_lossy()));
+            if let Some((id, v)) = binding.and_then(|v| v.current.map(|id| (id, v))) {
+                let inst = QuadInstance::new(center, half, Affine::IDENTITY.m, 1.0)
+                    .kind(QuadKind::Opaque)
+                    .uv(cover_uv(v.size.0, v.size.1, vw, vh));
+                self.canvas.push(0, BlendKind::Normal, id, inst);
+                self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true));
+            }
         } else if let BackgroundSource::Image { path } = &scene.background {
             if let Some(path) = self.resolve_asset(path) {
                 if let Some(img) = self
@@ -935,11 +1249,13 @@ impl Frame<'_> {
         if !self.is_visible(layer) {
             return;
         }
-        let opacity = self.f(&layer.opacity).clamp(0.0, 1.0) * inherited_opacity;
+        // Base (estática/FX) + delta dos bindings: o delta é recalculado por quadro, sem deriva.
+        let fx = self.fx.fx(layer.id.as_str()).unwrap_or_default();
+        let opacity = (self.f(&layer.opacity) + fx.opacity).clamp(0.0, 1.0) * inherited_opacity;
         if opacity <= 0.003 {
             return;
         }
-        let scale = self.f(&layer.scale);
+        let scale = self.f(&layer.scale) * (1.0 + fx.scale);
         if scale.abs() < 1e-3 {
             return;
         }
@@ -956,13 +1272,20 @@ impl Frame<'_> {
                 }
             }
             LayerKind::Stack => self.stack_size(layer),
+            _ if layer.fill_parent => Size {
+                w: parent.w.max(0.0),
+                h: parent.h.max(0.0),
+            },
             _ => Size {
                 w: (self.f(&layer.width_px) * ui).max(0.0),
                 h: (self.f(&layer.height_px) * ui).max(0.0),
             },
         };
 
-        let offset = [self.f(&layer.offset_x_px) * ui, self.f(&layer.offset_y_px) * ui];
+        let offset = [
+            (self.f(&layer.offset_x_px) + fx.offset[0]) * ui,
+            (self.f(&layer.offset_y_px) + fx.offset[1]) * ui,
+        ];
         let center = match forced_center {
             Some(c) => [c[0] + offset[0], c[1] + offset[1]],
             None => {
@@ -972,8 +1295,22 @@ impl Frame<'_> {
                 [ax + (0.5 - fx) * size.w, ay + (0.5 - fy) * size.h]
             }
         };
-        let rot = self.f(&layer.rotation_deg).to_radians();
+        let rot = (self.f(&layer.rotation_deg) + fx.rotation_deg).to_radians();
         let xf = parent_xf.child(center, rot, scale);
+
+        // Controle de mídia tocável: mesma caixa orientada do desenho (mín. 10 px lógicos).
+        let action = DesktopAction::from_touch(layer.touch.action_type).or_else(|| {
+            self.touch_index
+                .get(layer.id.as_str())
+                .map(|&i| DesktopAction::Custom(i))
+        });
+        if let Some(action) = action {
+            let min = 10.0 * ui;
+            let half = [(size.w * 0.5).max(min), (size.h * 0.5).max(min)];
+            if let Some(region) = HitRegion::new(xf.t, xf.m, half, action) {
+                self.canvas.hits.push(region);
+            }
+        }
 
         let z = self.next_z();
         let blend = map_blend(layer.blend);
@@ -981,8 +1318,11 @@ impl Frame<'_> {
             LayerKind::Text => self.draw_text(layer, text_draw, &xf, z, blend, opacity),
             LayerKind::Shape => self.draw_shape(layer, size, &xf, z, blend, opacity),
             LayerKind::Image => self.draw_image(layer, size, &xf, z, blend, opacity),
-            // Svg/Icon (tesselação lyon) e DepthSubject (segmentação) ainda não têm renderer.
-            LayerKind::Stack | LayerKind::Svg | LayerKind::Icon | LayerKind::DepthSubject => {}
+            LayerKind::Scene3d => self.draw_scene3d(size, &xf, z, blend, opacity, layer.fill_parent),
+            LayerKind::Video => self.draw_video(layer, size, &xf, z, blend, opacity),
+            LayerKind::Svg | LayerKind::Icon => self.draw_svg(layer, size, &xf, z, blend, opacity),
+            // DepthSubject (segmentação) ainda não tem renderer.
+            LayerKind::Stack | LayerKind::Group | LayerKind::DepthSubject => {}
         }
 
         if layer.children.is_empty() {
@@ -1292,6 +1632,117 @@ impl Frame<'_> {
                 self.canvas.push(z, blend, TextureId::WHITE, base);
             }
         }
+    }
+
+    /// Camada 3D: registra a caixa (só a primeira da cena; um `Scene3dRenderer` por motor) e
+    /// desenha a textura de saída já renderizada (pré-multiplicada, mesmo aspecto da caixa).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene3d(
+        &mut self,
+        size: Size,
+        xf: &Affine,
+        z: u32,
+        blend: BlendKind,
+        opacity: f32,
+        fill_parent: bool,
+    ) {
+        if size.w <= 0.0 || size.h <= 0.0 || self.canvas.scene3d.is_some() {
+            return;
+        }
+        let half = [size.w * 0.5, size.h * 0.5];
+        self.canvas.scene3d = Some(Scene3dPlacement {
+            center: xf.t,
+            half,
+            basis: xf.m,
+        });
+        let Some(out) = self.scene3d_out else {
+            return; // 1º quadro: o 3D ainda não renderizou; a lista é refeita ao registrar.
+        };
+        let inst = QuadInstance::new(xf.t, half, xf.m, xf.scale())
+            .kind(QuadKind::Texture)
+            .color([1.0, 1.0, 1.0, opacity])
+            .uv(cover_uv(out.size.0, out.size.1, size.w, size.h));
+        self.canvas.push(z, blend, out.id, inst);
+        // 3D full-bleed: vira o backdrop do vidro desenhado por cima (blur refeito por quadro 3D).
+        if fill_parent {
+            self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true));
+        }
+    }
+
+    /// Camada de vídeo: frame atual do decoder (zero-copy), cover na caixa, cantos arredondados.
+    fn draw_video(
+        &mut self,
+        layer: &LayerNode,
+        size: Size,
+        xf: &Affine,
+        z: u32,
+        blend: BlendKind,
+        opacity: f32,
+    ) {
+        if size.w <= 0.0 || size.h <= 0.0 {
+            return;
+        }
+        let raw = FxEngine::eval_string(&layer.asset, self.ctx).value;
+        let Some(path) = self.resolve_asset(&raw) else {
+            return;
+        };
+        let videos = self.videos;
+        let Some(v) = videos.get(&*path.to_string_lossy()) else {
+            return;
+        };
+        let Some(id) = v.current else {
+            return; // 1º frame ainda não decodificado; `set_video_frame` refaz a lista
+        };
+        let scale = xf.scale();
+        let half = [size.w * 0.5, size.h * 0.5];
+        let radius = layer.corner_radius_px * self.ui;
+        let quad = ShadowQuad {
+            center: xf.t,
+            half,
+            basis: xf.m,
+            scale,
+            radius,
+        };
+        self.push_shadow(layer, quad, z, blend, opacity);
+        let inst = QuadInstance::new(xf.t, half, xf.m, scale)
+            .kind(QuadKind::Opaque)
+            .radius(radius)
+            .color([1.0, 1.0, 1.0, opacity])
+            .uv(cover_uv(v.size.0, v.size.1, size.w, size.h));
+        self.canvas.push(z, blend, id, inst);
+        if layer.fill_parent {
+            self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true));
+        }
+    }
+
+    /// Ícone/SVG: `svg_markup` rasterizado (resvg) no tamanho físico da caixa, tingido por `color`
+    /// (`currentColor` do markup = branco; SVG multicolorido usa `color` branco).
+    fn draw_svg(
+        &mut self,
+        layer: &LayerNode,
+        size: Size,
+        xf: &Affine,
+        z: u32,
+        blend: BlendKind,
+        opacity: f32,
+    ) {
+        if layer.svg_markup.trim().is_empty() || size.w <= 0.5 || size.h <= 0.5 {
+            return;
+        }
+        let scale = xf.scale();
+        let (pw, ph) = (svg_bucket(size.w * scale), svg_bucket(size.h * scale));
+        let Some(img) = self
+            .svgs
+            .get(&layer.svg_markup, pw, ph, self.compositor, self.device, self.queue)
+        else {
+            return;
+        };
+        let color = with_alpha(self.color(&layer.color), opacity);
+        let half = [size.w * 0.5, size.h * 0.5];
+        let inst = QuadInstance::new(xf.t, half, xf.m, scale)
+            .kind(QuadKind::Texture)
+            .color(color);
+        self.canvas.push(z, blend, img.id, inst);
     }
 
     fn draw_image(

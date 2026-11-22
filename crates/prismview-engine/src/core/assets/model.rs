@@ -189,6 +189,8 @@ pub struct MeshData {
     pub primitives: Vec<PrimitiveData>,
     /// Pesos padrão dos morph targets (`mesh.weights`); pode ser menor que o nº de alvos (resto 0).
     pub weights: Vec<f32>,
+    /// Nomes dos morph targets (`mesh.extras.targetNames`); vazio se o arquivo não os define.
+    pub target_names: Vec<String>,
 }
 
 impl MeshData {

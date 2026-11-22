@@ -1,5 +1,6 @@
 mod desktop_host;
 mod native_engine;
+mod native_scene;
 mod reactive_sensors;
 
 use desktop_host::{GsmtcHandle, LiveMediaDto, MediaCommand, MonitorInfoDto};
@@ -63,6 +64,9 @@ pub struct RuntimeStateDto {
     pub monitors: Vec<MonitorInfoDto>,
     #[serde(default)]
     pub monitor_wallpapers: HashMap<String, String>,
+    /// Aviso quando a migração automática de um wallpaper antigo (WebView) para o motor nativo falhou.
+    #[serde(default)]
+    pub legacy_migration_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +138,7 @@ struct AppRuntimeState {
     manual_paused: bool,
     desktop_visible: bool,
     allow_exit: bool,
+    legacy_migration_notice: Option<String>,
 }
 
 #[link(name = "advapi32")]
@@ -320,9 +325,13 @@ fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn is_autostart_enabled_inner() -> bool {
+/// Valor legado: Studio `--minimized` no login. Hoje só existe se houver widgets fixados
+/// (o wallpaper é do motor nativo, que sobe sozinho).
+const STUDIO_RUN_VALUE: &str = "PrismView";
+
+fn run_value_present(name: &str) -> bool {
     let subkey = wide_null(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let value_name = wide_null("PrismView");
+    let value_name = wide_null(name);
     let mut hkey: isize = 0;
     let status = unsafe {
         RegOpenKeyExW(
@@ -354,9 +363,10 @@ fn is_autostart_enabled_inner() -> bool {
     q_status == ERROR_SUCCESS && val_type == REG_SZ && cb_data > 2
 }
 
-fn set_autostart_enabled_inner(enabled: bool) -> Result<bool, String> {
+/// Grava (`Some(cmd)`) ou remove (`None`) um valor em `HKCU\...\Run`.
+fn write_run_value(name: &str, command: Option<&str>) -> Result<(), String> {
     let subkey = wide_null(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let value_name = wide_null("PrismView");
+    let value_name = wide_null(name);
     let mut hkey: isize = 0;
     let status = unsafe {
         RegOpenKeyExW(
@@ -370,41 +380,90 @@ fn set_autostart_enabled_inner(enabled: bool) -> Result<bool, String> {
     if status != ERROR_SUCCESS {
         return Err(format!("Falha ao abrir Registro do Windows (erro {status})"));
     }
-    let res = if enabled {
-        match std::env::current_exe() {
-            Ok(exe) => {
-                let cmd = wide_null(&format!("\"{}\" --minimized", exe.to_string_lossy()));
-                let byte_len = (cmd.len() * std::mem::size_of::<u16>()) as u32;
-                let st = unsafe {
-                    RegSetValueExW(
-                        hkey,
-                        value_name.as_ptr(),
-                        0,
-                        REG_SZ,
-                        cmd.as_ptr() as *const u8,
-                        byte_len,
-                    )
-                };
-                if st == ERROR_SUCCESS {
-                    Ok(true)
-                } else {
-                    Err(format!("Falha ao gravar autostart no Registro (erro {st})"))
-                }
+    let res = match command {
+        Some(cmd) => {
+            let cmd = wide_null(cmd);
+            let byte_len = (cmd.len() * std::mem::size_of::<u16>()) as u32;
+            let st = unsafe {
+                RegSetValueExW(
+                    hkey,
+                    value_name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    cmd.as_ptr() as *const u8,
+                    byte_len,
+                )
+            };
+            if st == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("Falha ao gravar autostart no Registro (erro {st})"))
             }
-            Err(e) => Err(e.to_string()),
         }
-    } else {
-        let st = unsafe { RegDeleteValueW(hkey, value_name.as_ptr()) };
-        if st == ERROR_SUCCESS || st == ERROR_FILE_NOT_FOUND {
-            Ok(false)
-        } else {
-            Err(format!("Falha ao remover autostart no Registro (erro {st})"))
+        None => {
+            let st = unsafe { RegDeleteValueW(hkey, value_name.as_ptr()) };
+            if st == ERROR_SUCCESS || st == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!("Falha ao remover autostart no Registro (erro {st})"))
+            }
         }
     };
     unsafe {
         RegCloseKey(hkey);
     }
     res
+}
+
+/// "Iniciar com o Windows" = motor nativo no login (relê `active_scene.json`).
+fn is_autostart_enabled_inner() -> bool {
+    run_value_present(native_engine::ENGINE_RUN_VALUE)
+}
+
+/// Liga/desliga o motor no login. O Studio só entra no login se houver widgets fixados (são
+/// janelas dele); a escolha do usuário fica gravada para o "Aplicar" não religar sozinho.
+fn set_autostart_enabled_inner(enabled: bool, has_widgets: bool) -> Result<bool, String> {
+    if enabled {
+        let cmd = native_engine::login_command()?;
+        write_run_value(native_engine::ENGINE_RUN_VALUE, Some(&cmd))?;
+    } else {
+        write_run_value(native_engine::ENGINE_RUN_VALUE, None)?;
+    }
+    native_engine::set_autostart_opt_out(!enabled);
+    sync_studio_login_entry(enabled && has_widgets);
+    Ok(enabled)
+}
+
+/// Garante o motor no login após um "Aplicar" (padrão), salvo se o usuário desligou.
+fn ensure_engine_login_autostart(has_widgets: bool) {
+    if native_engine::autostart_opted_out() || is_autostart_enabled_inner() {
+        return;
+    }
+    if let Err(err) = set_autostart_enabled_inner(true, has_widgets) {
+        eprintln!("[prismview-studio] autostart do motor: {err}");
+    }
+}
+
+/// Entrada legada do Studio no login: só quando há widgets (senão a janela principal abriria).
+fn sync_studio_login_entry(want: bool) {
+    if want == run_value_present(STUDIO_RUN_VALUE) {
+        return;
+    }
+    let result = if want {
+        std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| {
+                write_run_value(
+                    STUDIO_RUN_VALUE,
+                    Some(&format!("\"{}\" --minimized", exe.to_string_lossy())),
+                )
+            })
+    } else {
+        write_run_value(STUDIO_RUN_VALUE, None)
+    };
+    if let Err(err) = result {
+        eprintln!("[prismview-studio] autostart do Studio: {err}");
+    }
 }
 
 type SharedState = Arc<Mutex<AppRuntimeState>>;
@@ -490,10 +549,37 @@ fn session_path() -> PathBuf {
     prismview_root_dir().join("session.json")
 }
 
+/// Escopo do asset protocol (tauri.conf.json cobre só `%APPDATA%\PrismView`). Arquivos que o
+/// usuário escolheu fora dessa pasta entram aqui, um a um, ao escolher/carregar o projeto.
+static ASSET_SCOPE: OnceLock<tauri::scope::fs::Scope> = OnceLock::new();
+
+fn allow_asset_file(path: &Path) {
+    if let Some(scope) = ASSET_SCOPE.get() {
+        let _ = scope.allow_file(path);
+    }
+}
+
+/// Libera no asset protocol os caminhos absolutos de arquivos existentes citados no projeto.
+fn allow_project_media(value: &Value) {
+    match value {
+        Value::String(s) if s.len() < 1024 => {
+            let p = Path::new(s);
+            if p.is_absolute() && p.is_file() {
+                allow_asset_file(p);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(allow_project_media),
+        Value::Object(map) => map.values().for_each(allow_project_media),
+        _ => {}
+    }
+}
+
 fn load_project_from_disk(project_id: &str) -> Option<Value> {
     let p = project_path(project_id);
     let raw = fs::read_to_string(p).ok()?;
-    serde_json::from_str::<Value>(&raw).ok()
+    let val = serde_json::from_str::<Value>(&raw).ok()?;
+    allow_project_media(&val);
+    Some(val)
 }
 
 fn wallpaper_window_label(monitor_id: &str) -> String {
@@ -543,6 +629,9 @@ fn save_session_from_state(st: &AppRuntimeState) {
     };
     if let Ok(json) = serde_json::to_string_pretty(&session) {
         let _ = fs::write(session_path(), json);
+    }
+    if is_autostart_enabled_inner() {
+        sync_studio_login_entry(!st.pinned_widgets.is_empty());
     }
 }
 
@@ -748,6 +837,7 @@ fn build_runtime_state(st: &AppRuntimeState) -> RuntimeStateDto {
         locked_widget_ids,
         monitors: st.monitors.clone(),
         monitor_wallpapers,
+        legacy_migration_notice: st.legacy_migration_notice.clone(),
     }
 }
 
@@ -1021,6 +1111,7 @@ async fn list_projects() -> Result<Vec<Value>, String> {
                 if p.extension().and_then(|s| s.to_str()) == Some("json") {
                     if let Ok(raw) = fs::read_to_string(&p) {
                         if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+                            allow_project_media(&val);
                             out.push(val);
                         }
                     }
@@ -1256,253 +1347,44 @@ fn build_telemetry_snapshot(
     }
 }
 
-fn spawn_or_update_monitor_wallpaper(
-    app: &AppHandle,
-    state: &SharedState,
-    mon: &MonitorInfoDto,
-    project: &Value,
-    pre_resolved_worker: Option<(isize, bool)>,
-    force_reattach: bool,
-) -> Result<(), String> {
-    let label = wallpaper_window_label(&mon.id);
-    let attach_on_main = |win: &tauri::WebviewWindow,
-                          mon_clone: MonitorInfoDto,
-                          state_clone: SharedState,
-                          pre: Option<(isize, bool)>| {
-        if let Ok(hwnd) = win.hwnd() {
-            let hwnd_raw = hwnd.0 as isize;
-            let _ = app.run_on_main_thread(move || {
-                let (ww, is_true) = if let Some((ww_raw, is_true_ww)) = pre {
-                    let attached = desktop_host::attach_window_to_resolved_worker_w(
-                        hwnd_raw,
-                        &mon_clone,
-                        HWND(ww_raw as *mut core::ffi::c_void),
-                        is_true_ww,
-                    );
-                    (attached, is_true_ww)
-                } else {
-                    let (ww_hwnd, is_true_ww) = desktop_host::resolve_worker_w_ex();
-                    let attached = desktop_host::attach_window_to_resolved_worker_w(
-                        hwnd_raw,
-                        &mon_clone,
-                        ww_hwnd,
-                        is_true_ww,
-                    );
-                    (attached, is_true_ww)
-                };
-                if ww != 0 {
-                    if let Ok(mut st) = state_clone.lock() {
-                        st.last_worker_w = ww;
-                        st.last_worker_is_true = is_true;
-                    }
-                }
-            });
-        }
-    };
-
-    if let Some(win) = app.get_webview_window(&label) {
-        let (is_ready, need_attach) = {
-            let mut st = state.lock().map_err(|e| e.to_string())?;
-            st.monitor_wallpapers
-                .insert(mon.id.clone(), project.clone());
-            st.wallpaper_labels.insert(label.clone(), mon.id.clone());
-            refresh_parallax_targets(&mut st);
-            let worker_alive =
-                st.last_worker_w != 0 && desktop_host::is_window_alive(st.last_worker_w);
-            (st.ready_windows.contains(&label), force_reattach || !worker_alive)
-        };
-        if need_attach {
-            attach_on_main(&win, mon.clone(), Arc::clone(state), pre_resolved_worker);
-        }
-        if is_ready {
-            let _ = app.emit_to(&label, "prism://wallpaper-scene", project);
-            if need_attach {
-                let _ = app.emit_to(&label, "prism://monitor-changed", mon);
-            }
-        }
-        if need_attach {
-            let _ = win.show();
-        }
-    } else {
-        let scale = mon.scale_factor.max(0.5) as f64;
-        let logical_w = (mon.width as f64 / scale).max(320.0);
-        let logical_h = (mon.height as f64 / scale).max(200.0);
-        let logical_x = mon.x as f64 / scale;
-        let logical_y = mon.y as f64 / scale;
-        let url = format!(
-            "desktop.html?mode=wallpaper&monitor={}",
-            percent_encode_query(&mon.id)
-        );
-
-        // Pre-insert state BEFORE build() so an early wallpaper_window_ready IPC never misses the project
-        // or gets wiped out, while saving previous entries for full rollback if build() fails.
-        let (prev_wp, prev_lbl) = {
-            let mut st = state.lock().map_err(|e| e.to_string())?;
-            st.ready_windows.remove(&label);
-            let prev_wp = st
-                .monitor_wallpapers
-                .insert(mon.id.clone(), project.clone());
-            let prev_lbl = st.wallpaper_labels.insert(label.clone(), mon.id.clone());
-            refresh_parallax_targets(&mut st);
-            (prev_wp, prev_lbl)
-        };
-
-        let win = match WebviewWindowBuilder::new(app, &label, WebviewUrl::App(url.into()))
-            .title(format!("PrismView Desktop Wallpaper ({})", mon.id))
-            .inner_size(logical_w, logical_h)
-            .position(logical_x, logical_y)
-            .decorations(false)
-            .resizable(false)
-            .skip_taskbar(true)
-            .shadow(false)
-            .visible(true)
-            .build()
-        {
-            Ok(w) => w,
-            Err(e) => {
-                if let Ok(mut st) = state.lock() {
-                    st.ready_windows.remove(&label);
-                    match prev_wp {
-                        Some(old) => {
-                            st.monitor_wallpapers.insert(mon.id.clone(), old);
-                        }
-                        None => {
-                            st.monitor_wallpapers.remove(&mon.id);
-                        }
-                    }
-                    match prev_lbl {
-                        Some(old) => {
-                            st.wallpaper_labels.insert(label.clone(), old);
-                        }
-                        None => {
-                            st.wallpaper_labels.remove(&label);
-                        }
-                    }
-                    refresh_parallax_targets(&mut st);
-                }
-                return Err(e.to_string());
-            }
-        };
-
-        attach_on_main(&win, mon.clone(), Arc::clone(state), pre_resolved_worker);
-    }
-    Ok(())
-}
-
-fn apply_wallpaper_inner(
-    app: &AppHandle,
-    state: &SharedState,
-    project: Value,
-    target_monitor_id: Option<String>,
-    persist_session: bool,
-) -> Result<(), String> {
-    let (monitors, cached_ww, cached_is_true) = {
+/// Fecha janelas WebView de wallpaper deixadas por versões antigas e zera o estado delas, sem
+/// mexer no motor nativo.
+fn close_legacy_wallpaper_windows(app: &AppHandle, state: &SharedState) -> Result<(), String> {
+    let labels: Vec<String> = {
         let mut st = state.lock().map_err(|e| e.to_string())?;
-        let fresh = if st.monitors.is_empty() {
-            let m = desktop_host::enumerate_monitors();
-            st.monitors = m.clone();
-            for item in &m {
-                st.monitor_visibility.entry(item.id.clone()).or_insert(true);
-            }
-            m
-        } else {
-            st.monitors.clone()
-        };
-        if target_monitor_id.is_none() {
-            st.active_wallpaper = Some(project.clone());
+        let mut all: Vec<String> = st.wallpaper_labels.keys().cloned().collect();
+        for m in &st.monitors {
+            all.push(wallpaper_window_label(&m.id));
         }
-        (fresh, st.last_worker_w, st.last_worker_is_true)
-    };
-
-    let targets: Vec<MonitorInfoDto> = match target_monitor_id.as_deref() {
-        Some(mid) => {
-            let matched: Vec<MonitorInfoDto> = monitors
-                .iter()
-                .filter(|m| m.id == mid)
-                .cloned()
-                .collect();
-            if matched.is_empty() {
-                // Disconnected monitor ID during session restore — skip instead of overwriting primary monitor
-                return Ok(());
-            }
-            matched
+        all.push("wallpaper".to_string());
+        st.monitor_wallpapers.clear();
+        st.wallpaper_labels.clear();
+        for lbl in &all {
+            st.ready_windows.remove(lbl);
         }
-        None => monitors,
+        refresh_parallax_targets(&mut st);
+        all
     };
-
-    // Reuse cached live WorkerW so switching/updating wallpapers never spams 0x052C or re-parents
-    let worker_alive = cached_ww != 0 && desktop_host::is_window_alive(cached_ww);
-    let pre_worker = if worker_alive {
-        Some((cached_ww, cached_is_true))
-    } else {
-        let (ww_hwnd, is_true_ww) = desktop_host::resolve_worker_w_ex();
-        let raw = ww_hwnd.0 as isize;
-        if raw != 0 {
-            if let Ok(mut st) = state.lock() {
-                st.last_worker_w = raw;
-                st.last_worker_is_true = is_true_ww;
-            }
-        }
-        Some((raw, is_true_ww))
-    };
-
-    for mon in &targets {
-        spawn_or_update_monitor_wallpaper(app, state, mon, &project, pre_worker, false)?;
-    }
-
-    if persist_session {
-        if let Ok(st) = state.lock() {
-            save_session_from_state(&st);
+    for label in labels {
+        if let Some(win) = app.get_webview_window(&label) {
+            let _ = win.close();
         }
     }
-
     Ok(())
 }
 
+/// Remove o wallpaper do desktop: motor nativo encerrado + cena ativa apagada + estado limpo.
 fn clear_wallpaper_inner(
     app: &AppHandle,
     state: &SharedState,
     target_monitor_id: Option<String>,
 ) -> Result<(), String> {
-    let labels_to_close: Vec<String> = {
-        let mut st = state.lock().map_err(|e| e.to_string())?;
-        let labels = match target_monitor_id.as_deref() {
-            Some(mid) => {
-                let lbl = wallpaper_window_label(mid);
-                st.monitor_wallpapers.remove(mid);
-                st.wallpaper_labels.remove(&lbl);
-                st.ready_windows.remove(&lbl);
-                // Clear global fallback so recovery never respawns an explicitly cleared monitor
-                st.active_wallpaper = None;
-                vec![lbl]
-            }
-            None => {
-                let mut all: Vec<String> = st.wallpaper_labels.keys().cloned().collect();
-                for m in &st.monitors {
-                    let lbl = wallpaper_window_label(&m.id);
-                    if !all.contains(&lbl) {
-                        all.push(lbl);
-                    }
-                }
-                all.push("wallpaper".to_string());
-                st.active_wallpaper = None;
-                st.monitor_wallpapers.clear();
-                st.wallpaper_labels.clear();
-                for lbl in &all {
-                    st.ready_windows.remove(lbl);
-                }
-                all
-            }
-        };
-        refresh_parallax_targets(&mut st);
+    let _ = target_monitor_id;
+    native_engine::clear_desktop()?;
+    close_legacy_wallpaper_windows(app, state)?;
+    if let Ok(mut st) = state.lock() {
+        st.active_wallpaper = None;
         save_session_from_state(&st);
-        labels
-    };
-
-    for label in labels_to_close {
-        if let Some(win) = app.get_webview_window(&label) {
-            let _ = win.close();
-        }
     }
     Ok(())
 }
@@ -1511,7 +1393,7 @@ fn reconcile_monitors_and_worker_w(app: &AppHandle, state: &SharedState) {
     let fresh_monitors = desktop_host::enumerate_monitors();
     let fresh_ids: HashSet<String> = fresh_monitors.iter().map(|m| m.id.clone()).collect();
 
-    let (stale_labels, plan, pinned_widget_snapshots) = {
+    let (stale_labels, pinned_widget_snapshots) = {
         let Ok(mut st) = state.lock() else {
             return;
         };
@@ -1539,18 +1421,6 @@ fn reconcile_monitors_and_worker_w(app: &AppHandle, state: &SharedState) {
             }
         }
 
-        let mut attach_plan: Vec<(MonitorInfoDto, Value)> = Vec::new();
-        for mon in &fresh_monitors {
-            if let Some(proj) = st
-                .monitor_wallpapers
-                .get(&mon.id)
-                .cloned()
-                .or_else(|| st.active_wallpaper.clone())
-            {
-                attach_plan.push((mon.clone(), proj));
-            }
-        }
-
         let widgets: Vec<(String, bool)> = st
             .pinned_widgets
             .iter()
@@ -1564,27 +1434,12 @@ fn reconcile_monitors_and_worker_w(app: &AppHandle, state: &SharedState) {
             .collect();
 
         refresh_parallax_targets(&mut st);
-        (stale, attach_plan, widgets)
+        (stale, widgets)
     };
 
     for lbl in stale_labels {
         if let Some(win) = app.get_webview_window(&lbl) {
             let _ = win.close();
-        }
-    }
-
-    if !plan.is_empty() {
-        let (ww_hwnd, is_true_ww) = desktop_host::resolve_worker_w_ex();
-        let raw = ww_hwnd.0 as isize;
-        if raw != 0 {
-            if let Ok(mut st) = state.lock() {
-                st.last_worker_w = raw;
-                st.last_worker_is_true = is_true_ww;
-            }
-        }
-        let pre_worker = Some((raw, is_true_ww));
-        for (mon, proj) in plan {
-            let _ = spawn_or_update_monitor_wallpaper(app, state, &mon, &proj, pre_worker, true);
         }
     }
 
@@ -1616,16 +1471,31 @@ fn list_monitors(state: tauri::State<'_, SharedState>) -> Result<Vec<MonitorInfo
     Ok(fresh)
 }
 
+/// "Aplicar no Desktop": sempre pelo motor nativo (`prismview-engine --native`), em todos os
+/// monitores (`monitor_id` é ignorado: o motor desenha a mesma cena em cada saída). Falhas
+/// (conversor, exe ausente, pipe) voltam como erro para a UI; não existe mais wallpaper WebView.
 #[tauri::command]
 async fn apply_desktop_wallpaper(
     app: AppHandle,
     state: tauri::State<'_, SharedState>,
+    engine: tauri::State<'_, native_engine::SharedEngine>,
     project: Value,
     monitor_id: Option<String>,
 ) -> Result<RuntimeStateDto, String> {
     let state_arc = Arc::clone(state.inner());
+    let engine_arc = Arc::clone(engine.inner());
+    let _ = monitor_id;
     tauri::async_runtime::spawn_blocking(move || {
-        apply_wallpaper_inner(&app, &state_arc, project, monitor_id, true)?;
+        engine_arc.apply_project(&project)?;
+        // Limpa restos de sessões antigas (janelas WebView de wallpaper) sem tocar no motor.
+        close_legacy_wallpaper_windows(&app, &state_arc)?;
+        let has_widgets = {
+            let mut st = state_arc.lock().map_err(|e| e.to_string())?;
+            st.active_wallpaper = Some(project);
+            save_session_from_state(&st);
+            !st.pinned_widgets.is_empty()
+        };
+        ensure_engine_login_autostart(has_widgets);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1633,6 +1503,8 @@ async fn apply_desktop_wallpaper(
     .map_err(|e| e.to_string())?
 }
 
+/// Remove o wallpaper: encerra o motor nativo e apaga a cena ativa (o Windows volta ao fundo
+/// dele). O motor desenha todos os monitores juntos, então `monitor_id` limpa tudo.
 #[tauri::command]
 async fn clear_desktop_wallpaper(
     app: AppHandle,
@@ -1640,8 +1512,9 @@ async fn clear_desktop_wallpaper(
     monitor_id: Option<String>,
 ) -> Result<RuntimeStateDto, String> {
     let state_arc = Arc::clone(state.inner());
+    let _ = monitor_id;
     tauri::async_runtime::spawn_blocking(move || {
-        clear_wallpaper_inner(&app, &state_arc, monitor_id)?;
+        clear_wallpaper_inner(&app, &state_arc, None)?;
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
     })
@@ -1965,52 +1838,6 @@ fn apply_manual_pause_inner(app: &AppHandle, state: &SharedState, paused: bool) 
 }
 
 #[tauri::command]
-fn wallpaper_window_ready(
-    state: tauri::State<'_, SharedState>,
-    monitor_id: Option<String>,
-) -> Result<WindowBootstrapDto, String> {
-    let (project, visible, media_cache, monitor) = {
-        let mut st = state.lock().map_err(|e| e.to_string())?;
-        let monitors = ensure_monitors_loaded(&mut st);
-        let mon = monitor_id
-            .as_deref()
-            .and_then(|mid| monitors.iter().find(|m| m.id == mid).cloned())
-            .or_else(|| monitors.first().cloned());
-        let resolved_id = mon
-            .as_ref()
-            .map(|m| m.id.clone())
-            .or(monitor_id)
-            .unwrap_or_else(|| "DISPLAY1".to_string());
-        let label = wallpaper_window_label(&resolved_id);
-        st.ready_windows.insert(label);
-        let proj = st
-            .monitor_wallpapers
-            .get(&resolved_id)
-            .cloned()
-            .or_else(|| st.active_wallpaper.clone());
-        let mon_vis = st
-            .monitor_visibility
-            .get(&resolved_id)
-            .copied()
-            .unwrap_or(st.desktop_visible);
-        (
-            proj,
-            mon_vis && !st.manual_paused,
-            Arc::clone(&st.media_cache),
-            mon,
-        )
-    };
-    let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".to_string());
-    let telemetry = build_telemetry_snapshot(&hostname, &media_cache);
-    Ok(WindowBootstrapDto {
-        project,
-        visible,
-        telemetry,
-        monitor,
-    })
-}
-
-#[tauri::command]
 fn widget_window_ready(
     app: AppHandle,
     state: tauri::State<'_, SharedState>,
@@ -2080,14 +1907,28 @@ fn get_autostart_enabled() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
-    set_autostart_enabled_inner(enabled)
+fn set_autostart_enabled(
+    state: tauri::State<'_, SharedState>,
+    enabled: bool,
+) -> Result<bool, String> {
+    let has_widgets = state
+        .lock()
+        .map(|st| !st.pinned_widgets.is_empty())
+        .unwrap_or(false);
+    set_autostart_enabled_inner(enabled, has_widgets)
 }
 
 #[tauri::command]
 fn get_runtime_state(state: tauri::State<'_, SharedState>) -> Result<RuntimeStateDto, String> {
     let st = state.lock().map_err(|e| e.to_string())?;
     Ok(build_runtime_state(&st))
+}
+
+#[tauri::command]
+fn dismiss_legacy_migration_notice(state: tauri::State<'_, SharedState>) -> Result<(), String> {
+    let mut st = state.lock().map_err(|e| e.to_string())?;
+    st.legacy_migration_notice = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2154,91 +1995,98 @@ async fn pick_save_archive_path(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-async fn export_prism_archive(
+/// Exporta o `.prism` otimizado (mídias empacotadas). Síncrona: usada pelo comando e pelo
+/// fluxo "Aplicar no Desktop" do motor nativo (`native_engine`).
+pub(crate) fn export_prism_archive_sync(
     mut project: Value,
     dest_path: Option<String>,
 ) -> Result<ExportPackageResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let is_widget = project
-            .get("packageType")
-            .and_then(|v| v.as_str())
-            .map(|s| s.eq_ignore_ascii_case("WIDGET"))
-            .unwrap_or(false);
-        let title = project
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("PrismView_Project")
-            .to_string();
-        let ext = if is_widget { "widget.prism" } else { "prism" };
-        let default_file_name = format!("{}.{ext}", sanitize_name(&title));
-        let dest = match dest_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(custom) => {
-                let p = PathBuf::from(custom);
-                if let Some(parent) = p.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = fs::create_dir_all(parent);
-                    }
+    let is_widget = project
+        .get("packageType")
+        .and_then(|v| v.as_str())
+        .map(|s| s.eq_ignore_ascii_case("WIDGET"))
+        .unwrap_or(false);
+    let title = project
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("PrismView_Project")
+        .to_string();
+    let ext = if is_widget { "widget.prism" } else { "prism" };
+    let default_file_name = format!("{}.{ext}", sanitize_name(&title));
+    let dest = match dest_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(custom) => {
+            let p = PathBuf::from(custom);
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = fs::create_dir_all(parent);
                 }
-                p
             }
-            None => prismview_root_dir().join("packages").join(&default_file_name),
-        };
-        let file_name = dest
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-            .unwrap_or(default_file_name);
-
-        let file = File::create(&dest).map_err(|e| e.to_string())?;
-        let mut zip = ZipWriter::new(file);
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-        let mut bundled = HashMap::new();
-        if let Some(layers) = project.get_mut("layers").and_then(|v| v.as_array_mut()) {
-            bundle_layer_files(layers, &mut zip, opts, &mut bundled)?;
+            p
         }
+        None => prismview_root_dir().join("packages").join(&default_file_name),
+    };
+    let file_name = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or(default_file_name);
 
-        let manifest = serde_json::json!({
-            "version": 3,
-            "packageType": if is_widget { "WIDGET" } else { "WALLPAPER" },
-            "isWidget": is_widget,
-            "title": title,
-            "bundledFiles": bundled.len(),
-        });
-        zip.start_file("manifest.json", opts)
-            .map_err(|e| e.to_string())?;
-        zip.write_all(
-            serde_json::to_string_pretty(&manifest)
-                .map_err(|e| e.to_string())?
-                .as_bytes(),
-        )
+    let file = File::create(&dest).map_err(|e| e.to_string())?;
+    let mut zip = ZipWriter::new(file);
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    let mut bundled = HashMap::new();
+    if let Some(layers) = project.get_mut("layers").and_then(|v| v.as_array_mut()) {
+        bundle_layer_files(layers, &mut zip, opts, &mut bundled)?;
+    }
+
+    let manifest = serde_json::json!({
+        "version": 3,
+        "packageType": if is_widget { "WIDGET" } else { "WALLPAPER" },
+        "isWidget": is_widget,
+        "title": title,
+        "bundledFiles": bundled.len(),
+    });
+    zip.start_file("manifest.json", opts)
         .map_err(|e| e.to_string())?;
+    zip.write_all(
+        serde_json::to_string_pretty(&manifest)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|e| e.to_string())?;
 
-        let payload = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
-        zip.start_file("project.json", opts)
+    let payload = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
+    zip.start_file("project.json", opts)
+        .map_err(|e| e.to_string())?;
+    zip.write_all(payload.as_bytes())
+        .map_err(|e| e.to_string())?;
+    if is_widget {
+        zip.start_file("widget.json", opts)
             .map_err(|e| e.to_string())?;
         zip.write_all(payload.as_bytes())
             .map_err(|e| e.to_string())?;
-        if is_widget {
-            zip.start_file("widget.json", opts)
-                .map_err(|e| e.to_string())?;
-            zip.write_all(payload.as_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        zip.finish().map_err(|e| e.to_string())?;
+    }
+    zip.finish().map_err(|e| e.to_string())?;
 
-        Ok(ExportPackageResult {
-            archive_path: dest.to_string_lossy().to_string(),
-            file_name,
-        })
+    Ok(ExportPackageResult {
+        archive_path: dest.to_string_lossy().to_string(),
+        file_name,
     })
-    .await
-    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn export_prism_archive(
+    project: Value,
+    dest_path: Option<String>,
+) -> Result<ExportPackageResult, String> {
+    tauri::async_runtime::spawn_blocking(move || export_prism_archive_sync(project, dest_path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
@@ -2409,6 +2257,7 @@ async fn pick_local_file(kind: Option<String>) -> Result<Option<PickedFileDto>, 
         if !p.is_file() {
             return Ok(None);
         }
+        allow_asset_file(&p);
         let ext = p
             .extension()
             .and_then(|s| s.to_str())
@@ -2940,6 +2789,7 @@ pub fn run() {
         .manage(shared_state)
         .manage(native_engine::new_state())
         .setup(move |app| {
+            let _ = ASSET_SCOPE.set(app.asset_protocol_scope());
             let open_item =
                 MenuItem::with_id(app, "open_studio", "Abrir PrismView", true, None::<&str>)?;
             let toggle_pause =
@@ -2989,7 +2839,11 @@ pub fn run() {
                     }
                     "toggle_autostart" => {
                         let next = !is_autostart_enabled_inner();
-                        if let Ok(enabled) = set_autostart_enabled_inner(next) {
+                        let has_widgets = st_menu
+                            .lock()
+                            .map(|st| !st.pinned_widgets.is_empty())
+                            .unwrap_or(false);
+                        if let Ok(enabled) = set_autostart_enabled_inner(next, has_widgets) {
                             let _ = autostart_item.set_text(if enabled {
                                 "✓ Iniciar com o Windows"
                             } else {
@@ -3036,57 +2890,32 @@ pub fn run() {
             }
 
             let mut restored_any = false;
+            // Sessão antiga (wallpaper WebView, sem cena nativa): migra aplicando no motor.
+            let mut legacy_wallpaper: Option<Value> = None;
             if let Some(session) = load_persisted_session() {
                 if let Ok(mut st) = state_for_setup.lock() {
                     st.manual_paused = session.paused;
                 }
-                if !session.monitor_wallpaper_ids.is_empty() {
-                    for (mon_id, proj_id) in &session.monitor_wallpaper_ids {
-                        let wp_opt = load_project_from_disk(proj_id)
-                            .or_else(|| session.monitor_wallpaper_snapshots.get(mon_id).cloned());
-                        if let Some(wp) = wp_opt {
-                            if apply_wallpaper_inner(
-                                app.handle(),
-                                &state_for_setup,
-                                wp,
-                                Some(mon_id.clone()),
-                                false,
-                            )
-                            .is_ok()
-                            {
-                                restored_any = true;
-                            }
-                        }
+                // Wallpaper: só o id/projeto em memória (UI sabe qual está ativo e re-aplica ao
+                // salvar). Quem desenha é o motor nativo, que já relê `active_scene.json`.
+                let wallpaper_proj = session
+                    .active_wallpaper_id
+                    .as_deref()
+                    .and_then(load_project_from_disk)
+                    .or(session.active_wallpaper_snapshot)
+                    .or_else(|| {
+                        session
+                            .monitor_wallpaper_ids
+                            .values()
+                            .next()
+                            .and_then(|id| load_project_from_disk(id))
+                    });
+                if let Some(wp) = wallpaper_proj {
+                    if !native_engine::has_active_scene() {
+                        legacy_wallpaper = Some(wp.clone());
                     }
-                    // Keep legacy global fallback in memory if present
-                    if let Some(global_wp) = session
-                        .active_wallpaper_id
-                        .as_deref()
-                        .and_then(load_project_from_disk)
-                        .or(session.active_wallpaper_snapshot)
-                    {
-                        if let Ok(mut st) = state_for_setup.lock() {
-                            st.active_wallpaper = Some(global_wp);
-                        }
-                    }
-                } else {
-                    let wallpaper_proj = session
-                        .active_wallpaper_id
-                        .as_deref()
-                        .and_then(load_project_from_disk)
-                        .or(session.active_wallpaper_snapshot);
-                    if let Some(wp) = wallpaper_proj {
-                        if apply_wallpaper_inner(
-                            app.handle(),
-                            &state_for_setup,
-                            wp,
-                            None,
-                            false,
-                        )
-                        .is_ok()
-                        {
-                            restored_any = true;
-                        }
+                    if let Ok(mut st) = state_for_setup.lock() {
+                        st.active_wallpaper = Some(wp);
                     }
                 }
                 for wid in session.pinned_widget_ids {
@@ -3105,6 +2934,45 @@ pub fn run() {
                         },
                     );
                 }
+            }
+
+            {
+                let engine = Arc::clone(app.state::<native_engine::SharedEngine>().inner());
+                let state_for_migration = Arc::clone(&state_for_setup);
+                let handle_for_migration = app.handle().clone();
+                std::thread::spawn(move || {
+                    let migrating = legacy_wallpaper.is_some();
+                    let result = match legacy_wallpaper {
+                        Some(project) => engine.apply_project(&project),
+                        None => engine.ensure_running(),
+                    };
+                    let Err(err) = result else { return };
+                    eprintln!("[prismview-studio] motor nativo: {err}");
+                    if !migrating {
+                        return;
+                    }
+                    // Migração falhou: o Hub não pode fingir que o wallpaper legado está aplicado.
+                    let notice = "Seu wallpaper antigo usa o formato legado (WebView) e não pôde ser migrado para o motor nativo. Abra-o no Estúdio e use \"Aplicar\" novamente para reaplicá-lo."
+                        .to_string();
+                    if let Ok(mut st) = state_for_migration.lock() {
+                        st.active_wallpaper = None;
+                        st.monitor_wallpapers.clear();
+                        st.legacy_migration_notice = Some(notice.clone());
+                        save_session_from_state(&st);
+                    }
+                    let _ = handle_for_migration.emit("prism://legacy-migration-failed", notice);
+                });
+            }
+            // Migração: entrada antiga do Studio no login → motor nativo no login.
+            if run_value_present(STUDIO_RUN_VALUE)
+                && !is_autostart_enabled_inner()
+                && !native_engine::autostart_opted_out()
+            {
+                let has_widgets = state_for_setup
+                    .lock()
+                    .map(|st| !st.pinned_widgets.is_empty())
+                    .unwrap_or(false);
+                let _ = set_autostart_enabled_inner(true, has_widgets);
             }
 
             let start_minimized = std::env::args().any(|a| a == "--minimized");
@@ -3176,12 +3044,12 @@ pub fn run() {
             pin_standalone_widget,
             unpin_standalone_widget,
             set_widget_locked,
-            wallpaper_window_ready,
             widget_window_ready,
             set_engine_paused,
             get_autostart_enabled,
             set_autostart_enabled,
             get_runtime_state,
+            dismiss_legacy_migration_notice,
             export_prism_archive,
             pick_save_archive_path,
             import_prism_archive,
@@ -3193,6 +3061,8 @@ pub fn run() {
             native_engine::native_engine_stop,
             native_engine::native_engine_clear,
             native_engine::native_engine_status,
+            native_engine::native_engine_apply,
+            native_engine::native_engine_set_power,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir PrismView");
@@ -3203,10 +3073,7 @@ pub fn run() {
             let (should_stay_resident, gsmtc_opt) = state_for_run
                 .lock()
                 .map(|st| {
-                    let stay = !st.allow_exit
-                        && (st.active_wallpaper.is_some()
-                            || !st.monitor_wallpapers.is_empty()
-                            || !st.pinned_widgets.is_empty());
+                    let stay = !st.allow_exit && !st.pinned_widgets.is_empty();
                     (stay, st.gsmtc.clone())
                 })
                 .unwrap_or((false, None));

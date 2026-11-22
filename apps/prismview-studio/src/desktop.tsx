@@ -8,50 +8,6 @@ import { useDesktopWindowBridge } from "./hooks/useDesktopWindowBridge";
 import { usePowerState } from "./engine/powerGovernor";
 
 /**
- * MODE 1: Desktop Wallpaper Window (Attached to Win32 WorkerW per physical monitor, 0 UI chrome)
- */
-const DesktopWallpaperHost: React.FC<{ monitorId: string | null }> = ({ monitorId }) => {
-  const {
-    hostRef,
-    project,
-    monitor,
-    telemetry,
-    visible,
-    cursorNormRef,
-    subscribeCursorTick,
-    subscribeCursorClick,
-    reactiveSignalRef,
-    subscribeReactiveTick,
-  } = useDesktopWindowBridge({
-    sceneEvent: "prism://wallpaper-scene",
-    readyCommand: "wallpaper_window_ready",
-    readyArgs: { monitorId },
-    listenMonitorChange: true,
-  });
-  const power = usePowerState(telemetry);
-
-  if (!project) return <div ref={hostRef} className="w-screen h-screen bg-black" />;
-
-  return (
-    <div ref={hostRef} className="w-screen h-screen bg-black overflow-hidden">
-      <UnifiedCompositor
-        project={project}
-        telemetry={telemetry}
-        monitorInfo={monitor}
-        cursorNormRef={cursorNormRef}
-        subscribeCursorTick={subscribeCursorTick}
-        subscribeCursorClick={subscribeCursorClick}
-        reactiveSignalRef={reactiveSignalRef}
-        subscribeReactiveTick={subscribeReactiveTick}
-        paused={!visible}
-        interactive={false}
-        powerState={power.state}
-      />
-    </div>
-  );
-};
-
-/**
  * MODE 2: Standalone Transparent Desktop Widget Window (works over native Windows wallpaper)
  */
 const StandaloneWidgetHost: React.FC<{ widgetId: string }> = ({ widgetId }) => {
@@ -146,13 +102,16 @@ const StandaloneWidgetHost: React.FC<{ widgetId: string }> = ({ widgetId }) => {
   );
 };
 
-/** Lightweight desktop entry (wallpaper / widget windows): no Studio, Hub or framer-motion. */
+/**
+ * Lightweight desktop entry (widget windows only): no Studio, Hub or framer-motion.
+ * Wallpapers are drawn by the native engine (prismview-engine --native), never by a WebView.
+ */
 function DesktopRoot() {
   const params = new URLSearchParams(window.location.search);
   if (params.get("mode") === "widget") {
     return <StandaloneWidgetHost widgetId={params.get("id") ?? ""} />;
   }
-  return <DesktopWallpaperHost monitorId={params.get("monitor")} />;
+  return null;
 }
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

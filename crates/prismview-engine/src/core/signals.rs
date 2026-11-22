@@ -39,8 +39,11 @@ impl SignalKind {
     pub const TELEMETRY: Self = Self(1 << 4);
     /// Bateria/energia (governador). Barato: amostrado em baixa frequência.
     pub const POWER: Self = Self(1 << 5);
+    /// Clique curto (toque) no fundo da área de trabalho — fora de ícones e de outras janelas.
+    /// Separado de `MOUSE` para o loop acordar só em toques, não a cada movimento.
+    pub const DESKTOP_TAP: Self = Self(1 << 6);
     pub const INPUT: Self = Self(Self::MOUSE.0 | Self::KEYBOARD.0);
-    pub const ALL: Self = Self(0x3F);
+    pub const ALL: Self = Self(0x7F);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -186,6 +189,9 @@ pub struct SignalBus {
     clicks: AtomicU32,
     key_presses: AtomicU32,
     last_input_ms: AtomicU64,
+    /// Último toque no desktop: `(x, y)` empacotados num só atômico (sem rasgo) + sequência.
+    tap_pos: AtomicU64,
+    tap_seq: AtomicU32,
 
     // Mídia.
     media_version: AtomicU64,
@@ -248,6 +254,8 @@ impl SignalBus {
             clicks: AtomicU32::new(0),
             key_presses: AtomicU32::new(0),
             last_input_ms: AtomicU64::new(0),
+            tap_pos: AtomicU64::new(0),
+            tap_seq: AtomicU32::new(0),
             media_version: AtomicU64::new(0),
             cover_version: AtomicU64::new(0),
             media_has_session: AtomicBool::new(false),
@@ -416,6 +424,15 @@ impl SignalBus {
         self.mark(kind);
     }
 
+    /// Plataforma: clique curto no fundo do desktop em `(x, y)` (pixels físicos do desktop
+    /// virtual). Só o último toque entre dois quadros é mantido.
+    pub fn publish_desktop_tap(&self, x: i32, y: i32) {
+        let packed = (u64::from(x as u32) << 32) | u64::from(y as u32);
+        self.tap_pos.store(packed, Ordering::Relaxed);
+        self.tap_seq.fetch_add(1, Ordering::Release);
+        self.mark(SignalKind::DESKTOP_TAP);
+    }
+
     // ───────── produtores: mídia ─────────
 
     /// Publica escalares de mídia. `text`: `Some` só quando metadados/capa mudaram.
@@ -445,6 +462,7 @@ impl SignalBus {
 
     /// Copia o texto de mídia em `out` reaproveitando a capacidade das `String`s.
     /// Retorna `false` se o lock estava ocupado (tentar no próximo frame) — nunca bloqueia.
+    #[allow(dead_code)] // API reservada (ainda sem chamador)
     pub fn read_media_text(&self, out: &mut MediaText) -> bool {
         match self.media_text.try_lock() {
             Ok(guard) => {
@@ -607,6 +625,9 @@ pub enum SignalSource {
     RamUsage,
     GpuUsage,
     Battery,
+    /// Cursor sobre o monitor em que está, -1 (esquerda/topo) ..= 1 (direita/base); parallax.
+    CursorX,
+    CursorY,
 }
 
 impl SignalSource {
@@ -628,6 +649,8 @@ impl SignalSource {
             "RAM_USAGE" => Self::RamUsage,
             "GPU_USAGE" => Self::GpuUsage,
             "BATTERY" => Self::Battery,
+            "CURSOR_X" => Self::CursorX,
+            "CURSOR_Y" => Self::CursorY,
             other => {
                 let n: u8 = other.strip_prefix("AUDIO_BAND_")?.parse().ok()?;
                 if (n as usize) < BAND_COUNT {
@@ -653,6 +676,7 @@ impl SignalSource {
             Self::MediaPlaying | Self::MediaProgress => SignalKind::MEDIA,
             Self::CpuUsage | Self::RamUsage | Self::GpuUsage => SignalKind::TELEMETRY,
             Self::Battery => SignalKind::POWER,
+            Self::CursorX | Self::CursorY => SignalKind::MOUSE,
         }
     }
 }
@@ -681,6 +705,9 @@ pub struct SignalSnapshot {
 
     /// Cursor global (pixels físicos do desktop virtual).
     pub cursor: (i32, i32),
+    /// Cursor normalizado (-1..=1) sobre o monitor que o contém (preenchido pelo loop nativo,
+    /// que conhece as saídas). Centro = 0.
+    pub cursor_norm: [f32; 2],
     /// Movimento bruto acumulado neste frame (mickeys).
     pub mouse_delta: (i32, i32),
     /// Velocidade suavizada 0..=1.
@@ -693,6 +720,8 @@ pub struct SignalSnapshot {
     pub typing_energy: f32,
     /// Segundos desde a última entrada global.
     pub idle_s: f32,
+    /// Toque no fundo do desktop neste quadro (pixels físicos do desktop virtual).
+    pub desktop_tap: Option<(i32, i32)>,
 
     pub media_has_session: bool,
     pub media_playing: bool,
@@ -731,6 +760,7 @@ impl Default for SignalSnapshot {
             beat_now: false,
             bpm: 0.0,
             cursor: (0, 0),
+            cursor_norm: [0.0, 0.0],
             mouse_delta: (0, 0),
             mouse_energy: 0.0,
             wheel: 0,
@@ -739,6 +769,7 @@ impl Default for SignalSnapshot {
             key_pulse: 0.0,
             typing_energy: 0.0,
             idle_s: 0.0,
+            desktop_tap: None,
             media_has_session: false,
             media_playing: false,
             media_position_s: 0.0,
@@ -790,6 +821,8 @@ impl SignalSnapshot {
             SignalSource::RamUsage => pct(self.ram_percent),
             SignalSource::GpuUsage => pct(self.gpu_percent),
             SignalSource::Battery => pct(self.battery_percent),
+            SignalSource::CursorX => self.cursor_norm[0].clamp(-1.0, 1.0),
+            SignalSource::CursorY => self.cursor_norm[1].clamp(-1.0, 1.0),
         }
     }
 
@@ -810,6 +843,7 @@ impl SignalSnapshot {
 pub struct SignalReader {
     last_update: Option<Instant>,
     last_beat_count: Option<u32>,
+    last_tap_seq: Option<u32>,
     key_pulse: f32,
     typing_energy: f32,
     beat: f32,
@@ -830,6 +864,7 @@ impl SignalReader {
         Self {
             last_update: None,
             last_beat_count: None,
+            last_tap_seq: None,
             key_pulse: 0.0,
             typing_energy: 0.0,
             beat: 0.0,
@@ -899,6 +934,17 @@ impl SignalReader {
         snap.typing_energy = self.typing_energy;
         let last_input = bus.last_input_ms.load(Ordering::Relaxed);
         snap.idle_s = now_ms.saturating_sub(last_input) as f32 / 1000.0;
+
+        // Toque no desktop (1º update só sincroniza a sequência: toque antigo não dispara).
+        let tap_seq = bus.tap_seq.load(Ordering::Acquire);
+        snap.desktop_tap = match self.last_tap_seq {
+            Some(prev) if prev != tap_seq => {
+                let packed = bus.tap_pos.load(Ordering::Relaxed);
+                Some(((packed >> 32) as u32 as i32, packed as u32 as i32))
+            }
+            _ => None,
+        };
+        self.last_tap_seq = Some(tap_seq);
 
         // Mídia (posição extrapolada entre eventos do SMTC).
         let m = bus.media_scalars();
@@ -1034,6 +1080,21 @@ mod tests {
         reader.update(&bus, Instant::now(), &mut snap);
         assert_eq!(snap.mouse_delta, (0, 0));
         assert!(snap.dirty.is_empty());
+    }
+
+    #[test]
+    fn desktop_tap_roundtrip() {
+        let bus = SignalBus::new();
+        let mut reader = SignalReader::new();
+        let mut snap = SignalSnapshot::default();
+        reader.update(&bus, Instant::now(), &mut snap);
+        assert_eq!(snap.desktop_tap, None);
+        bus.publish_desktop_tap(-1920, 1079);
+        reader.update(&bus, Instant::now(), &mut snap);
+        assert_eq!(snap.desktop_tap, Some((-1920, 1079)));
+        assert!(snap.dirty.contains(SignalKind::DESKTOP_TAP));
+        reader.update(&bus, Instant::now(), &mut snap);
+        assert_eq!(snap.desktop_tap, None);
     }
 
     #[test]

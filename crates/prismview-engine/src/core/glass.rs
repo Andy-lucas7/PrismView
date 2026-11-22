@@ -1162,6 +1162,8 @@ pub struct GlassRenderer {
     groups: HashMap<GroupKey, wgpu::BindGroup>,
     groups_epoch: u32,
     stats: GlassStats,
+    /// `false` (modo Eco): sem pirâmide de blur; o vidro refrata o backdrop nítido.
+    blur_enabled: bool,
 }
 
 impl GlassRenderer {
@@ -1271,6 +1273,7 @@ impl GlassRenderer {
             groups: HashMap::new(),
             groups_epoch: 0,
             stats: GlassStats::default(),
+            blur_enabled: true,
         }
     }
 
@@ -1284,6 +1287,18 @@ impl GlassRenderer {
         self.blur.release();
         self.glyphs.entries.clear();
         self.groups.clear();
+    }
+
+    /// Liga/desliga a pirâmide de blur (PowerGovernor). `true` se mudou (refazer o quadro).
+    pub fn set_blur_enabled(&mut self, enabled: bool) -> bool {
+        if self.blur_enabled == enabled {
+            return false;
+        }
+        self.blur_enabled = enabled;
+        if !enabled {
+            self.blur.release();
+        }
+        true
     }
 
     /// Invalida resultados de blur de um backdrop que foi trocado/liberado.
@@ -1409,7 +1424,7 @@ impl GlassRenderer {
 
             // Blur (px de tela → px da fonte).
             let mut blur_handle = None;
-            if draw.params.blur_px > MIN_BLUR_PX {
+            if self.blur_enabled && draw.params.blur_px > MIN_BLUR_PX {
                 let token = if draw.backdrop.live { frame_token } else { 0 };
                 blur_handle = self.blur.blur(
                     device,

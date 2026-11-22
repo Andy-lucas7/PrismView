@@ -397,6 +397,26 @@ fn chunk4(v: &[f32]) -> Vec<[f32; 4]> {
 
 // ───────────────────────── Malhas ─────────────────────────
 
+/// `mesh.extras.targetNames` (convenção do Blender/three.js). Vazio se ausente ou inválido.
+fn morph_target_names(mesh: &gltf::Mesh) -> Vec<String> {
+    let Some(raw) = mesh.extras().as_ref() else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw.get()) else {
+        return Vec::new();
+    };
+    value
+        .get("targetNames")
+        .and_then(serde_json::Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .map(|n| n.as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn convert_mesh(
     mesh: &gltf::Mesh,
     buffers: &[Vec<u8>],
@@ -407,6 +427,7 @@ fn convert_mesh(
         name: mesh.name().map(str::to_owned),
         primitives: Vec::with_capacity(mesh.primitives().len()),
         weights: mesh.weights().map(<[f32]>::to_vec).unwrap_or_default(),
+        target_names: morph_target_names(mesh),
     };
     let label = mesh.name().unwrap_or("<sem nome>").to_owned();
     for prim in mesh.primitives() {

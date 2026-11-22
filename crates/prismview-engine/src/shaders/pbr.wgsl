@@ -44,6 +44,7 @@ struct Frame {
 struct Draw {
     model: mat4x4<f32>,
     normal: mat4x4<f32>, // inversa-transposta (3×3 útil)
+    glow: vec4<f32>,     // x = brilho emissivo extra (bindings EMISSIVE_GLOW)
 };
 @group(1) @binding(0) var<storage, read> draws: array<Draw>;
 
@@ -79,6 +80,7 @@ struct VsOut {
     @location(3) uv0: vec2<f32>,
     @location(4) uv1: vec2<f32>,
     @location(5) color: vec4<f32>,
+    @location(6) @interpolate(flat) glow: f32,
 };
 
 @vertex
@@ -95,6 +97,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.uv0 = in.uv0;
     out.uv1 = in.uv1;
     out.color = in.color;
+    out.glow = d.glow.x;
     return out;
 }
 
@@ -290,6 +293,14 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         emissive = emissive * emi_tex.rgb;
     }
     color = color + emissive;
+
+    // Brilho reativo: tom do emissivo do material (normalizado) ou, sem emissivo, da cor base.
+    if in.glow > 0.0 {
+        let e = material.emissive.rgb;
+        let peak = max(e.r, max(e.g, e.b));
+        let tint = select(material.base_color.rgb, e / max(peak, 1e-4), peak > 0.0);
+        color = color + tint * in.glow;
+    }
 
     // Sem NaN/Inf no alvo HDR (um pixel inválido contaminaria o resolve do MSAA).
     color = clamp(select(color, vec3<f32>(0.0), color != color), vec3<f32>(0.0), vec3<f32>(6.0e4));

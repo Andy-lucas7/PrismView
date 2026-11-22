@@ -392,6 +392,39 @@ pub struct ModelRig {
     pub animations: Vec<AnimationClip>,
     /// AABB do modelo inteiro (pose de repouso, espaço do modelo).
     pub bounds: Aabb,
+    /// Nomes para resolver alvos de bindings (Fase 4) — só lidos no carregamento da cena.
+    pub node_names: Vec<Option<String>>,
+    pub mesh_names: Vec<Option<String>>,
+    /// Índice = material do `GpuModel` (o último, padrão, não tem nome).
+    pub material_names: Vec<Option<String>>,
+    /// `mesh.extras.targetNames` por malha (vazio se o arquivo não nomeia os morph targets).
+    pub morph_names: Vec<Vec<String>>,
+}
+
+impl ModelRig {
+    /// Nó por nome (glTF `node.name`). `None` se não existir.
+    pub fn node_by_name(&self, name: &str) -> Option<u32> {
+        self.node_names
+            .iter()
+            .position(|n| n.as_deref() == Some(name))
+            .and_then(|i| u32::try_from(i).ok())
+    }
+
+    /// Nome do nó ou da malha do nó bate com `name` (como `matchesMeshTarget` do Estúdio, que
+    /// compara o nome do objeto Three — o nó — e o da malha).
+    pub fn node_matches(&self, node: u32, name: &str) -> bool {
+        let n = node as usize;
+        if self.node_names.get(n).and_then(Option::as_deref) == Some(name) {
+            return true;
+        }
+        self.node_mesh
+            .get(n)
+            .copied()
+            .flatten()
+            .and_then(|m| self.mesh_names.get(m as usize))
+            .and_then(Option::as_deref)
+            == Some(name)
+    }
 }
 
 fn buffer_or_dummy(device: &wgpu::Device, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -591,6 +624,10 @@ impl GpuModel {
                 skins: asset.skins.clone(),
                 animations: asset.animations.clone(),
                 bounds: asset.bounds,
+                node_names: asset.nodes.iter().map(|n| n.name.clone()).collect(),
+                mesh_names: asset.meshes.iter().map(|m| m.name.clone()).collect(),
+                material_names: asset.materials.iter().map(|m| m.name.clone()).collect(),
+                morph_names: asset.meshes.iter().map(|m| m.target_names.clone()).collect(),
             },
         }
     }

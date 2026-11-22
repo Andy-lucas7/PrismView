@@ -1,3 +1,4 @@
+import { evaluateFxTemplate } from "../engine/fx/fxEngine";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
 export type PackageType = "WALLPAPER" | "WIDGET";
@@ -13,7 +14,8 @@ export type LayerKind =
 export type Scene3DEnvPreset = "STUDIO_DARK" | "CITY_NIGHT" | "SUNSET" | "DAYLIGHT";
 export type Scene3DShowcaseVariant = "MONOLITH" | "GYROSCOPE" | "KINETIC_SLAB";
 export type Scene3DObjectKind = "GLB" | "SHOWCASE";
-export type Scene3DBackgroundMode = "TRANSPARENT" | "SOLID";
+/** TRANSPARENT (default) = alpha 0 behind the models; SOLID = backgroundColor; ENVIRONMENT = envPreset/HDRI as backdrop */
+export type Scene3DBackgroundMode = "TRANSPARENT" | "SOLID" | "ENVIRONMENT";
 export type Scene3DBindingSource =
   | "CURSOR_LOOK"
   | "HOVER_MESH"
@@ -40,7 +42,9 @@ export type Scene3DAxis = "X" | "Y" | "Z";
 export type Scene3DFpsMode = "CAP" | "MONITOR";
 
 /** Current Scene3DConfig schema; bump + extend normalizeScene3DConfig() when the shape changes */
-export const SCENE3D_SCHEMA_VERSION = 2;
+export const SCENE3D_SCHEMA_VERSION = 3;
+/** Pre-v3 default spin (rad/s); migrated to 0 because v3 models are static unless the user opts in */
+const LEGACY_DEFAULT_AUTO_ROTATE = 0.22;
 export const SCENE3D_FPS_MIN = 5;
 export const SCENE3D_FPS_MAX = 200;
 export const SCENE3D_FPS_STEP = 5;
@@ -119,16 +123,37 @@ export interface Scene3DObject {
     loop: boolean;
   };
   dynamicTextures?: Scene3DDynamicTexture[];
+  /** Hierarchy: id of another object in the same room (absent = root); transform is local to the parent */
+  parentId?: string;
+}
+
+export interface Scene3DCamera {
+  fov: number;
+  /** Camera position = target + spherical(distance, azimuthDeg, elevationDeg) */
+  distance: number;
+  azimuthDeg: number;
+  elevationDeg: number;
+  /** @deprecated use `target[1]`; kept in sync by normalizeScene3DConfig() */
+  targetY: number;
+  /** Orbit target (Sala 3D free camera); always filled by normalizeScene3DConfig() */
+  target?: [number, number, number];
+  /** Cursor parallax in degrees */
+  orbitParallaxX: number;
+  orbitParallaxY: number;
+  damping: number;
 }
 
 export interface Scene3DConfig {
   /** Absent on projects saved before schema 2; filled by normalizeScene3DConfig() */
   schemaVersion?: number;
-  modelSrc: string;
+  objects: Scene3DObject[];
+  backgroundMode: Scene3DBackgroundMode;
+  /** Used when backgroundMode === "SOLID" */
+  backgroundColor: string;
+  /** @deprecated schema ≤2 single model; migrated into objects[0] and never saved again */
+  modelSrc?: string;
+  /** @deprecated schema ≤2; migrated into objects[0].showcaseVariant */
   showcaseVariant?: Scene3DShowcaseVariant;
-  objects?: Scene3DObject[];
-  backgroundMode?: Scene3DBackgroundMode;
-  backgroundColor?: string;
   envPreset: Scene3DEnvPreset;
   envIntensity: number;
   exposure: number;
@@ -136,30 +161,20 @@ export interface Scene3DConfig {
   /** FPS ceiling, 5–200 in steps of 5 (see clampScene3DFps). Ignored when fpsMode === "MONITOR". */
   maxFps: number;
   fpsMode?: Scene3DFpsMode;
-  autoRotateSpeed: number;
-  modelScale: number;
-  modelOffsetY: number;
+  /** @deprecated schema ≤2; migrated into objects[0].autoRotateSpeed (0.22 → 0) */
+  autoRotateSpeed?: number;
+  /** @deprecated schema ≤2; migrated into objects[0].scale */
+  modelScale?: number;
+  /** @deprecated schema ≤2; migrated into objects[0].position[1] */
+  modelOffsetY?: number;
   autoDayNight?: boolean;
   /** Optional 0..24 override for previewing solar cycle in Studio; null/undefined = real system clock */
   dayNightHourOverride?: number | null;
-  camera: {
-    fov: number;
-    distance: number;
-    azimuthDeg: number;
-    elevationDeg: number;
-    targetY: number;
-    /** Orbit target captured from the Sala 3D free camera; absent = [0, targetY, 0] */
-    target?: [number, number, number];
-    orbitParallaxX: number;
-    orbitParallaxY: number;
-    damping: number;
-  };
-  playback: {
-    clipName: string;
-    speed: number;
-    loop: boolean;
-  };
+  camera: Scene3DCamera;
+  /** @deprecated schema ≤2; migrated into objects[0].playback */
+  playback?: Scene3DObject["playback"];
   bindings?: ReactiveBinding3D[];
+  /** @deprecated schema ≤2; migrated into objects[0].dynamicTextures */
   dynamicTextures?: Scene3DDynamicTexture[];
 }
 
@@ -195,7 +210,17 @@ export interface Scene3DInspectInfo {
   error?: string | null;
   byObject?: Record<string, Scene3DObjectInspectInfo>;
 }
-export type ClickAction = "NONE" | "MEDIA_PLAY_PAUSE" | "MEDIA_NEXT" | "MEDIA_PREV";
+export type ClickAction =
+  | "NONE"
+  | "MEDIA_PLAY_PAUSE"
+  | "MEDIA_NEXT"
+  | "MEDIA_PREV"
+  // Executadas pelo motor nativo (toque no desktop): URL, app, variáveis globais.
+  | "OPEN_URL"
+  | "OPEN_APP"
+  | "TOGGLE_GLOBAL"
+  | "SET_GLOBAL"
+  | "NEXT_GLOBAL_LIST";
 export type BlendModeCss =
   | "normal"
   | "screen"
@@ -250,6 +275,14 @@ export interface SceneLayer {
   parallaxX: number; // -1.5..1.5
   parallaxY: number; // -1.5..1.5
   clickAction?: ClickAction;
+  /** OPEN_URL */
+  clickUrl?: string;
+  /** OPEN_APP (caminho do executável/arquivo) */
+  clickTarget?: string;
+  clickLabel?: string;
+  /** TOGGLE_GLOBAL / SET_GLOBAL / NEXT_GLOBAL_LIST */
+  clickGlobal?: string;
+  clickValue?: string;
   video?: {
     src: string;
     speed: number;
@@ -270,6 +303,10 @@ export interface SceneLayer {
     color: string;
     colorAlpha?: number;
     strokeWidth: number;
+    /** Preenchidos só ao aplicar no motor nativo (`withNativeAssets`): markup do ícone embutido. */
+    resolvedSvg?: string;
+    /** Ícone alternativo (Play/Pause: "pause" enquanto a mídia toca). */
+    resolvedSvgAlt?: string;
   };
   text?: {
     content: string;
@@ -356,6 +393,8 @@ export interface RuntimeState {
   locked_widget_ids: string[];
   monitors?: MonitorInfoDto[];
   monitor_wallpapers?: Record<string, string>;
+  /** Migração automática de wallpaper legado (WebView) falhou; precisa reaplicar no motor nativo. */
+  legacy_migration_notice?: string | null;
 }
 
 export interface PickedFileDto {
@@ -706,7 +745,7 @@ export function createScene3DObject(
     rotation: opts?.rotation ?? [0, 0, 0],
     scale: opts?.scale ?? [1, 1, 1],
     visible: true,
-    autoRotateSpeed: opts?.autoRotateSpeed ?? (kind === "GLB" ? 0 : 0.22),
+    autoRotateSpeed: opts?.autoRotateSpeed ?? 0,
     playback: {
       clipName: "",
       speed: 1,
@@ -716,33 +755,143 @@ export function createScene3DObject(
   };
 }
 
+/** v2→v3: the old 0.22 rad/s default spin becomes 0; any other user value is kept */
+function migrateLegacySpin(speed: unknown): number {
+  const n = finiteOr(speed, 0);
+  return Math.abs(n - LEGACY_DEFAULT_AUTO_ROTATE) < 1e-6 ? 0 : n;
+}
+
+function finiteTriple(v: unknown, fallback: [number, number, number]): [number, number, number] {
+  if (!Array.isArray(v) || v.length !== 3) return fallback;
+  return [finiteOr(v[0], fallback[0]), finiteOr(v[1], fallback[1]), finiteOr(v[2], fallback[2])];
+}
+
+function sameTriple(a: unknown, b: [number, number, number]): boolean {
+  return Array.isArray(a) && a.length === 3 && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+}
+
+/** Fills missing/invalid fields of one room object; returns the same reference when already valid */
+function normalizeScene3DObject(raw: Scene3DObject, index: number, migrateSpin: boolean): Scene3DObject {
+  const kind: Scene3DObjectKind = raw.kind === "SHOWCASE" ? "SHOWCASE" : "GLB";
+  const modelSrc = typeof raw.modelSrc === "string" ? raw.modelSrc : "";
+  const variant = raw.showcaseVariant ?? "MONOLITH";
+  const position = finiteTriple(raw.position, [0, 0, 0]);
+  const rotation = finiteTriple(raw.rotation, [0, 0, 0]);
+  const scale = finiteTriple(raw.scale, [1, 1, 1]);
+  const spin = migrateSpin ? migrateLegacySpin(raw.autoRotateSpeed) : finiteOr(raw.autoRotateSpeed, 0);
+  const pb = raw.playback;
+  const playbackOk =
+    !!pb && typeof pb.clipName === "string" && Number.isFinite(pb.speed) && typeof pb.loop === "boolean";
+  const id = typeof raw.id === "string" && raw.id ? raw.id : `obj-${index}`;
+  const name =
+    typeof raw.name === "string" && raw.name
+      ? raw.name
+      : kind === "GLB" && modelSrc
+      ? fileBaseName(modelSrc)
+      : defaultShowcaseLabel(variant);
+  const parentOk = raw.parentId === undefined || (typeof raw.parentId === "string" && raw.parentId !== id);
+  if (
+    raw.kind === kind &&
+    raw.modelSrc === modelSrc &&
+    raw.id === id &&
+    raw.name === name &&
+    sameTriple(raw.position, position) &&
+    sameTriple(raw.rotation, rotation) &&
+    sameTriple(raw.scale, scale) &&
+    typeof raw.visible === "boolean" &&
+    raw.autoRotateSpeed === spin &&
+    playbackOk &&
+    Array.isArray(raw.dynamicTextures) &&
+    parentOk &&
+    (kind === "SHOWCASE" ? raw.showcaseVariant === variant : raw.showcaseVariant === undefined)
+  ) {
+    return raw;
+  }
+  const out: Scene3DObject = {
+    ...raw,
+    id,
+    name,
+    kind,
+    modelSrc,
+    showcaseVariant: kind === "SHOWCASE" ? variant : undefined,
+    position,
+    rotation,
+    scale,
+    visible: typeof raw.visible === "boolean" ? raw.visible : true,
+    autoRotateSpeed: spin,
+    playback: playbackOk
+      ? pb
+      : {
+          clipName: typeof pb?.clipName === "string" ? pb.clipName : "",
+          speed: finiteOr(pb?.speed, 1),
+          loop: typeof pb?.loop === "boolean" ? pb.loop : true,
+        },
+    dynamicTextures: Array.isArray(raw.dynamicTextures) ? raw.dynamicTextures : [],
+  };
+  if (!out.showcaseVariant) delete out.showcaseVariant;
+  if (!parentOk) delete out.parentId;
+  return out;
+}
+
+/** Legacy (schema ≤2) single-model fields → objects[0] */
+function legacyPrimaryObject(cfg: Scene3DConfig): Scene3DObject {
+  const src = (cfg.modelSrc ?? "").trim();
+  const hasModel = Boolean(src);
+  const variant = cfg.showcaseVariant ?? "MONOLITH";
+  const rawScale = finiteOr(cfg.modelScale, 1);
+  const sc = rawScale > 0 ? rawScale : 1;
+  const obj = createScene3DObject(hasModel ? "GLB" : "SHOWCASE", {
+    id: "obj-primary",
+    modelSrc: src,
+    showcaseVariant: variant,
+    position: [0, finiteOr(cfg.modelOffsetY, 0), 0],
+    scale: [sc, sc, sc],
+    autoRotateSpeed: migrateLegacySpin(cfg.autoRotateSpeed),
+    dynamicTextures: Array.isArray(cfg.dynamicTextures) ? cfg.dynamicTextures : [],
+  });
+  if (cfg.playback) {
+    obj.playback = {
+      clipName: typeof cfg.playback.clipName === "string" ? cfg.playback.clipName : "",
+      speed: finiteOr(cfg.playback.speed, 1),
+      loop: typeof cfg.playback.loop === "boolean" ? cfg.playback.loop : true,
+    };
+  }
+  return obj;
+}
+
+/** Room objects of a config (legacy single-model configs yield one synthetic primary object) */
 export function normalizeScene3DObjects(cfg: Scene3DConfig): Scene3DObject[] {
   if (Array.isArray(cfg.objects) && cfg.objects.length > 0) {
     return cfg.objects;
   }
-  const hasModel = Boolean(cfg.modelSrc?.trim());
-  const variant = cfg.showcaseVariant ?? "MONOLITH";
-  const sc = Number.isFinite(cfg.modelScale) && cfg.modelScale > 0 ? cfg.modelScale : 1;
-  return [
-    {
-      id: "obj-primary",
-      name: hasModel ? fileBaseName(cfg.modelSrc) : defaultShowcaseLabel(variant),
-      kind: hasModel ? "GLB" : "SHOWCASE",
-      modelSrc: cfg.modelSrc ?? "",
-      showcaseVariant: hasModel ? undefined : variant,
-      position: [0, Number.isFinite(cfg.modelOffsetY) ? cfg.modelOffsetY : 0, 0],
-      rotation: [0, 0, 0],
-      scale: [sc, sc, sc],
-      visible: true,
-      autoRotateSpeed: Number.isFinite(cfg.autoRotateSpeed)
-        ? cfg.autoRotateSpeed
-        : hasModel
-        ? 0
-        : 0.22,
-      playback: cfg.playback ?? { clipName: "", speed: 1, loop: true },
-      dynamicTextures: cfg.dynamicTextures ?? [],
-    },
-  ];
+  return [legacyPrimaryObject(cfg)];
+}
+
+const LEGACY_SCENE3D_KEYS = [
+  "modelSrc",
+  "showcaseVariant",
+  "autoRotateSpeed",
+  "modelScale",
+  "modelOffsetY",
+  "playback",
+  "dynamicTextures",
+] as const;
+
+function hasLegacyScene3DKeys(cfg: Scene3DConfig): boolean {
+  for (const k of LEGACY_SCENE3D_KEYS) {
+    if (cfg[k] !== undefined) return true;
+  }
+  return false;
+}
+
+function stripLegacyScene3DKeys(cfg: Scene3DConfig): Scene3DConfig {
+  const out = { ...cfg };
+  for (const k of LEGACY_SCENE3D_KEYS) delete out[k];
+  return out;
+}
+
+function isBackgroundMode(v: unknown): v is Scene3DBackgroundMode {
+  return v === "TRANSPARENT" || v === "SOLID" || v === "ENVIRONMENT";
 }
 
 export function defaultScene3D(
@@ -754,11 +903,9 @@ export function defaultScene3D(
     id: "obj-primary",
     modelSrc,
     showcaseVariant,
-    autoRotateSpeed: hasExternalModel ? 0 : 0.22,
+    autoRotateSpeed: 0,
   });
   return {
-    modelSrc,
-    showcaseVariant,
     objects: [primary],
     backgroundMode: "TRANSPARENT",
     backgroundColor: "#07080b",
@@ -767,23 +914,16 @@ export function defaultScene3D(
     exposure: 1.08,
     renderScale: 0.85,
     maxFps: 60,
-    autoRotateSpeed: hasExternalModel ? 0 : 0.22,
-    modelScale: 1,
-    modelOffsetY: 0,
     camera: {
       fov: 42,
       distance: 4.8,
       azimuthDeg: hasExternalModel ? 0 : 22,
       elevationDeg: hasExternalModel ? 8 : 14,
       targetY: 0,
+      target: [0, 0, 0],
       orbitParallaxX: 12,
       orbitParallaxY: 7,
       damping: 0.08,
-    },
-    playback: {
-      clipName: "",
-      speed: 1,
-      loop: true,
     },
     bindings: [
       {
@@ -828,29 +968,52 @@ export function normalizeScene3DConfig(raw: Scene3DConfig | undefined | null): S
   if (!raw || typeof raw !== "object") return base;
   const fps = clampScene3DFps(raw.maxFps);
   const fpsMode: Scene3DFpsMode = raw.fpsMode === "MONITOR" ? "MONITOR" : "CAP";
+  const isCurrent = raw.schemaVersion === SCENE3D_SCHEMA_VERSION;
+  const hasObjects = Array.isArray(raw.objects) && raw.objects.length > 0;
   if (
-    raw.schemaVersion === SCENE3D_SCHEMA_VERSION &&
+    isCurrent &&
     raw.maxFps === fps &&
     raw.fpsMode === fpsMode &&
-    Array.isArray(raw.objects) &&
-    raw.objects.length > 0 &&
-    raw.camera
+    hasObjects &&
+    isBackgroundMode(raw.backgroundMode) &&
+    typeof raw.backgroundColor === "string" &&
+    raw.camera &&
+    Array.isArray(raw.camera.target) &&
+    raw.camera.targetY === raw.camera.target[1] &&
+    !hasLegacyScene3DKeys(raw) &&
+    raw.objects.every(
+      (o, i) =>
+        normalizeScene3DObject(o, i, false) === o &&
+        (o.parentId === undefined || raw.objects.some((p) => p.id === o.parentId))
+    )
   ) {
     return raw;
   }
+  // Pre-v3 projects: legacy single-model fields → objects[0], old 0.22 spin → 0, transparent backdrop
+  const migrating = !isCurrent;
+  const rawObjects = hasObjects ? raw.objects : [legacyPrimaryObject(raw)];
+  const objects = rawObjects.map((o, i) => normalizeScene3DObject(o, i, migrating));
+  const linkedObjects = objects.map((o) => {
+    if (o.parentId === undefined || objects.some((p) => p.id === o.parentId)) return o;
+    const orphan = { ...o };
+    delete orphan.parentId;
+    return orphan;
+  });
   const cam = { ...base.camera, ...(raw.camera ?? {}) };
-  // `objects: raw.objects` keeps legacy single-modelSrc projects from inheriting the default sculpture
-  const objects = normalizeScene3DObjects({ ...base, ...raw, objects: raw.objects });
+  const targetY = finiteOr(cam.targetY, 0);
+  const target = Array.isArray(cam.target)
+    ? finiteTriple(cam.target, [0, targetY, 0])
+    : ([0, targetY, 0] as [number, number, number]);
   return {
-    ...base,
-    ...raw,
+    ...stripLegacyScene3DKeys({ ...base, ...raw }),
     schemaVersion: SCENE3D_SCHEMA_VERSION,
-    objects,
-    modelSrc: objects[0]?.modelSrc ?? raw.modelSrc ?? "",
+    objects: linkedObjects,
+    backgroundMode: migrating || !isBackgroundMode(raw.backgroundMode) ? "TRANSPARENT" : raw.backgroundMode,
+    backgroundColor: typeof raw.backgroundColor === "string" ? raw.backgroundColor : base.backgroundColor,
     maxFps: fps,
     fpsMode,
     renderScale: Math.max(0.5, Math.min(1, finiteOr(raw.renderScale, base.renderScale))),
-    camera: cam,
+    camera: { ...cam, target, targetY: target[1] },
     bindings: Array.isArray(raw.bindings) ? raw.bindings : base.bindings,
   };
 }
@@ -883,7 +1046,7 @@ export function setScene3DObjectTransform(
 ): Scene3DConfig {
   const objs = normalizeScene3DObjects(cfg);
   const nextObjs = objs.map((o) => (o.id === objectId ? { ...o, position, rotation, scale } : o));
-  return { ...cfg, objects: nextObjs, modelSrc: nextObjs[0]?.modelSrc ?? cfg.modelSrc };
+  return { ...cfg, objects: nextObjs };
 }
 
 export function duplicateScene3DObject(
@@ -901,7 +1064,7 @@ export function duplicateScene3DObject(
     position: [Number(((src.position?.[0] ?? 0) + 0.8).toFixed(2)), src.position?.[1] ?? 0, src.position?.[2] ?? 0],
   };
   const nextObjs = [...objs, clone];
-  return { config: { ...cfg, objects: nextObjs, modelSrc: nextObjs[0]?.modelSrc ?? "" }, newId };
+  return { config: { ...cfg, objects: nextObjs }, newId };
 }
 
 /** Removes an object (a room always keeps at least one) and its bindings */
@@ -912,8 +1075,13 @@ export function removeScene3DObject(cfg: Scene3DConfig, objectId: string): Scene
   if (nextObjs.length === objs.length) return cfg;
   return {
     ...cfg,
-    objects: nextObjs,
-    modelSrc: nextObjs[0]?.modelSrc ?? "",
+    // Children of the removed object become roots
+    objects: nextObjs.map((o) => {
+      if (o.parentId !== objectId) return o;
+      const root = { ...o };
+      delete root.parentId;
+      return root;
+    }),
     bindings: (cfg.bindings ?? []).filter((b) => b.objectId !== objectId),
   };
 }
@@ -1077,7 +1245,6 @@ export function createSolarAtelier3DProject(id = "preset-solar-atelier-3d"): Pri
     envPreset: "SUNSET",
     envIntensity: 1.35,
     exposure: 1.12,
-    autoRotateSpeed: 0.28,
     objects: [
       createScene3DObject("SHOWCASE", {
         id: "obj-primary",
@@ -1093,6 +1260,7 @@ export function createSolarAtelier3DProject(id = "preset-solar-atelier-3d"): Pri
       azimuthDeg: 18,
       elevationDeg: 18,
       targetY: 0,
+      target: [0, 0, 0],
       orbitParallaxX: 16,
       orbitParallaxY: 9,
       damping: 0.08,
@@ -1182,7 +1350,6 @@ export function createPulseReactive3DProject(id = "preset-pulse-reactive-3d"): P
     envPreset: "CITY_NIGHT",
     envIntensity: 1.3,
     exposure: 1.1,
-    autoRotateSpeed: 0.12,
     objects: [
       createScene3DObject("SHOWCASE", {
         id: "obj-primary",
@@ -1197,6 +1364,7 @@ export function createPulseReactive3DProject(id = "preset-pulse-reactive-3d"): P
       azimuthDeg: 14,
       elevationDeg: 10,
       targetY: 0,
+      target: [0, 0, 0],
       orbitParallaxX: 15,
       orbitParallaxY: 8,
       damping: 0.08,
@@ -1247,7 +1415,6 @@ export function createPulseReactive3DProject(id = "preset-pulse-reactive-3d"): P
         smoothing: 0.2,
       },
     ],
-    dynamicTextures: [coverTex],
   };
 
   const trackTitle = createLayer("TEXT", "Faixa & Hora");
@@ -1659,6 +1826,44 @@ export function createDefaultProjects(): PrismProject[] {
   ];
 }
 
+/** Markup do ícone embutido com a espessura de traço da camada (mesma regra do compositor). */
+export function builtinSvgMarkup(iconName: string, strokeWidth: number): string {
+  const sw = Math.max(0.6, Math.min(4.5, strokeWidth || 1.6));
+  return (BUILTIN_SVG_ICONS[iconName] || BUILTIN_SVG_ICONS.prism).replace(
+    /stroke-width="[^"]*"/g,
+    `stroke-width="${sw}"`
+  );
+}
+
+/**
+ * Cópia do projeto para o motor nativo: ícones embutidos (só existem no TS) viram markup em
+ * `svg.resolvedSvg` (+ `resolvedSvgAlt` = "pause" no botão Play/Pause, que alterna pelo estado
+ * da mídia). O conversor Rust (`native_scene.rs`) rasteriza esse markup no motor.
+ */
+export function withNativeAssets(project: PrismProject): PrismProject {
+  const mapLayer = (layer: SceneLayer): SceneLayer => {
+    let next = layer;
+    if (layer.kind === "SVG" && layer.svg && !layer.svg.customSvg.trim()) {
+      const isToggle =
+        layer.clickAction === "MEDIA_PLAY_PAUSE" &&
+        (layer.svg.iconName === "play" || layer.svg.iconName === "pause");
+      next = {
+        ...layer,
+        svg: {
+          ...layer.svg,
+          resolvedSvg: builtinSvgMarkup(isToggle ? "play" : layer.svg.iconName, layer.svg.strokeWidth),
+          resolvedSvgAlt: isToggle ? builtinSvgMarkup("pause", layer.svg.strokeWidth) : undefined,
+        },
+      };
+    }
+    if (layer.children?.length) {
+      next = { ...next, children: layer.children.map(mapLayer) };
+    }
+    return next;
+  };
+  return { ...project, layers: project.layers.map(mapLayer) };
+}
+
 export function computeLiveMediaProgress(
   media: LiveTelemetry["media"],
   nowMs: number
@@ -1672,13 +1877,10 @@ export function computeLiveMediaProgress(
   return { positionSecs: pos, durationSecs: dur, ratio };
 }
 
-function formatDurationMMSS(secs: number): string {
-  const total = Math.max(0, Math.floor(secs));
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
+/**
+ * Avalia `$...$` via parser de passada única (`engine/fx/fxEngine.ts`, espelho de
+ * `crates/prism-core/src/fx.rs`).
+ */
 export function evaluateFormula(
   template: string,
   telemetry: LiveTelemetry,
@@ -1688,133 +1890,5 @@ export function evaluateFormula(
   if (!template.includes("$")) return template;
   const gMap: Record<string, string> = {};
   for (const g of globals) gMap[g.name.toLowerCase()] = g.value;
-
-  const h24 = now.getHours();
-  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
-  const HH = String(h24).padStart(2, "0");
-  const hh = String(h12).padStart(2, "0");
-  const mm = String(now.getMinutes()).padStart(2, "0");
-  const ss = String(now.getSeconds()).padStart(2, "0");
-  const days = ["DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SÁB"];
-  const months = ["JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"];
-
-  const evalInner = (raw: string): string => {
-    const s = raw.trim();
-    const dfM = s.match(/^df\(([^)]+)\)$/i);
-    if (dfM) {
-      return dfM[1]
-        .replace(/HH/g, HH)
-        .replace(/hh/g, hh)
-        .replace(/mm/g, mm)
-        .replace(/ss/g, ss)
-        .replace(/EEE/g, days[now.getDay()])
-        .replace(/dd/g, String(now.getDate()).padStart(2, "0"))
-        .replace(/MMM/g, months[now.getMonth()]);
-    }
-    const gvM = s.match(/^gv\(([^)]+)\)$/i);
-    if (gvM) {
-      const k = gvM[1].trim().replace(/^["']|["']$/g, "").toLowerCase();
-      return gMap[k] ?? "";
-    }
-    const sysM = s.match(/^(?:sys|bi|si)\(([^)]+)\)$/i);
-    if (sysM) {
-      const k = sysM[1].trim().toLowerCase();
-      if (k === "cpu") return String(Math.round(telemetry.cpu_percent));
-      if (k === "ram" || k === "mem") return String(Math.round(telemetry.ram_percent));
-      if (k === "ram_gb") return telemetry.ram_used_gb.toFixed(1);
-      if (k === "level" || k === "bat") return String(telemetry.battery_percent);
-      if (k === "host") return telemetry.hostname;
-      return "0";
-    }
-    const miM = s.match(/^mi\(([^)]+)\)$/i);
-    if (miM) {
-      const k = miM[1].trim().toLowerCase();
-      if (k === "title") return telemetry.media.title || "Sem mídia";
-      if (k === "artist") return telemetry.media.artist || "";
-      if (k === "album") return telemetry.media.album || "";
-      if (k === "state") return telemetry.media.playing ? "PLAYING" : "PAUSED";
-      if (k === "cover") return telemetry.media.cover_path || "";
-      if (k === "pos" || k === "dur" || k === "pct") {
-        const prog = computeLiveMediaProgress(telemetry.media, now.getTime());
-        if (k === "pos") return formatDurationMMSS(prog.positionSecs);
-        if (k === "dur") return formatDurationMMSS(prog.durationSecs);
-        return String(Math.round(prog.ratio * 100));
-      }
-      return "";
-    }
-    const tcM = s.match(/^tc\(\s*(up|low)\s*,\s*(.+)\)$/i);
-    if (tcM) {
-      const v = evalInner(tcM[2]);
-      return tcM[1].toLowerCase() === "up" ? v.toUpperCase() : v.toLowerCase();
-    }
-    if (/^if\(/i.test(s) && s.endsWith(")")) {
-      const innerBody = s.slice(3, -1);
-      // Split top-level arguments respecting nested parentheses and quoted strings
-      const args: string[] = [];
-      let depth = 0;
-      let quote: string | null = null;
-      let cur = "";
-      for (let i = 0; i < innerBody.length; i++) {
-        const ch = innerBody[i];
-        if (quote) {
-          cur += ch;
-          if (ch === quote) quote = null;
-          continue;
-        }
-        if (ch === "'" || ch === '"') {
-          quote = ch;
-          cur += ch;
-        } else if (ch === "(") {
-          depth++;
-          cur += ch;
-        } else if (ch === ")") {
-          depth = Math.max(0, depth - 1);
-          cur += ch;
-        } else if (ch === "," && depth === 0 && args.length < 2) {
-          args.push(cur.trim());
-          cur = "";
-        } else {
-          cur += ch;
-        }
-      }
-      args.push(cur.trim());
-
-      if (args.length === 3) {
-        const stripQuotes = (v: string) => v.trim().replace(/^["']|["']$/g, "");
-        const cond = args[0];
-        const trueBranch = () => stripQuotes(evalInner(args[1]));
-        const falseBranch = () => stripQuotes(evalInner(args[2]));
-        const opMatch = cond.match(/^(.+?)\s*(!=|>=|<=|=|>|<)\s*(.+)$/);
-        if (opMatch) {
-          const lhsRaw = stripQuotes(evalInner(opMatch[1]));
-          const op = opMatch[2];
-          const rhsRaw = stripQuotes(evalInner(opMatch[3]));
-          const lhsNum = Number(lhsRaw);
-          const rhsNum = Number(rhsRaw);
-          const bothNum =
-            lhsRaw !== "" && rhsRaw !== "" && Number.isFinite(lhsNum) && Number.isFinite(rhsNum);
-          let ok = false;
-          if (op === "=") {
-            ok = bothNum ? lhsNum === rhsNum : lhsRaw.toLowerCase() === rhsRaw.toLowerCase();
-          } else if (op === "!=") {
-            ok = bothNum ? lhsNum !== rhsNum : lhsRaw.toLowerCase() !== rhsRaw.toLowerCase();
-          } else if (op === ">") {
-            ok = bothNum ? lhsNum > rhsNum : lhsRaw > rhsRaw;
-          } else if (op === "<") {
-            ok = bothNum ? lhsNum < rhsNum : lhsRaw < rhsRaw;
-          } else if (op === ">=") {
-            ok = bothNum ? lhsNum >= rhsNum : lhsRaw >= rhsRaw;
-          } else if (op === "<=") {
-            ok = bothNum ? lhsNum <= rhsNum : lhsRaw <= rhsRaw;
-          }
-          return ok ? trueBranch() : falseBranch();
-        }
-        const truthy = stripQuotes(evalInner(cond)).toLowerCase();
-        return truthy && truthy !== "0" && truthy !== "false" ? trueBranch() : falseBranch();
-      }
-    }
-    return s;
-  };
-
-  return template.replace(/\$([^$]+)\$/g, (_, inner: string) => evalInner(inner));
+  return evaluateFxTemplate(template, { now, telemetry, globals: gMap });
 }
