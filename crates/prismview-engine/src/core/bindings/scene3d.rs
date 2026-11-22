@@ -270,15 +270,16 @@ impl BindingSolver3d {
         if self.resolved {
             return;
         }
-        let first_loaded = (0..access.object_count()).find(|&i| access.instance(i).is_some());
         for b in &mut self.bindings {
             b.res = Resolved::default();
-            let object = b
+            // `bindingOwnerId` do Estúdio: `objectId` existente → esse objeto; vazio/desconhecido →
+            // `objects[0]`. Dono ainda sem modelo = binding sem alvo até o próximo `invalidate`.
+            let owner = b
                 .object_id
                 .as_deref()
                 .and_then(|id| access.object_index(id))
-                .filter(|&i| access.instance(i).is_some())
-                .or(first_loaded);
+                .or_else(|| (access.object_count() > 0).then_some(0));
+            let object = owner.filter(|&i| access.instance(i).is_some());
             b.res.object = object;
             let Some(inst) = object.and_then(|i| access.instance(i)) else {
                 continue;

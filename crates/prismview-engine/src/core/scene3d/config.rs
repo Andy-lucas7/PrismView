@@ -5,7 +5,9 @@
 //! `effective_objects` exatamente como `normalizeScene3DConfig` do TS (`obj-primary`, giro 0,22→0).
 //!
 //! Todos os campos têm `default` (projetos antigos/editados à mão não derrubam o parse). `bindings`
-//! e `dynamicTextures` ficam como JSON bruto até a Fase 4 (SignalBus/BindingSolver).
+//! (`ReactiveBinding3D`: `objectId`, `targetType` incl. `NODE_ROTATE_SWING`/`NODE_MOVE_OFFSET`,
+//! `axis`, `strength`, `smoothing`, `invertAxis`) e `dynamicTextures` ficam como JSON bruto e são
+//! interpretados por `bindings::scene3d::BindingSolver3d::set_specs` (binding inválido = ignorado).
 
 use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};

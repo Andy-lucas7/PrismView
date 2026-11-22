@@ -1277,7 +1277,11 @@ mod tests {
                     "fx": { "opacity": "$gv(show)$" } })),
                 layer("room", "SCENE_3D", json!({ "width": 1920, "height": 1080,
                     "scene3d": { "modelSrc": "http://asset.localhost/D%3A%5Cm.glb", "envPreset": "SUNSET",
-                                 "schemaVersion": 2, "modelScale": 2, "autoRotateSpeed": 0.22 } }))
+                                 "schemaVersion": 2, "modelScale": 2, "autoRotateSpeed": 0.22,
+                                 "bindings": [{ "id": "sw", "enabled": true, "objectId": "obj-primary",
+                                    "source": "AUDIO_BASS", "sourceNode": "*", "targetType": "NODE_ROTATE_SWING",
+                                    "targetName": "Jaw", "strength": 30, "smoothing": 0.2, "axis": "X",
+                                    "invertAxis": true }] } }))
             ]
         });
         let scene = project_to_scene(&project).expect("convertível");
@@ -1298,6 +1302,12 @@ mod tests {
         assert_eq!(s3d["objects"][0]["modelSrc"], "D:\m.glb");
         assert_eq!(s3d["objects"][0]["scale"][1], 2.0);
         assert_eq!(s3d["objects"][0]["autoRotateSpeed"], 0.0);
+        let swing = &s3d["bindings"][0];
+        assert_eq!(swing["targetType"], "NODE_ROTATE_SWING");
+        assert_eq!(swing["objectId"], "obj-primary");
+        assert_eq!(swing["axis"], "X");
+        assert_eq!(swing["invertAxis"], true);
+        assert_eq!(swing["strength"], 30);
         let b = &scene["bindings"][0];
         assert_eq!(b["source"], "CURSOR_X");
         assert_eq!(b["layerId"], "clock");
