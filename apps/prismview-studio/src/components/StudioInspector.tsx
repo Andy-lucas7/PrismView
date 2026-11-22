@@ -22,12 +22,14 @@ import {
   createLayer,
   createScene3DObject,
   defaultScene3D,
+  duplicateScene3DObject,
   GLASS_STYLE_PRESETS,
   GlobalVar,
   LayerKind,
   normalizeScene3DObjects,
   PrismProject,
   ReactiveBinding3D,
+  removeScene3DObject,
   Scene3DAxis,
   Scene3DBackgroundMode,
   Scene3DBindingSource,
@@ -1240,11 +1242,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   patch3d((c) => {
                     const cur = normalizeScene3DObjects(c);
                     const nextObjs = fn(cur);
-                    return {
-                      ...c,
-                      modelSrc: nextObjs[0]?.modelSrc ?? "",
-                      objects: nextObjs,
-                    };
+                    return { ...c, objects: nextObjs };
                   }, commit);
                 const patchActiveObj = (
                   fn: (o: Scene3DObject) => Scene3DObject,
@@ -1291,7 +1289,6 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   s3d.renderScale <= 0.72 && !fpsFollowsMonitor && fpsValue <= 30;
                 const bgMode: Scene3DBackgroundMode = s3d.backgroundMode ?? "TRANSPARENT";
                 const activeDynTex = activeObj.dynamicTextures ?? [];
-                const activeUniformScale = Number((activeObj.scale?.[0] ?? 1).toFixed(2));
 
                 return (
                   <div className="space-y-3">
@@ -1317,7 +1314,6 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                               const nextObj = createScene3DObject("SHOWCASE", {
                                 showcaseVariant: "MONOLITH",
                                 position: [Number((objs.length * 1.6).toFixed(2)), 0, 0],
-                                autoRotateSpeed: 0.22,
                               });
                               patchObjects((list) => [...list, nextObj], "discrete");
                               onSelect3dObjectId?.(nextObj.id);
@@ -1382,19 +1378,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   title="Duplicar objeto 3D"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    const cloneId = `obj3d-${Math.random().toString(36).slice(2, 9)}`;
-                                    const clone: Scene3DObject = {
-                                      ...JSON.parse(JSON.stringify(obj)),
-                                      id: cloneId,
-                                      name: `${obj.name} (Cópia)`,
-                                      position: [
-                                        Number(((obj.position?.[0] ?? 0) + 0.8).toFixed(2)),
-                                        obj.position?.[1] ?? 0,
-                                        obj.position?.[2] ?? 0,
-                                      ],
-                                    };
-                                    patchObjects((list) => [...list, clone], "discrete");
-                                    onSelect3dObjectId?.(cloneId);
+                                    let cloneId: string | null = null;
+                                    patch3d((c) => {
+                                      const res = duplicateScene3DObject(c, obj.id);
+                                      cloneId = res.newId;
+                                      return res.config;
+                                    }, "discrete");
+                                    if (cloneId) onSelect3dObjectId?.(cloneId);
                                   }}
                                   className="p-1 rounded hover:bg-white/10"
                                 >
@@ -1407,19 +1397,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                     onClick={(e) => {
                                       e.stopPropagation();
                                       const remaining = objs.filter((item) => item.id !== obj.id);
-                                      patch3d((c) => {
-                                        const nextObjs = normalizeScene3DObjects(c).filter(
-                                          (item) => item.id !== obj.id
-                                        );
-                                        return {
-                                          ...c,
-                                          modelSrc: nextObjs[0]?.modelSrc ?? "",
-                                          objects: nextObjs,
-                                          bindings: (c.bindings ?? []).filter(
-                                            (b) => b.objectId !== obj.id
-                                          ),
-                                        };
-                                      }, "discrete");
+                                      patch3d((c) => removeScene3DObject(c, obj.id), "discrete");
                                       if (selected3dObjectId === obj.id && remaining[0]) {
                                         onSelect3dObjectId?.(remaining[0].id);
                                       }
@@ -1562,104 +1540,33 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       <span className="block text-[11px] font-medium text-[#A1A1AA]">
                         Posição & Giro ({activeObj.name})
                       </span>
-                      <InspectorSlider
-                        label="Posição X"
-                        value={activeObj.position?.[0] ?? 0}
-                        min={-8}
-                        max={8}
+                      <Vec3Field
+                        key={`pos-${activeObj.id}`}
+                        label="Posição"
+                        value={activeObj.position}
                         step={0.05}
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            position: [v, o.position?.[1] ?? 0, o.position?.[2] ?? 0],
-                          }))
-                        }
+                        onCommit={(v) => patchActiveObj((o) => ({ ...o, position: v }))}
+                        onRecordStep={onRecordStep}
+                        onFlushSave={onFlushSave}
                       />
-                      <InspectorSlider
-                        label="Posição Y"
-                        value={activeObj.position?.[1] ?? 0}
-                        min={-4}
-                        max={4}
-                        step={0.05}
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            position: [o.position?.[0] ?? 0, v, o.position?.[2] ?? 0],
-                          }))
-                        }
+                      <Vec3Field
+                        key={`rot-${activeObj.id}`}
+                        label="Rotação (°)"
+                        value={activeObj.rotation}
+                        step={1}
+                        onCommit={(v) => patchActiveObj((o) => ({ ...o, rotation: v }))}
+                        onRecordStep={onRecordStep}
+                        onFlushSave={onFlushSave}
                       />
-                      <InspectorSlider
-                        label="Posição Z"
-                        value={activeObj.position?.[2] ?? 0}
-                        min={-8}
-                        max={8}
-                        step={0.05}
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            position: [o.position?.[0] ?? 0, o.position?.[1] ?? 0, v],
-                          }))
-                        }
-                      />
-                      <InspectorSlider
-                        label="Rotação X"
-                        value={activeObj.rotation?.[0] ?? 0}
-                        min={-180}
-                        max={180}
-                        step={2}
-                        unit="°"
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            rotation: [v, o.rotation?.[1] ?? 0, o.rotation?.[2] ?? 0],
-                          }))
-                        }
-                      />
-                      <InspectorSlider
-                        label="Rotação Y"
-                        value={activeObj.rotation?.[1] ?? 0}
-                        min={-180}
-                        max={180}
-                        step={2}
-                        unit="°"
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            rotation: [o.rotation?.[0] ?? 0, v, o.rotation?.[2] ?? 0],
-                          }))
-                        }
-                      />
-                      <InspectorSlider
-                        label="Rotação Z"
-                        value={activeObj.rotation?.[2] ?? 0}
-                        min={-180}
-                        max={180}
-                        step={2}
-                        unit="°"
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({
-                            ...o,
-                            rotation: [o.rotation?.[0] ?? 0, o.rotation?.[1] ?? 0, v],
-                          }))
-                        }
-                      />
-                      <InspectorSlider
+                      <Vec3Field
+                        key={`scl-${activeObj.id}`}
                         label="Escala"
-                        value={activeUniformScale}
-                        min={0.1}
-                        max={4}
+                        value={activeObj.scale}
                         step={0.05}
-                        unit="×"
-                        {...sliderHandlers}
-                        onChange={(v) =>
-                          patchActiveObj((o) => ({ ...o, scale: [v, v, v] }))
-                        }
+                        min={0.01}
+                        onCommit={(v) => patchActiveObj((o) => ({ ...o, scale: v }))}
+                        onRecordStep={onRecordStep}
+                        onFlushSave={onFlushSave}
                       />
                       <InspectorSlider
                         label="Rotação Automática"
@@ -1740,7 +1647,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       <span className="block text-[11px] font-medium text-[#A1A1AA]">
                         Fundo da Sala & Iluminação (IBL)
                       </span>
-                      <div className="grid grid-cols-2 gap-1.5">
+                      <div className="grid grid-cols-3 gap-1.5">
                         <button
                           type="button"
                           onClick={() =>
@@ -1762,6 +1669,17 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           }`}
                         >
                           Cor Sólida
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            patch3d((c) => ({ ...c, backgroundMode: "ENVIRONMENT" }), "discrete")
+                          }
+                          className={`py-1.5 rounded-xl text-[11px] ${
+                            bgMode === "ENVIRONMENT" ? "prism-pill-active" : "prism-pill-idle"
+                          }`}
+                        >
+                          Ambiente
                         </button>
                       </div>
                       {bgMode === "SOLID" && (
@@ -3409,6 +3327,84 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
         ? renderGlobalsTab()
         : renderLayerTab()}
     </aside>
+  );
+};
+
+interface Vec3FieldProps {
+  label: string;
+  value: [number, number, number] | undefined;
+  step: number;
+  min?: number;
+  onCommit: (v: [number, number, number]) => void;
+  onRecordStep: () => void;
+  onFlushSave?: () => void;
+}
+
+/** Numeric X/Y/Z entry: commits on blur/Enter (one undo step), reverts invalid text */
+const Vec3Field: React.FC<Vec3FieldProps> = ({
+  label,
+  value,
+  step,
+  min,
+  onCommit,
+  onRecordStep,
+  onFlushSave,
+}) => {
+  const cur: [number, number, number] = [value?.[0] ?? 0, value?.[1] ?? 0, value?.[2] ?? 0];
+  const [drafts, setDrafts] = useState<[string | null, string | null, string | null]>([
+    null,
+    null,
+    null,
+  ]);
+  const setDraft = (i: number, v: string | null) =>
+    setDrafts((d) => {
+      const n: [string | null, string | null, string | null] = [d[0], d[1], d[2]];
+      n[i] = v;
+      return n;
+    });
+  const commit = (i: number) => {
+    const raw = drafts[i];
+    setDraft(i, null);
+    if (raw === null) return;
+    const parsed = Number(raw.replace(",", "."));
+    if (raw.trim() === "" || !Number.isFinite(parsed)) return;
+    const next = min !== undefined ? Math.max(min, parsed) : parsed;
+    const rounded = Number(next.toFixed(3));
+    if (rounded === cur[i]) return;
+    const out: [number, number, number] = [cur[0], cur[1], cur[2]];
+    out[i] = rounded;
+    onRecordStep();
+    onCommit(out);
+    onFlushSave?.();
+  };
+  const axes = ["X", "Y", "Z"] as const;
+  return (
+    <div className="space-y-1">
+      <span className="block text-xs text-[#A1A1AA]">{label}</span>
+      <div className="grid grid-cols-3 gap-1.5">
+        {axes.map((ax, i) => (
+          <label
+            key={ax}
+            className="flex items-center gap-1 bg-black border border-white/15 rounded-lg px-1.5 py-1 focus-within:border-white/50"
+          >
+            <span className="text-[10px] font-mono-fx text-[#A1A1AA]">{ax}</span>
+            <input
+              type="number"
+              step={step}
+              min={min}
+              value={drafts[i] ?? String(Number(cur[i].toFixed(3)))}
+              onChange={(e) => setDraft(i, e.target.value)}
+              onBlur={() => commit(i)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                else if (e.key === "Escape") setDraft(i, null);
+              }}
+              className="w-full min-w-0 bg-transparent text-[11px] font-mono-fx text-white outline-none"
+            />
+          </label>
+        ))}
+      </div>
+    </div>
   );
 };
 

@@ -1,9 +1,9 @@
-E1-L4 OK (gate ts: 0 erros novos). Só `Scene3DLayer.tsx` mudou; `prism.ts` já tinha `objectId?` (E1-L1).
-- Novo `ResolvedBindingTarget {rt,node,mats}` + `bindingOwnerId(objs, objectId)` (objectId existente, senão `objects[0]`). Não cai em outro objeto: dono ainda carregando ⇒ binding ignorado.
-- `ensureBindingCache(eng,cfg)` (render + clique): listas por cfg/thumb e alvos resolvidos (`cachedSignalTargets`/`cachedCursorTargets`, paralelos às listas) só quando muda `eng.targetsRev`. `resolveTargetRuntime` e os `nodesByName.get` por quadro foram removidos.
-- `eng.targetsRev++` em `clearRuntimeModel` (se tinha índice) e nas 3 atribuições de `modelIndex` (procedural, glb, erro→procedural).
-- `applyScalarTarget(b, target, ...)` usa node/mats resolvidos; PLAY_CLIP já usava o mixer/override do próprio `rt`.
-- Hover/clique: exigem `hoveredObjectId`/`hit.objectId === target.rt.id`, inclusive sem `objectId` (antes um `sourceNode` vazio disparava em qualquer objeto). `performRaycastAt` já devolve `{object, objectId}`.
-- Texturas dinâmicas: loads em voo deduplicados por `cacheKey` (`pendingLoads`), aplicados a cada `rt` ainda vivo; antes 2 objetos com a mesma URL vazavam 1 textura. Restaurar `baseMap` antes de trocar/descartar já existia.
-- Testar em máquina: 2 GLB, bindings HOVER_MESH/CLICK_MESH com `sourceNode` vazio em cada um ⇒ só o objeto sob o cursor reage; mesma capa em 2 objetos ⇒ 1 textura no HUD.
-- Pendente (outros lotes): `parentId` no runtime; motor nativo (Rust) não lê `objectId`.
+E1-L5 OK (gate ts: 0 erros novos). Só `StudioInspector.tsx` mudou; o resto da UI de objetos (lista, +.glb via `pick_local_file`, undo) já existia de lotes anteriores.
+- Novo `Vec3Field` (inputs numéricos X/Y/Z, commit em blur/Enter, `onRecordStep`+`onCommit`+`onFlushSave`) substitui os 7 sliders de posição/rotação/escala; escala agora por eixo (min 0.01).
+- Duplicar/remover objeto no outliner usam `duplicateScene3DObject`/`removeScene3DObject` (religa filhos a raiz, apaga bindings do objeto).
+- `patchObjects` não grava mais o campo legado `cfg.modelSrc`.
+- Fundo: 3 botões TRANSPARENT/SOLID/ENVIRONMENT (antes faltava ENVIRONMENT) + cor para SOLID.
+- "+ Escultura" nasce com `autoRotateSpeed` 0 (era 0.22).
+- Não revogamos `blob:` ao excluir objeto (quebraria undo; só existe no fallback sem Tauri; limpeza geral em `blobUrlsRef`).
+- Resíduo: `tools/autorun/_splice_l5.mjs` (script não usado, pode apagar).
+- Pendente: `parentId` no runtime/outliner (UI sem hierarquia); motor Rust não lê `objectId`.
