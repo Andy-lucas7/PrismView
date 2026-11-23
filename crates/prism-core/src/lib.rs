@@ -1,6 +1,7 @@
 pub mod fx;
 pub mod package;
 pub mod schema;
+pub mod vstem;
 
 pub mod stem_stretch {
     use crate::schema::StemStretchParams;
