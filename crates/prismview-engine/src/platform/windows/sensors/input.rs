@@ -47,7 +47,7 @@ const CLASS_NAME: PCWSTR = w!("PrismEngineRawInputSink");
 /// Demanda mudou: re-sincronizar registros.
 pub(super) const WM_INPUT_DEMAND: u32 = WM_APP + 0x51;
 
-const CURSOR_POLL: Duration = Duration::from_millis(4);
+const CURSOR_POLL: Duration = Duration::from_millis(12);
 /// Toque = soltar a até `TAP_SLOP_PX` de onde desceu, em até `TAP_MAX` (senão é arrasto/seleção).
 const TAP_SLOP_PX: i32 = 6;
 const TAP_MAX: Duration = Duration::from_millis(600);
@@ -274,10 +274,14 @@ fn handle_mouse(state: &InputState, raw: &[u8]) {
     let button_data = rd_u16(raw, m + 6) as i16;
     let dx = rd_i32(raw, m + 12);
     let dy = rd_i32(raw, m + 16);
+    let is_abs = flags & MOUSE_MOVE_ABSOLUTE != 0;
+    if !is_abs && dx == 0 && dy == 0 && button_flags == 0 {
+        return;
+    }
 
     let now = Instant::now();
     let cursor_delta = poll_cursor(state, now, false);
-    if flags & MOUSE_MOVE_ABSOLUTE != 0 {
+    if is_abs {
         if let Some((cx, cy)) = cursor_delta {
             bus.add_mouse_delta(cx, cy);
         }

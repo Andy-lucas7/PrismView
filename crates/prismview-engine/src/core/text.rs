@@ -12,22 +12,30 @@
 //! texto couber nela (cresce em passos; encolhe só se sobrar 4× de área).
 //!
 //! Fontes: `register_font_dir/file/data` carregam as fontes do projeto (`%APPDATA%\PrismView\fonts`,
-//! pacotes `.prism`). O banco começa **vazio** (RAM mínima); as fontes do sistema só são
-//! carregadas, uma vez, se um `font_id` não for achado entre as fontes do projeto.
+//! pacotes `.prism`). O banco começa **vazio** (RAM mínima); fontes do sistema são carregadas
+//! **sob demanda e apenas para a família pedida** via `FontResolver` injetado pela plataforma
+//! (ex.: lookup pontual no Registro do Windows), sem nunca varrer `C:\Windows\Fonts`.
 //!
-//! Limitações atuais (cosmic-text 0.12): sem `letter_spacing_em` nem eixos de fonte variável
-//! (`axes`); o `weight` escolhe a face mais próxima. Glifos coloridos (emoji) saem como máscara.
+//! Limitações atuais (cosmic-text 0.12): sem eixos de fonte variável (`axes`); `(weight,
+//! stretch, style)` são ajustados para a face real mais próxima da família para que fontes
+//! condensadas (ex.: `Impact`) ou pesos intermediários (ex.: `500`) nunca sejam rejeitados pelo
+//! matcher estrito do cosmic-text 0.12. `letter_spacing_em` é aplicado por glifo (paridade 1:1
+//! com CSS `letter-spacing` e `glassLens.ts`). Glifos coloridos (emoji) saem como máscara.
 //!
-//! Regras: sem `unwrap/expect`; nenhum código de SO (caminhos de fontes vêm do chamador).
+//! Regras: sem `unwrap/expect`; nenhum código de SO (resolução de caminhos vem do chamador).
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use cosmic_text::{
     fontdb, Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
     Wrap,
 };
 use glyphon::{Cache, ColorMode, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
+
+/// Callback de plataforma que resolve apenas os arquivos de fonte (`.ttf/.otf/.ttc/.otc`) de uma
+/// família específica, sem carregar todas as fontes do sistema operacional.
+pub type FontResolver = Box<dyn Fn(&str) -> Vec<PathBuf> + Send>;
 
 /// Formato das texturas dos slots. Sem sRGB: o pipeline inteiro trabalha na codificação da tela.
 pub const TEXT_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -55,9 +63,13 @@ pub struct TextSpec<'a> {
     pub font_id: &'a str,
     pub size_px: f32,
     pub weight: u16,
-    /// Espaço extra entre linhas, como fração do tamanho (0 = entrelinha padrão de 1.2×).
+    /// Espaço extra entre linhas, como fração do tamanho (0 = entrelinha padrão 1.06× do Estúdio).
     pub line_spacing: f32,
+    /// Espaçamento entre letras em `em` (paridade 1:1 com CSS `letter-spacing`).
+    pub letter_spacing_em: f32,
     pub align: TextAlignment,
+    /// Largura máxima em px físicos (0 = largura automática sem quebra de linha).
+    pub max_width_px: f32,
 }
 
 /// Resultado do layout de um slot.
@@ -99,7 +111,9 @@ struct TextKey {
     size_bits: u32,
     weight: u16,
     spacing_bits: u32,
+    letter_spacing_bits: u32,
     align: TextAlignment,
+    max_width_bits: u32,
 }
 
 impl TextKey {
@@ -107,7 +121,9 @@ impl TextKey {
         self.size_bits == spec.size_px.to_bits()
             && self.weight == spec.weight
             && self.spacing_bits == spec.line_spacing.to_bits()
+            && self.letter_spacing_bits == spec.letter_spacing_em.to_bits()
             && self.align == spec.align
+            && self.max_width_bits == spec.max_width_px.to_bits()
             && self.text == spec.text
             && self.font_id == spec.font_id
     }
@@ -120,7 +136,9 @@ impl TextKey {
         self.size_bits = spec.size_px.to_bits();
         self.weight = spec.weight;
         self.spacing_bits = spec.line_spacing.to_bits();
+        self.letter_spacing_bits = spec.letter_spacing_em.to_bits();
         self.align = spec.align;
+        self.max_width_bits = spec.max_width_px.to_bits();
     }
 }
 
@@ -133,6 +151,8 @@ struct SlotTexture {
 
 struct TextSlot {
     buffer: Buffer,
+    /// Preenchido apenas quando `|letter_spacing_em| >= 0.001`: `(buffer_glifo, x, y)`.
+    spaced_glyphs: Vec<(Buffer, f32, f32)>,
     key: TextKey,
     font_gen: u64,
     valid: bool,
@@ -159,7 +179,14 @@ pub struct TextSystem {
     aliases: HashMap<String, String>,
     /// Incrementa quando o banco de fontes muda: todo slot refaz o shaping.
     font_generation: u64,
-    system_fonts_loaded: bool,
+    /// Resolução pontual de fontes do SO (injetada pela plataforma).
+    resolver: Option<FontResolver>,
+    /// Famílias normalizadas já consultadas no `resolver`.
+    resolved_queries: HashSet<String>,
+    /// Caminhos já carregados no banco (evita duplicar faces).
+    loaded_files: HashSet<String>,
+    /// Fallback sans-serif leve (`Segoe UI` / `Arial`) já inicializado.
+    fallback_loaded: bool,
     slots: HashMap<String, TextSlot>,
     serial: u64,
     max_texture_dim: u32,
@@ -184,7 +211,10 @@ impl TextSystem {
             families: HashMap::new(),
             aliases: HashMap::new(),
             font_generation: 0,
-            system_fonts_loaded: false,
+            resolver: None,
+            resolved_queries: HashSet::new(),
+            loaded_files: HashSet::new(),
+            fallback_loaded: false,
             slots: HashMap::new(),
             serial: 0,
             max_texture_dim: device.limits().max_texture_dimension_2d,
@@ -193,15 +223,45 @@ impl TextSystem {
 
     // ── Fontes ──
 
+    /// Instala o resolvedor pontual da plataforma (ex.: consulta ao Registro do Windows).
+    pub fn set_font_resolver(&mut self, resolver: FontResolver) {
+        self.resolver = Some(resolver);
+        self.resolved_queries.clear();
+        self.fallback_loaded = false;
+        self.fonts_changed();
+    }
+
     /// Carrega todas as fontes (`.ttf/.otf/.ttc`) de `dir`, recursivamente.
     pub fn register_font_dir(&mut self, dir: &Path) {
         self.font_system.db_mut().load_fonts_dir(dir);
+        for face in self.font_system.db().faces() {
+            if let fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) = &face.source {
+                self.loaded_files.insert(p.to_string_lossy().to_ascii_lowercase());
+            }
+        }
         self.fonts_changed();
+    }
+
+    fn load_font_file_dedup(&mut self, path: &Path) -> bool {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if self.loaded_files.contains(&key) {
+            return false;
+        }
+        if self.font_system.db_mut().load_font_file(path).is_ok() {
+            self.loaded_files.insert(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Carrega uma fonte de arquivo. `false` se não foi possível ler.
     pub fn register_font_file(&mut self, path: &Path) -> bool {
-        let ok = self.font_system.db_mut().load_font_file(path).is_ok();
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if self.loaded_files.contains(&key) {
+            return true;
+        }
+        let ok = self.load_font_file_dedup(path);
         if ok {
             self.fonts_changed();
         }
@@ -219,7 +279,7 @@ impl TextSystem {
     /// com o nome interno do arquivo. `false` se o arquivo não pôde ser lido.
     pub fn register_font_alias(&mut self, font_id: &str, path: &Path) -> bool {
         let mut family = self.family_of_file(path);
-        if family.is_none() && self.font_system.db_mut().load_font_file(path).is_ok() {
+        if family.is_none() && self.load_font_file_dedup(path) {
             family = self.family_of_file(path);
         }
         let Some(family) = family else {
@@ -233,13 +293,14 @@ impl TextSystem {
     }
 
     fn family_of_file(&self, path: &Path) -> Option<String> {
+        let wanted = path.to_string_lossy();
         self.font_system.db().faces().find_map(|face| {
             let src = match &face.source {
                 fontdb::Source::File(p) => p.as_path(),
                 fontdb::Source::SharedFile(p, _) => p.as_path(),
                 _ => return None,
             };
-            if src == path {
+            if src == path || src.to_string_lossy().eq_ignore_ascii_case(&wanted) {
                 face.families.first().map(|(name, _)| name.clone())
             } else {
                 None
@@ -252,9 +313,51 @@ impl TextSystem {
         self.font_generation += 1;
     }
 
+    /// Garante 1 família sans-serif leve (ex.: `Segoe UI` sem Emoji/Symbol) como fallback para
+    /// famílias ausentes e separadores (`·`, `•`), sem nunca chamar `db.load_system_fonts()`.
+    fn ensure_fallback_font(&mut self) {
+        if self.fallback_loaded {
+            return;
+        }
+        self.fallback_loaded = true;
+        if let Some(existing) = SANS_FALLBACKS
+            .iter()
+            .find_map(|name| find_family(self.font_system.db(), name))
+        {
+            self.font_system.db_mut().set_sans_serif_family(existing.as_str());
+            return;
+        }
+        let mut paths = Vec::new();
+        if let Some(resolver) = self.resolver.as_ref() {
+            for name in SANS_FALLBACKS {
+                let found = resolver(name);
+                if !found.is_empty() {
+                    paths = found;
+                    break;
+                }
+            }
+        }
+        let mut loaded_any = false;
+        for path in paths {
+            if self.load_font_file_dedup(&path) {
+                loaded_any = true;
+            }
+        }
+        if let Some(sans) = SANS_FALLBACKS
+            .iter()
+            .find_map(|name| find_family(self.font_system.db(), name))
+        {
+            self.font_system.db_mut().set_sans_serif_family(sans.as_str());
+        }
+        if loaded_any {
+            self.fonts_changed();
+        }
+    }
+
     /// Nome de família no banco para `font_id`, ou `None` (sans-serif genérica).
-    /// Busca por nome de família e, se falhar, pelo nome do arquivo (como o motor antigo).
+    /// Busca por alias, no banco local e, se faltar, consulta o `resolver` pontual da plataforma.
     fn resolve_family(&mut self, font_id: &str) -> Option<String> {
+        self.ensure_fallback_font();
         if let Some(hit) = self.families.get(font_id) {
             return hit.clone();
         }
@@ -264,21 +367,41 @@ impl TextSystem {
                 return Some(found);
             }
         }
-        let mut found = find_family(self.font_system.db(), font_id);
-        if found.is_none() && !self.system_fonts_loaded {
-            self.system_fonts_loaded = true;
-            let db = self.font_system.db_mut();
-            db.load_system_fonts();
-            if let Some(sans) = SANS_FALLBACKS
-                .iter()
-                .find(|name| find_family(db, name).is_some())
-            {
-                db.set_sans_serif_family(*sans);
+        let primary = primary_font_name(font_id);
+        if let Some(alias) = self.aliases.get(primary) {
+            if let Some(found) = find_family(self.font_system.db(), alias) {
+                self.families.insert(font_id.to_owned(), Some(found.clone()));
+                return Some(found);
             }
-            // Fallback de glifos/emoji passa a existir: todos os slots refazem o shaping.
-            self.families.clear();
-            self.font_generation += 1;
-            found = find_family(self.font_system.db(), font_id);
+        }
+        let mut found = find_family(self.font_system.db(), primary);
+        if found.is_none() {
+            let needle = normalize(primary);
+            if !needle.is_empty() && self.resolved_queries.insert(needle) {
+                let paths = self
+                    .resolver
+                    .as_ref()
+                    .map(|r| r(primary))
+                    .unwrap_or_default();
+                let mut loaded_any = false;
+                for path in &paths {
+                    if self.load_font_file_dedup(path) {
+                        loaded_any = true;
+                    }
+                }
+                if loaded_any {
+                    self.fonts_changed();
+                }
+                found = find_family(self.font_system.db(), primary)
+                    .or_else(|| paths.iter().find_map(|p| self.family_of_file(p)));
+                // Persiste o alias (sobrevive a `fonts_changed()` quando outra camada carregar outra fonte).
+                if let Some(ref resolved_name) = found {
+                    if normalize(resolved_name) != normalize(primary) {
+                        self.aliases.insert(primary.to_owned(), resolved_name.clone());
+                        self.aliases.insert(font_id.to_owned(), resolved_name.clone());
+                    }
+                }
+            }
         }
         self.families.insert(font_id.to_owned(), found.clone());
         found
@@ -308,6 +431,7 @@ impl TextSystem {
     pub fn clear(&mut self) {
         self.slots.clear();
         self.atlas.trim();
+        self.swash = SwashCache::new();
     }
 
     /// Faz o layout do slot `id` para `spec`. Sem mudança desde a última chamada devolve o layout
@@ -322,6 +446,7 @@ impl TextSystem {
                 id.to_owned(),
                 TextSlot {
                     buffer,
+                    spaced_glyphs: Vec::new(),
                     key: TextKey::default(),
                     font_gen: u64::MAX,
                     valid: false,
@@ -362,40 +487,202 @@ impl TextSystem {
         } else {
             0.0
         };
-        let line_height = (size * (1.2 + spacing)).max(1.0);
+        // Paridade 1:1 com `UnifiedCompositor.tsx` (`lineHeight: 1.06`) e `glassLens.ts`.
+        let line_height = (size * (1.06 + spacing)).max(1.0);
+        let letter_spacing_em = if spec.letter_spacing_em.is_finite() {
+            spec.letter_spacing_em.clamp(-0.5, 2.0)
+        } else {
+            0.0
+        };
+        let letter_spacing_px = letter_spacing_em * size;
+        let use_letter_spacing = letter_spacing_px.abs() >= 0.25;
 
-        let family_ref = match family.as_deref() {
+        let (matched_family, matched_weight, matched_stretch, matched_style) =
+            match_face_attrs(fs.db(), family.as_deref(), spec.weight);
+        let family_ref = match matched_family.as_deref().or(family.as_deref()) {
             Some(name) => Family::Name(name),
             None => Family::SansSerif,
         };
         let attrs = Attrs::new()
             .family(family_ref)
-            .weight(Weight(spec.weight.clamp(1, 1000)))
+            .weight(matched_weight)
+            .stretch(matched_stretch)
+            .style(matched_style)
             .color(Color::rgb(255, 255, 255));
 
-        slot.buffer.set_metrics(fs, Metrics::new(size, line_height));
-        slot.buffer.set_wrap(fs, Wrap::None);
-        slot.buffer.set_size(fs, None, None);
-        slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
-        slot.buffer.shape_until_scroll(fs, false);
+        let wrap_width = if spec.max_width_px.is_finite() && spec.max_width_px >= 1.0 {
+            Some(spec.max_width_px.min(max_dim as f32))
+        } else {
+            None
+        };
 
-        let (width, mut height, lines) = measure(&slot.buffer);
-        if lines == 0 {
-            height = line_height;
-        }
-        if lines > 1 && spec.align != TextAlignment::Start {
-            // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
+        slot.spaced_glyphs.clear();
+        let (width, height) = if use_letter_spacing {
+            let metrics = Metrics::new(size, line_height);
+            let mut per_line: Vec<(f32, Vec<(Buffer, f32)>)> = Vec::new();
+            let mut max_w = wrap_width.unwrap_or(0.0);
+            let mut char_buf = [0u8; 4];
+
+            let measure_str = |fs: &mut FontSystem, text: &str| -> f32 {
+                let mut cursor = 0.0f32;
+                let mut w = 0.0f32;
+                let mut cb = [0u8; 4];
+                for ch in text.chars() {
+                    let s = ch.encode_utf8(&mut cb);
+                    let mut b = Buffer::new(fs, metrics);
+                    b.set_wrap(fs, Wrap::None);
+                    b.set_size(fs, None, None);
+                    b.set_text(fs, s, attrs, Shaping::Advanced);
+                    b.shape_until_scroll(fs, false);
+                    let (mut cw, _, _) = measure(&b);
+                    if cw <= 0.0 && ch.is_whitespace() {
+                        cw = size * 0.28;
+                    }
+                    let x = cursor.max(0.0);
+                    w = w.max(x + cw);
+                    cursor = x + cw + letter_spacing_px;
+                }
+                w
+            };
+
+            let mut wrapped_lines: Vec<String> = Vec::new();
+            if let Some(limit) = wrap_width {
+                for para in spec.text.split('\n') {
+                    if para.is_empty() {
+                        wrapped_lines.push(String::new());
+                        continue;
+                    }
+                    let mut current = String::new();
+                    for word in para.split_inclusive(|c: char| c.is_whitespace()) {
+                        let word_trimmed = word.trim_end();
+                        if current.is_empty() {
+                            if measure_str(fs, word_trimmed) <= limit {
+                                current.push_str(word);
+                            } else {
+                                // Palavra mais larga que a caixa: quebra por caractere.
+                                for ch in word.chars() {
+                                    let mut cand = current.clone();
+                                    cand.push(ch);
+                                    if !current.is_empty() && measure_str(fs, &cand) > limit {
+                                        wrapped_lines.push(current.trim_end().to_string());
+                                        current.clear();
+                                    }
+                                    current.push(ch);
+                                }
+                            }
+                        } else {
+                            let mut cand = current.clone();
+                            cand.push_str(word_trimmed);
+                            if measure_str(fs, &cand) <= limit {
+                                current.push_str(word);
+                            } else {
+                                wrapped_lines.push(current.trim_end().to_string());
+                                current.clear();
+                                if measure_str(fs, word_trimmed) <= limit {
+                                    current.push_str(word);
+                                } else {
+                                    for ch in word.chars() {
+                                        let mut cand2 = current.clone();
+                                        cand2.push(ch);
+                                        if !current.is_empty() && measure_str(fs, &cand2) > limit {
+                                            wrapped_lines.push(current.trim_end().to_string());
+                                            current.clear();
+                                        }
+                                        current.push(ch);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !current.is_empty() {
+                        wrapped_lines.push(current.trim_end().to_string());
+                    }
+                }
+            } else {
+                for line in spec.text.split('\n') {
+                    wrapped_lines.push(line.to_string());
+                }
+            }
+
+            for line in &wrapped_lines {
+                let mut cursor = 0.0f32;
+                let mut line_w = 0.0f32;
+                let mut items = Vec::new();
+                for ch in line.chars() {
+                    let s = ch.encode_utf8(&mut char_buf);
+                    let mut b = Buffer::new(fs, metrics);
+                    b.set_wrap(fs, Wrap::None);
+                    b.set_size(fs, None, None);
+                    b.set_text(fs, s, attrs, Shaping::Advanced);
+                    b.shape_until_scroll(fs, false);
+                    let (mut cw, _, _) = measure(&b);
+                    if cw <= 0.0 && ch.is_whitespace() {
+                        cw = size * 0.28;
+                    }
+                    let x = cursor.max(0.0);
+                    line_w = line_w.max(x + cw);
+                    if !ch.is_whitespace() {
+                        items.push((b, x));
+                    }
+                    cursor = x + cw + letter_spacing_px;
+                }
+                max_w = max_w.max(line_w);
+                per_line.push((line_w, items));
+            }
+            let total_h = (per_line.len().max(1) as f32) * line_height;
+            for (li, (line_w, items)) in per_line.into_iter().enumerate() {
+                let align_dx = match spec.align {
+                    TextAlignment::Start => 0.0,
+                    TextAlignment::Center => (max_w - line_w) * 0.5,
+                    TextAlignment::End => max_w - line_w,
+                };
+                let y = li as f32 * line_height;
+                for (b, x) in items {
+                    slot.spaced_glyphs.push((b, x + align_dx, y));
+                }
+            }
+            (max_w, total_h)
+        } else {
+            slot.buffer.set_metrics(fs, Metrics::new(size, line_height));
             let align = match spec.align {
                 TextAlignment::Start => Align::Left,
                 TextAlignment::Center => Align::Center,
                 TextAlignment::End => Align::Right,
             };
-            slot.buffer.set_size(fs, Some(width.ceil()), None);
-            for line in slot.buffer.lines.iter_mut() {
-                line.set_align(Some(align));
+            if let Some(limit) = wrap_width {
+                slot.buffer.set_wrap(fs, Wrap::WordOrGlyph);
+                slot.buffer.set_size(fs, Some(limit), None);
+                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
+                for line in slot.buffer.lines.iter_mut() {
+                    line.set_align(Some(align));
+                }
+                slot.buffer.shape_until_scroll(fs, false);
+                let (w, mut h, lines) = measure(&slot.buffer);
+                if lines == 0 {
+                    h = line_height;
+                }
+                (limit.max(w), h)
+            } else {
+                slot.buffer.set_wrap(fs, Wrap::None);
+                slot.buffer.set_size(fs, None, None);
+                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
+                slot.buffer.shape_until_scroll(fs, false);
+
+                let (w, mut h, lines) = measure(&slot.buffer);
+                if lines == 0 {
+                    h = line_height;
+                }
+                if lines > 1 && spec.align != TextAlignment::Start {
+                    // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
+                    slot.buffer.set_size(fs, Some(w.ceil()), None);
+                    for line in slot.buffer.lines.iter_mut() {
+                        line.set_align(Some(align));
+                    }
+                    slot.buffer.shape_until_scroll(fs, false);
+                }
+                (w, h)
             }
-            slot.buffer.shape_until_scroll(fs, false);
-        }
+        };
 
         slot.key.store(spec);
         slot.font_gen = font_gen;
@@ -504,31 +791,57 @@ impl TextSystem {
                 },
             );
 
+            let bounds = TextBounds {
+                left: 0,
+                top: 0,
+                right: i32::try_from(tex.cap.0).unwrap_or(i32::MAX),
+                bottom: i32::try_from(tex.cap.1).unwrap_or(i32::MAX),
+            };
             let mut prepared = false;
             for attempt in 0..2 {
-                let area = TextArea {
-                    buffer: &slot.buffer,
-                    left: slot.pad as f32,
-                    top: slot.pad as f32,
-                    scale: 1.0,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: i32::try_from(tex.cap.0).unwrap_or(i32::MAX),
-                        bottom: i32::try_from(tex.cap.1).unwrap_or(i32::MAX),
-                    },
-                    default_color: Color::rgb(255, 255, 255),
-                    custom_glyphs: &[],
+                let result = if slot.spaced_glyphs.is_empty() {
+                    let area = TextArea {
+                        buffer: &slot.buffer,
+                        left: slot.pad as f32,
+                        top: slot.pad as f32,
+                        scale: 1.0,
+                        bounds,
+                        default_color: Color::rgb(255, 255, 255),
+                        custom_glyphs: &[],
+                    };
+                    self.renderer.prepare(
+                        device,
+                        queue,
+                        &mut self.font_system,
+                        &mut self.atlas,
+                        &self.viewport,
+                        [area],
+                        &mut self.swash,
+                    )
+                } else {
+                    let areas: Vec<TextArea<'_>> = slot
+                        .spaced_glyphs
+                        .iter()
+                        .map(|(buf, gx, gy)| TextArea {
+                            buffer: buf,
+                            left: slot.pad as f32 + *gx,
+                            top: slot.pad as f32 + *gy,
+                            scale: 1.0,
+                            bounds,
+                            default_color: Color::rgb(255, 255, 255),
+                            custom_glyphs: &[],
+                        })
+                        .collect();
+                    self.renderer.prepare(
+                        device,
+                        queue,
+                        &mut self.font_system,
+                        &mut self.atlas,
+                        &self.viewport,
+                        areas,
+                        &mut self.swash,
+                    )
                 };
-                let result = self.renderer.prepare(
-                    device,
-                    queue,
-                    &mut self.font_system,
-                    &mut self.atlas,
-                    &self.viewport,
-                    [area],
-                    &mut self.swash,
-                );
                 if result.is_ok() {
                     prepared = true;
                     break;
@@ -566,6 +879,8 @@ impl TextSystem {
         }
         if any {
             self.atlas.trim();
+            // Glifos já rasterizados nas texturas GPU dos slots: solta bitmaps CPU do swash.
+            self.swash = SwashCache::new();
         }
     }
 }
@@ -589,6 +904,16 @@ fn measure(buffer: &Buffer) -> (f32, f32, usize) {
     (width, height, lines)
 }
 
+fn primary_font_name(font_id: &str) -> &str {
+    font_id
+        .split(',')
+        .next()
+        .unwrap_or(font_id)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+}
+
 fn normalize(name: &str) -> String {
     name.trim()
         .chars()
@@ -597,10 +922,154 @@ fn normalize(name: &str) -> String {
         .collect()
 }
 
+fn stretch_rank(stretch: fontdb::Stretch) -> u8 {
+    match stretch {
+        fontdb::Stretch::UltraCondensed => 0,
+        fontdb::Stretch::ExtraCondensed => 1,
+        fontdb::Stretch::Condensed => 2,
+        fontdb::Stretch::SemiCondensed => 3,
+        fontdb::Stretch::Normal => 4,
+        fontdb::Stretch::SemiExpanded => 5,
+        fontdb::Stretch::Expanded => 6,
+        fontdb::Stretch::ExtraExpanded => 7,
+        fontdb::Stretch::UltraExpanded => 8,
+    }
+}
+
+/// Verifica se uma face pertence à família `target_norm`: nome exato, nome com sufixo de
+/// peso/estilo (ex.: `"Outfit Thin"`, `"Segoe UI Semibold"`, `"Arial Black"`), ou stem do arquivo.
+fn face_matches_family(face: &fontdb::FaceInfo, target_norm: &str) -> bool {
+    for (name, _) in &face.families {
+        let norm = normalize(name);
+        if norm == target_norm || stem_matches_family(&norm, target_norm) {
+            return true;
+        }
+    }
+    if let fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) = &face.source {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(normalize)
+            .unwrap_or_default();
+        if stem_matches_family(&stem, target_norm) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ajusta `(family, weight, stretch, style)` para a face real mais próxima presente na família alvo.
+///
+/// O `cosmic-text 0.12` rejeita famílias quando `face.stretch != attrs.stretch` (ex.: `Impact` tem
+/// `Stretch::Condensed`) ou quando nenhuma face da família tem exatamente `font_weight_diff == 0`
+/// (ex.: `weight = 500` em `Segoe UI`), saltando para fontes aleatórias de fallback no banco.
+/// Também resolve subfamílias estáticas cujo `Name ID 1` inclui o peso (ex.: `Outfit Thin` = 300,
+/// `Outfit Bold` = 700, `Segoe UI Semibold` = 600).
+fn match_face_attrs(
+    db: &fontdb::Database,
+    family: Option<&str>,
+    requested_weight: u16,
+) -> (Option<String>, Weight, fontdb::Stretch, fontdb::Style) {
+    let clamped = requested_weight.clamp(1, 1000);
+    let sans = Family::SansSerif;
+    let target = match family {
+        Some(name) => name,
+        None => db.family_name(&sans),
+    };
+    let target_norm = normalize(target);
+    let mut best: Option<((u8, u8, u16, u8, u16), Option<String>, Weight, fontdb::Stretch, fontdb::Style)> = None;
+    for face in db.faces() {
+        let exact = face.families.iter().any(|(n, _)| n == target || normalize(n) == target_norm);
+        if !exact && !face_matches_family(face, &target_norm) {
+            continue;
+        }
+        let style_pen: u8 = match face.style {
+            fontdb::Style::Normal => 0,
+            fontdb::Style::Oblique => 1,
+            fontdb::Style::Italic => 2,
+        };
+        let stretch_pen = (stretch_rank(face.stretch) as i32 - 4).unsigned_abs() as u8;
+        let weight_diff = face.weight.0.abs_diff(clamped);
+        let name_pen: u8 = u8::from(!exact);
+        let weight_tie = if clamped >= 500 {
+            u16::MAX - face.weight.0
+        } else {
+            face.weight.0
+        };
+        let score = (style_pen, stretch_pen, weight_diff, name_pen, weight_tie);
+        if best.as_ref().map_or(true, |(b, _, _, _, _)| score < *b) {
+            let face_family = face
+                .families
+                .iter()
+                .find(|(n, _)| n == target)
+                .or_else(|| face.families.first())
+                .map(|(n, _)| n.clone());
+            best = Some((score, face_family, face.weight, face.stretch, face.style));
+        }
+    }
+    match best {
+        Some((_, fam, w, st, sy)) => (fam, w, st, sy),
+        None => (
+            family.map(str::to_owned),
+            Weight(clamped),
+            fontdb::Stretch::Normal,
+            fontdb::Style::Normal,
+        ),
+    }
+}
+
+fn stem_matches_family(stem: &str, needle: &str) -> bool {
+    if stem == needle {
+        return true;
+    }
+    let Some(rest) = stem.strip_prefix(needle) else {
+        return false;
+    };
+    let trimmed = rest
+        .strip_suffix("italic")
+        .or_else(|| rest.strip_suffix("oblique"))
+        .or_else(|| rest.strip_suffix("roman"))
+        .unwrap_or(rest);
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(weight) = trimmed.parse::<u16>() {
+            if (100..=1000).contains(&weight) {
+                return true;
+            }
+        }
+    }
+    matches!(
+        rest,
+        "regular"
+            | "bold"
+            | "semibold"
+            | "extrabold"
+            | "ultrabold"
+            | "demibold"
+            | "medium"
+            | "light"
+            | "extralight"
+            | "ultralight"
+            | "semilight"
+            | "thin"
+            | "black"
+            | "heavy"
+            | "book"
+            | "normal"
+            | "roman"
+            | "variable"
+            | "vf"
+            | "wght"
+            | "italic"
+            | "bolditalic"
+            | "oblique"
+    )
+}
+
 /// Família real no banco que corresponde a `font_id`: nome exato (ignorando caixa/espaços/`-`/`_`)
-/// e, em seguida, nome do arquivo da fonte contendo o `font_id` (compatível com o motor legado).
+/// e, em seguida, subfamília com sufixo de peso (ex.: `Outfit Thin`/`Outfit Bold`) ou stem do arquivo.
 fn find_family(db: &fontdb::Database, font_id: &str) -> Option<String> {
-    let needle = normalize(font_id);
+    let primary = primary_font_name(font_id);
+    let needle = normalize(primary);
     if needle.is_empty() {
         return None;
     }
@@ -611,21 +1080,94 @@ fn find_family(db: &fontdb::Database, font_id: &str) -> Option<String> {
             }
         }
     }
-    for face in db.faces() {
-        let path = match &face.source {
-            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
-            fontdb::Source::Binary(_) => continue,
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(normalize)
-            .unwrap_or_default();
-        if stem == needle || stem.contains(&needle) {
-            if let Some((name, _)) = face.families.first() {
-                return Some(name.clone());
+    if db.faces().any(|face| face_matches_family(face, &needle)) {
+        return Some(primary.to_owned());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn impact_weight_200_shapes_with_real_impact_face() {
+        let paths = crate::platform::windows::resolve_font_files("Impact");
+        if paths.is_empty() {
+            return;
+        }
+        let mut fs = FontSystem::new_with_locale_and_db(
+            TEXT_ATLAS_LOCALE.to_string(),
+            fontdb::Database::new(),
+        );
+        for p in crate::platform::windows::resolve_font_files("Segoe UI") {
+            let _ = fs.db_mut().load_font_file(p);
+        }
+        for p in &paths {
+            let _ = fs.db_mut().load_font_file(p);
+        }
+        let fam = find_family(fs.db(), "Impact").expect("Impact family loaded");
+        let (matched_fam, w, st, sy) = match_face_attrs(fs.db(), Some(&fam), 200);
+        let attrs = Attrs::new()
+            .family(Family::Name(matched_fam.as_deref().unwrap_or(&fam)))
+            .weight(w)
+            .stretch(st)
+            .style(sy);
+        let mut buf = Buffer::new(&mut fs, Metrics::new(340.0, 340.0 * 1.06));
+        buf.set_wrap(&mut fs, Wrap::None);
+        buf.set_text(&mut fs, "16:30", attrs, Shaping::Advanced);
+        buf.shape_until_scroll(&mut fs, false);
+        let run = buf.layout_runs().next().expect("shaped run");
+        assert!(!run.glyphs.is_empty());
+        let used_face = fs.db().face(run.glyphs[0].font_id).expect("used face");
+        assert!(
+            used_face.families.iter().any(|(n, _)| n.eq_ignore_ascii_case("Impact")),
+            "expected Impact, got {:?}",
+            used_face.families
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn bundled_numeric_weight_fonts_shape_with_real_faces() {
+        for family in ["Inter", "Outfit", "JetBrains Mono"] {
+            let paths = crate::platform::windows::resolve_font_files(family);
+            if paths.is_empty() {
+                continue;
+            }
+            let mut fs = FontSystem::new_with_locale_and_db(
+                TEXT_ATLAS_LOCALE.to_string(),
+                fontdb::Database::new(),
+            );
+            for p in crate::platform::windows::resolve_font_files("Segoe UI") {
+                let _ = fs.db_mut().load_font_file(p);
+            }
+            for p in &paths {
+                let _ = fs.db_mut().load_font_file(p);
+            }
+            let fam = find_family(fs.db(), family).unwrap_or_else(|| panic!("{family} family loaded"));
+            let needle = normalize(family);
+            for requested in [300u16, 400, 500, 600, 700] {
+                let (matched_fam, w, st, sy) = match_face_attrs(fs.db(), Some(&fam), requested);
+                let attrs = Attrs::new()
+                    .family(Family::Name(matched_fam.as_deref().unwrap_or(&fam)))
+                    .weight(w)
+                    .stretch(st)
+                    .style(sy);
+                let mut buf = Buffer::new(&mut fs, Metrics::new(64.0, 72.0));
+                buf.set_wrap(&mut fs, Wrap::None);
+                buf.set_text(&mut fs, "PrismView 12:34", attrs, Shaping::Advanced);
+                buf.shape_until_scroll(&mut fs, false);
+                let run = buf.layout_runs().next().expect("shaped run");
+                assert!(!run.glyphs.is_empty());
+                let used_face = fs.db().face(run.glyphs[0].font_id).expect("used face");
+                assert!(
+                    face_matches_family(used_face, &needle),
+                    "expected {family} (weight {requested}), got {:?}",
+                    used_face.families
+                );
             }
         }
     }
-    None
 }

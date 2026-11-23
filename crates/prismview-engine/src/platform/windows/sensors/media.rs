@@ -198,10 +198,26 @@ struct Worker {
 }
 
 pub(super) fn run(shared: Arc<Shared>, channel: Arc<MediaChannel>, cover_dir: PathBuf) {
+    let mut pending = Pending::default();
+    let mut queued_commands: VecDeque<MediaCommand> = VecDeque::new();
+    // Adia inicialização COM/WinRT até alguma cena pedir `MEDIA` ou chegar um comando de mídia.
+    while !shared.stop.load(Ordering::Relaxed)
+        && !shared.bus.is_demanded(SignalKind::MEDIA)
+        && queued_commands.is_empty()
+    {
+        channel.wait(None, &mut pending);
+        queued_commands.extend(pending.commands.drain(..));
+        if pending.stop {
+            return;
+        }
+    }
+    if shared.stop.load(Ordering::Relaxed) {
+        return;
+    }
+
     let _com = ComMta::init();
     cleanup_stale_covers(&cover_dir);
 
-    let mut pending = Pending::default();
     // Gerenciador: pode falhar logo após o logon; tenta de novo sem girar.
     let manager = loop {
         if shared.stop.load(Ordering::Relaxed) {
@@ -214,6 +230,7 @@ pub(super) fn run(shared: Arc<Shared>, channel: Arc<MediaChannel>, cover_dir: Pa
             break m;
         }
         channel.wait(Some(MANAGER_RETRY), &mut pending);
+        queued_commands.extend(pending.commands.drain(..));
         if pending.stop {
             return;
         }
@@ -242,9 +259,10 @@ pub(super) fn run(shared: Arc<Shared>, channel: Arc<MediaChannel>, cover_dir: Pa
         dominant: 0,
         playing: false,
     };
-    // Primeira leitura se a cena já pede mídia.
+    // Primeira leitura se a cena já pede mídia (preservando comandos enfileirados antes do init).
     pending.session_changed = true;
     pending.dirty = true;
+    pending.commands.extend(queued_commands.drain(..));
     let mut first = true;
 
     loop {

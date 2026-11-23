@@ -109,6 +109,83 @@ impl Default for Scene3dCamera {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scene3dDynamicTextureSource {
+    MediaCover,
+    CustomImage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scene3dDynamicTexture {
+    pub id: String,
+    /// Nome do material alvo (`""` ou `"*"` = todos os materiais do objeto).
+    pub material_name: String,
+    pub source: Scene3dDynamicTextureSource,
+    pub custom_src: Option<String>,
+    pub emissive_map: bool,
+}
+
+impl Scene3dDynamicTexture {
+    pub fn parse(raw: &Value) -> Option<Self> {
+        let obj = raw.as_object()?;
+        let source = match obj.get("source")?.as_str()?.trim() {
+            "MEDIA_COVER" => Scene3dDynamicTextureSource::MediaCover,
+            "CUSTOM_IMAGE" => Scene3dDynamicTextureSource::CustomImage,
+            _ => return None,
+        };
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let material_name = obj
+            .get("materialName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let custom_src = obj
+            .get("customSrc")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let emissive_map = obj.get("emissiveMap").and_then(Value::as_bool).unwrap_or(false);
+        Some(Self {
+            id,
+            material_name,
+            source,
+            custom_src,
+            emissive_map,
+        })
+    }
+
+    pub fn is_wildcard(&self) -> bool {
+        let name = self.material_name.trim();
+        name.is_empty() || name == "*"
+    }
+
+    /// Verifica se esta regra se aplica ao material com nome `material_name` (`None` = material padrão).
+    pub fn matches_material(&self, material_name: Option<&str>) -> bool {
+        if self.is_wildcard() {
+            return true;
+        }
+        let target = self.material_name.trim();
+        material_name
+            .map(str::trim)
+            .is_some_and(|name| name == target || name.eq_ignore_ascii_case(target))
+    }
+}
+
+fn raw_list_uses_media_cover(raw: &[Value]) -> bool {
+    raw.iter().any(|v| {
+        v.get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim() == "MEDIA_COVER")
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Scene3dObject {
@@ -175,6 +252,14 @@ impl Scene3dObject {
             rotation,
             finite(self.position, 0.0),
         )
+    }
+
+    /// Regras tipadas de `dynamicTextures` (entradas malformadas ou desconhecidas são ignoradas).
+    pub fn parsed_dynamic_textures(&self) -> Vec<Scene3dDynamicTexture> {
+        self.dynamic_textures
+            .iter()
+            .filter_map(Scene3dDynamicTexture::parse)
+            .collect()
     }
 }
 
@@ -300,6 +385,17 @@ impl Scene3dConfig {
             .filter(|h| h.is_finite())
             .map(|h| h.rem_euclid(24.0))
     }
+
+    /// `true` se algum objeto efetivo usa `dynamicTextures` com `source: "MEDIA_COVER"`. Sem alocação.
+    pub fn uses_media_cover(&self) -> bool {
+        if !self.objects.is_empty() {
+            self.objects
+                .iter()
+                .any(|obj| raw_list_uses_media_cover(&obj.dynamic_textures))
+        } else {
+            raw_list_uses_media_cover(&self.dynamic_textures)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +460,52 @@ mod tests {
         let p = obj.local_matrix().transform_point3(Vec3::new(0.0, 0.0, 1.0));
         // Ry(90°) leva +Z para +X; depois translada +1 em X.
         assert!((p - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn parses_dynamic_textures_and_detects_media_cover_demand() {
+        let json = r#"{
+            "schemaVersion": 3,
+            "objects": [{
+                "id": "chibi",
+                "dynamicTextures": [
+                    { "id": "dt-1", "materialName": "Placa", "source": "MEDIA_COVER", "emissiveMap": true },
+                    { "id": "dt-2", "materialName": "*", "source": "CUSTOM_IMAGE", "customSrc": "  C:/poster.png " },
+                    { "id": "bad", "source": "UNKNOWN_SOURCE" }
+                ]
+            }]
+        }"#;
+        let cfg: Scene3dConfig = serde_json::from_str(json).expect("json válido");
+        assert!(cfg.uses_media_cover());
+        let objects = cfg.effective_objects();
+        let rules = objects[0].parsed_dynamic_textures();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].source, Scene3dDynamicTextureSource::MediaCover);
+        assert!(rules[0].emissive_map);
+        assert!(!rules[0].is_wildcard());
+        assert!(rules[0].matches_material(Some("Placa")));
+        assert!(rules[0].matches_material(Some("placa")));
+        assert!(!rules[0].matches_material(Some("Cabeca")));
+        assert!(!rules[0].matches_material(None));
+
+        assert_eq!(rules[1].source, Scene3dDynamicTextureSource::CustomImage);
+        assert_eq!(rules[1].custom_src.as_deref(), Some("C:/poster.png"));
+        assert!(!rules[1].emissive_map);
+        assert!(rules[1].is_wildcard());
+        assert!(rules[1].matches_material(Some("Qualquer")));
+        assert!(rules[1].matches_material(None));
+
+        let legacy_json = r#"{
+            "schemaVersion": 2,
+            "dynamicTextures": [{ "id": "legacy", "materialName": "", "source": "MEDIA_COVER" }]
+        }"#;
+        let legacy: Scene3dConfig = serde_json::from_str(legacy_json).expect("json legado");
+        assert!(legacy.uses_media_cover());
+
+        let no_media: Scene3dConfig = serde_json::from_str(
+            r#"{ "schemaVersion": 3, "objects": [{ "id": "x", "dynamicTextures": [{ "source": "CUSTOM_IMAGE", "customSrc": "a.png" }] }] }"#,
+        )
+        .expect("json sem midia");
+        assert!(!no_media.uses_media_cover());
     }
 }

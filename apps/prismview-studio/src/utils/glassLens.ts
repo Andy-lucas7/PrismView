@@ -14,6 +14,10 @@ export interface GlyphGlassMaps {
   webglCanvas: HTMLCanvasElement;
   /** Blurred glyph heightfield (alpha channel) used by the GPU Sobel pass. */
   heightCanvas: HTMLCanvasElement;
+  /** Heightfield Gaussian sigma in heightCanvas pixels (normalizes Sobel slope across bevel widths). */
+  heightSigmaPx: number;
+  /** CSS padding added around the glyph box (subtracted from dome normal for 1:1 native parity). */
+  padPx: number;
   /** Lazily generated PNG data URLs only if pure CSS fallback is ever needed */
   getMaskUrl: () => string;
   getSpecularUrl: () => string;
@@ -28,6 +32,8 @@ export interface GlyphGlassParams {
   align: "left" | "center" | "right";
   bevelPx: number;
   fontRev: number;
+  /** Optional wrap width in CSS px (>0 wraps words inside the box; 0/undefined = auto-width). */
+  maxWidthPx?: number;
 }
 
 const glyphMapsCache = new Map<string, GlyphGlassMaps>();
@@ -78,7 +84,10 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   if (typeof document === "undefined") return null;
   const text = params.text || " ";
   const fontSize = Math.max(10, Math.min(360, Math.round(params.fontSize)));
-  const bevel = Math.max(2, Math.min(32, Math.round(params.bevelPx * 0.48)));
+  // Continuous sigma proportional to bevelPx (0.55 * 0.65 = 0.3575, 1:1 parity with native glyph.rs)
+  const heightBlurPx = Math.max(0.8, Math.min(31.2, Math.round(params.bevelPx * 0.3575 * 2) / 2));
+
+  const maxWidthPx = params.maxWidthPx && params.maxWidthPx > 1 ? Math.round(params.maxWidthPx) : 0;
 
   const key = [
     text,
@@ -87,8 +96,9 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     params.fontWeight,
     params.letterSpacingEm.toFixed(3),
     params.align,
-    bevel,
+    heightBlurPx.toFixed(1),
     params.fontRev,
+    maxWidthPx,
   ].join("|");
 
   const hit = glyphMapsCache.get(key);
@@ -99,8 +109,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     return hit;
   }
 
-  const lines = text.split("\n");
-  const lineH = Math.ceil(fontSize * 1.12);
+  const rawParagraphs = text.split("\n");
+  const lineH = Math.ceil(fontSize * 1.06);
   const pad = Math.max(12, Math.ceil(fontSize * 0.14));
 
   const fontDecl = `${params.fontWeight} ${fontSize}px ${params.fontStack}`;
@@ -127,12 +137,56 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     return Math.max(0, total);
   };
 
+  const lines: string[] = [];
+  if (maxWidthPx > 0) {
+    for (const para of rawParagraphs) {
+      if (!para) {
+        lines.push("");
+        continue;
+      }
+      const words = para.split(/(\s+)/);
+      let current = "";
+      for (const token of words) {
+        if (!token) continue;
+        const candidate = current ? current + token : token;
+        if (!current || measureLine(candidate) <= maxWidthPx) {
+          current = candidate;
+        } else if (/^\s+$/.test(token)) {
+          lines.push(current);
+          current = "";
+        } else {
+          lines.push(current.trimEnd());
+          if (measureLine(token) <= maxWidthPx) {
+            current = token;
+          } else {
+            // Word wider than box: break by character
+            let chunk = "";
+            for (const ch of Array.from(token)) {
+              const nextChunk = chunk + ch;
+              if (chunk && measureLine(nextChunk) > maxWidthPx) {
+                lines.push(chunk);
+                chunk = ch;
+              } else {
+                chunk = nextChunk;
+              }
+            }
+            current = chunk;
+          }
+        }
+      }
+      if (current) lines.push(current);
+    }
+  } else {
+    lines.push(...rawParagraphs);
+  }
+
   let maxLineW = 0;
   for (const line of lines) {
     maxLineW = Math.max(maxLineW, measureLine(line));
   }
 
-  const cssW = Math.max(24, Math.ceil(maxLineW + pad * 2));
+  const contentW = maxWidthPx > 0 ? Math.max(maxWidthPx, maxLineW) : maxLineW;
+  const cssW = Math.max(24, Math.ceil(contentW + pad * 2));
   const cssH = Math.max(24, Math.ceil(lines.length * lineH + pad * 2));
 
   // Cap BOTH width and height so tall multi-line text never stalls CPU Sobel pass
@@ -192,7 +246,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   heightCanvas.height = ch;
   const heightCtx = heightCanvas.getContext("2d");
   if (!heightCtx) return null;
-  drawTextOnto(heightCtx, Math.max(2, bevel * 0.55));
+  const heightSigmaPx = Math.max(0.8, heightBlurPx * renderScale);
+  drawTextOnto(heightCtx, heightBlurPx);
 
   let lazyMaskUrl: string | null = null;
   let lazySpecUrl: string | null = null;
@@ -231,7 +286,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
         const gy = (tl + 2 * t + tr) - (bl + 2 * b + br);
         const slope = Math.hypot(gx, gy);
         if (slope > 0.004) {
-          const gain = Math.min(1, slope * 2.2);
+          const gain = Math.min(1, slope * Math.max(2.2, heightSigmaPx * 0.9));
           out[idx] = Math.round(128 + (gx / slope) * gain * 126);
           out[idx + 1] = Math.round(128 + (gy / slope) * gain * 126);
           out[idx + 2] = Math.round(gain * 255);
@@ -253,6 +308,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     height: cssH,
     webglCanvas: maskCanvas,
     heightCanvas,
+    heightSigmaPx,
+    padPx: pad,
     getMaskUrl: () => {
       if (lazyMaskUrl !== null) return lazyMaskUrl;
       const pData = getPackedCpu();

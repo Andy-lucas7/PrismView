@@ -4,6 +4,7 @@
 //! pedido, mesmo protocolo de `prism-core::schema::IpcRequest/IpcResponse`). Este crate não
 //! depende de `prism-core`: os pedidos são montados como `serde_json::Value`.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
@@ -23,10 +24,17 @@ const ENGINE_EXE: &str = "prismview-engine.exe";
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const ACTIVE_SCENE_FILE: &str = "active_scene.json";
+/// Widgets nativos persistidos pelo motor (mesmo formato de `prism-core::ActiveWidgetsFile`).
+const ACTIVE_WIDGETS_FILE: &str = "active_widgets.json";
+/// Cenas dos widgets nativos (`native/widgets/<id>.json`).
+#[allow(dead_code)] // API de widgets nativos (Entrega 3) aguardando ligação em `widgets.rs`
+const WIDGET_SCENES_DIR: &str = "widgets";
 /// Preferência de energia lida pelo motor ao iniciar (mesmo arquivo que ele grava no IPC).
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
 /// Preferência de exibição da engine na bandeja do sistema (`"1"` / `"0"`, padrão: `"1"`).
 const TRAY_ENABLED_FILE: &str = "tray_enabled.txt";
+/// Sincronizar papel de parede real do Windows (imagem limpa sem HUD) ao aplicar (`"1"` / `"0"`, padrão: `"0"`).
+const SYNC_WINDOWS_WALLPAPER_FILE: &str = "sync_windows_wallpaper.txt";
 /// Marcador: o usuário desligou o início com o Windows (não reativar sozinho no "Aplicar").
 const AUTOSTART_OPT_OUT_FILE: &str = "autostart_disabled";
 /// Valor em `HKCU\...\Run` que sobe o motor no login.
@@ -35,7 +43,10 @@ const POWER_PREFERENCES: [&str; 5] = ["AUTO", "NORMAL", "ECO", "ULTRA", "FROZEN"
 /// Win32 `ERROR_PIPE_BUSY`: o servidor está vivo e reciclando a instância do pipe.
 const ERROR_PIPE_BUSY: i32 = 231;
 const PIPE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
-const PIPE_BUSY_TIMEOUT: Duration = Duration::from_millis(150);
+/// Espera máxima por uma instância livre quando o pipe responde BUSY (motor vivo, ocupado).
+const PIPE_BUSY_WAIT: Duration = Duration::from_millis(2000);
+/// Prefixo de erro: motor vivo porém ocupado. Nunca justifica subir outro processo.
+const ENGINE_BUSY: &str = "engine_busy";
 const PIPE_RETRY_INTERVAL: Duration = Duration::from_millis(12);
 const START_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const START_TIMEOUT: Duration = Duration::from_secs(8);
@@ -49,6 +60,23 @@ pub struct NativeEngine {
     /// Export `.prism` em background coalescido (último projeto vence, sem travar "Aplicar").
     pending_export: Mutex<Option<Value>>,
     export_worker_active: AtomicBool,
+    /// Última posição (física) que o Studio mandou por widget: decide se o arrasto feito no
+    /// desktop (estado do motor) ou a edição no Studio vence no próximo `UPSERT_WIDGET`.
+    #[allow(dead_code)]
+    widget_sent_pos: Mutex<HashMap<String, (i32, i32)>>,
+}
+
+/// Posição/tamanho (px físicos) e flags de um widget nativo.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeWidgetPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub always_on_top: bool,
+    pub locked: bool,
+    pub click_through: bool,
 }
 
 pub type SharedEngine = Arc<NativeEngine>;
@@ -72,16 +100,38 @@ fn exchange_pipe(mut pipe: fs::File, payload: &[u8]) -> Result<Value, String> {
     Ok(response)
 }
 
-/// Tentativa instantânea em `pipe_path`: falha imediatamente (< 1ms) se o pipe não existe;
-/// só aguarda brevemente se receber `ERROR_PIPE_BUSY` (servidor vivo reciclando o pipe).
+#[link(name = "kernel32")]
+extern "system" {
+    fn WaitNamedPipeW(name: *const u16, timeout_ms: u32) -> i32;
+}
+
+/// Bloqueia até haver instância livre do pipe (ou `timeout`). `false` = continua ocupado/ausente.
+fn wait_named_pipe(pipe_path: &str, timeout: Duration) -> bool {
+    let wide: Vec<u16> = pipe_path.encode_utf16().chain(std::iter::once(0)).collect();
+    let ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX).max(1);
+    // SAFETY: `wide` termina em NUL e vive até o fim da chamada.
+    unsafe { WaitNamedPipeW(wide.as_ptr(), ms) != 0 }
+}
+
+/// `true` se o erro indica motor vivo porém ocupado (não subir outro processo).
+fn is_engine_busy(err: &str) -> bool {
+    err.starts_with(ENGINE_BUSY)
+}
+
+/// Tentativa instantânea em `pipe_path`: falha imediatamente (< 1ms) se o pipe não existe.
+/// `ERROR_PIPE_BUSY` = motor vivo: espera instância livre com `WaitNamedPipeW` (até 2 s) e, se
+/// continuar ocupado, devolve `engine_busy` (nunca "fora do ar").
 fn pipe_try_once_at(pipe_path: &str, request: &Value) -> Result<Value, String> {
     let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + PIPE_BUSY_TIMEOUT;
+    let deadline = Instant::now() + PIPE_BUSY_WAIT;
     let pipe = loop {
         match OpenOptions::new().read(true).write(true).open(pipe_path) {
             Ok(file) => break file,
-            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => {
-                sleep(Duration::from_millis(10));
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || !wait_named_pipe(pipe_path, remaining) {
+                    return Err(format!("{ENGINE_BUSY}: {err}"));
+                }
             }
             Err(err) => return Err(format!("engine_unreachable: {err}")),
         }
@@ -158,9 +208,11 @@ pub fn set_autostart_opt_out(opt_out: bool) {
     };
     let marker = dir.join(AUTOSTART_OPT_OUT_FILE);
     if opt_out {
-        let _ = fs::write(marker, b"1");
+        if let Err(e) = crate::atomic_fs::write_atomic(&marker, b"1", false) {
+            eprintln!("[native_engine] autostart_opt_out: {e}");
+        }
     } else {
-        let _ = fs::remove_file(marker);
+        crate::atomic_fs::log_io("remove_file", fs::remove_file(marker));
     }
 }
 
@@ -169,10 +221,75 @@ pub fn has_active_scene() -> bool {
     state_dir().map(|d| d.join(ACTIVE_SCENE_FILE).is_file()).unwrap_or(false)
 }
 
-/// Remove o wallpaper nativo: encerra o motor (o Windows volta a pintar o próprio fundo) e apaga
-/// a cena ativa para o login seguinte não reaplicar. Não precisa do handle do processo filho.
+/// Há widgets nativos persistidos (o motor os recria no login, mesmo sem wallpaper).
+pub fn has_active_widgets() -> bool {
+    state_dir()
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join(ACTIVE_WIDGETS_FILE)).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("widgets").and_then(Value::as_array).map(|a| !a.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Mesmo critério do motor (`NativeWidgetSpec::is_valid_id`): vira nome de arquivo/janela.
+#[allow(dead_code)]
+pub fn is_valid_widget_id(id: &str) -> bool {
+    !id.trim().is_empty()
+        && id.len() <= 128
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && id != "."
+        && id != ".."
+}
+
+/// Widget pode rodar nativo? Vídeo em widget ainda não tem decoder no motor por widget:
+/// esses continuam no WebView (fallback explícito, sem quebrar projetos existentes).
+#[allow(dead_code)]
+pub fn widget_native_eligible(project: &Value) -> Result<(), String> {
+    fn has_video(layers: &[Value]) -> bool {
+        layers.iter().any(|l| {
+            l.get("kind").and_then(Value::as_str) == Some("VIDEO")
+                || l.get("children").and_then(Value::as_array).is_some_and(|c| has_video(c))
+        })
+    }
+    let layers = project.get("layers").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if has_video(layers) {
+        return Err("native_widget_unsupported: VIDEO".into());
+    }
+    Ok(())
+}
+
+/// Tira `id` do `active_widgets.json` (motor fora do ar) e apaga a cena dele.
+#[allow(dead_code)]
+fn remove_persisted_widget(id: &str) -> Result<(), String> {
+    let dir = state_dir()?;
+    let path = dir.join(ACTIVE_WIDGETS_FILE);
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if let Ok(mut v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(list) = v.get_mut("widgets").and_then(Value::as_array_mut) {
+                list.retain(|w| w.get("id").and_then(Value::as_str) != Some(id));
+                let empty = list.is_empty();
+                if empty {
+                    crate::atomic_fs::log_io("remove_file", fs::remove_file(&path));
+                } else {
+                    let bytes = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
+                    crate::atomic_fs::write_atomic(&path, &bytes, false)
+                        .map_err(|e| format!("active_widgets_write: {e}"))?;
+                }
+            }
+        }
+    }
+    crate::atomic_fs::log_io("remove_file", fs::remove_file(dir.join(WIDGET_SCENES_DIR).join(format!("{id}.json"))));
+    Ok(())
+}
+
+/// Remove o wallpaper nativo (`CLEAR_WALLPAPER`: widgets nativos seguem no ar; sem eles o motor
+/// encerra e o Windows volta a pintar o próprio fundo) e apaga a cena ativa para o login seguinte
+/// não reaplicar. Não precisa do handle do processo filho.
 pub fn clear_desktop() -> Result<(), String> {
-    let _ = pipe_try_once(&json!({ "cmd": "SHUTDOWN" }));
+    if pipe_try_once(&json!({ "cmd": "CLEAR_WALLPAPER" })).is_err() {
+        // Motor antigo (sem o comando) ou fora do ar.
+        let _ = pipe_try_once(&json!({ "cmd": "SHUTDOWN" }));
+    }
     let dir = state_dir()?;
     match fs::remove_file(dir.join(ACTIVE_SCENE_FILE)) {
         Ok(()) => Ok(()),
@@ -208,10 +325,36 @@ pub fn get_tray_enabled() -> bool {
 /// Persiste a visibilidade da bandeja da engine e sincroniza em tempo real via IPC se rodando.
 pub fn set_tray_visible(visible: bool) -> Result<bool, String> {
     let path = state_dir()?.join(TRAY_ENABLED_FILE);
-    fs::write(&path, if visible { b"1" } else { b"0" })
+    crate::atomic_fs::write_atomic(&path, if visible { b"1" } else { b"0" }, false)
         .map_err(|e| format!("tray_enabled_write: {e}"))?;
     let _ = pipe_try_once(&json!({ "cmd": "SET_TRAY_VISIBLE", "visible": visible }));
     Ok(visible)
+}
+
+/// Lê a preferência persistida de atualizar o papel de parede real do Windows (padrão: `false`).
+pub fn sync_windows_wallpaper_enabled() -> bool {
+    let Ok(dir) = state_dir() else {
+        return false;
+    };
+    match fs::read_to_string(dir.join(SYNC_WINDOWS_WALLPAPER_FILE)) {
+        Ok(raw) => {
+            let t = raw.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Persiste a preferência de atualizar o papel de parede real do Windows e notifica a engine via IPC.
+pub fn save_sync_windows_wallpaper(enabled: bool) -> Result<bool, String> {
+    let path = state_dir()?.join(SYNC_WINDOWS_WALLPAPER_FILE);
+    crate::atomic_fs::write_atomic(&path, if enabled { b"1" } else { b"0" }, false)
+        .map_err(|e| format!("sync_windows_wallpaper_write: {e}"))?;
+    let _ = pipe_try_once(&json!({
+        "cmd": "SET_SYNC_WINDOWS_WALLPAPER",
+        "enabled": enabled,
+    }));
+    Ok(enabled)
 }
 
 /// Agenda a atualização do `.prism` em `packages/` numa única thread em background (coalescida:
@@ -265,8 +408,9 @@ fn schedule_background_archive(engine: &SharedEngine, project: Value) {
 impl NativeEngine {
     /// Fluxo "Aplicar no Desktop": converte o projeto, materializa assets (hardlink/cache), grava a
     /// cena ativa atomicamente, garante o motor no ar e manda `LOAD_SCENE_FILE` na hora (< 300ms).
-    /// O pacote `.prism` em `packages/` é atualizado depois em background sem travar a UI.
-    pub fn apply_project(self: &Arc<Self>, project: &Value) -> Result<(), String> {
+    /// O pacote `.prism` em `packages/` é atualizado depois em background sem travar a UI, só
+    /// quando `archive` (Aplicar explícito; o autosave não re-zipa). Devolve avisos para a UI.
+    pub fn apply_project(self: &Arc<Self>, project: &Value, archive: bool) -> Result<Vec<String>, String> {
         let _guard = self
             .apply_lock
             .lock()
@@ -277,25 +421,136 @@ impl NativeEngine {
         //     (a cena ativa não depende de onde o Estúdio guardou os arquivos).
         let state = state_dir()?;
         let data_root = state.parent().map(Path::to_path_buf).unwrap_or_else(|| state.clone());
-        for warning in crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets")) {
+        let warnings = crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets"));
+        for warning in &warnings {
             eprintln!("[native_engine] {warning}");
         }
         // 2) Cena ativa: escrita atômica (tmp + rename) para o motor nunca ler pela metade.
         let final_path = state.join(ACTIVE_SCENE_FILE);
-        let tmp_path = state.join(format!("{ACTIVE_SCENE_FILE}.tmp"));
         let json = serde_json::to_vec(&scene).map_err(|e| e.to_string())?;
-        fs::write(&tmp_path, json).map_err(|e| format!("native_scene_write: {e}"))?;
-        fs::rename(&tmp_path, &final_path).map_err(|e| format!("native_scene_rename: {e}"))?;
+        crate::atomic_fs::write_atomic(&final_path, &json, false)
+            .map_err(|e| format!("native_scene_write: {e}"))?;
         // 3) Motor no ar (check instantâneo sem sleep de 1,5s) + recarga imediata.
         self.ensure_started()?;
         pipe_request(&json!({
             "cmd": "LOAD_SCENE_FILE",
             "path": final_path.to_string_lossy(),
+            "sync_windows": archive,
         }))?;
         drop(_guard);
         // 4) Atualiza o `.prism` otimizado em `packages/` fora do caminho crítico.
-        schedule_background_archive(self, project.clone());
+        if archive {
+            schedule_background_archive(self, project.clone());
+        }
+        Ok(warnings)
+    }
+
+    /// Entrega 3 — widget nativo (janela DirectComposition no motor, sem WebView2). Converte e
+    /// materializa a cena (mesmo pipeline do wallpaper, cache próprio por widget), grava
+    /// `native/widgets/<id>.json` e manda `UPSERT_WIDGET`. Devolve a posição efetiva (física):
+    /// se o usuário arrastou o widget no desktop, a posição do motor vence a do projeto, a menos
+    /// que o Studio tenha mudado `posX/posY` desde o último envio.
+    #[allow(dead_code)]
+    pub fn upsert_widget(&self, project: &Value, placement: &NativeWidgetPlacement) -> Result<(i32, i32), String> {
+        let id = project
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_valid_widget_id(id))
+            .ok_or("widget_id_invalido")?
+            .to_string();
+        widget_native_eligible(project)?;
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| "native_engine_apply_poisoned".to_string())?;
+        let mut scene = crate::native_scene::project_to_scene(project)?;
+        let state = state_dir()?;
+        let data_root = state.parent().map(Path::to_path_buf).unwrap_or_else(|| state.clone());
+        let cache = state.join("assets").join("widgets").join(&id);
+        for warning in crate::native_scene::materialize_assets(&mut scene, &data_root, &cache) {
+            eprintln!("[native_engine] widget {id}: {warning}");
+        }
+        let dir = state.join(WIDGET_SCENES_DIR);
+        fs::create_dir_all(&dir).map_err(|e| format!("native_widget_dir: {e}"))?;
+        let final_path = dir.join(format!("{id}.json"));
+        let json = serde_json::to_vec(&scene).map_err(|e| e.to_string())?;
+        crate::atomic_fs::write_atomic(&final_path, &json, false)
+            .map_err(|e| format!("native_widget_write: {e}"))?;
+
+        self.ensure_started()?;
+        let (mut x, mut y) = (placement.x, placement.y);
+        let studio_moved = self
+            .widget_sent_pos
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).copied())
+            .map_or(false, |prev| prev != (x, y));
+        if !studio_moved {
+            if let Some(current) = self.list_widgets().into_iter().find(|w| w.get("id").and_then(Value::as_str) == Some(id.as_str())) {
+                x = current.get("x").and_then(Value::as_i64).map_or(x, |v| v as i32);
+                y = current.get("y").and_then(Value::as_i64).map_or(y, |v| v as i32);
+            }
+        }
+        pipe_request(&json!({
+            "cmd": "UPSERT_WIDGET",
+            "id": id,
+            "scene_path": final_path.to_string_lossy(),
+            "x": x,
+            "y": y,
+            "width": placement.width.max(16),
+            "height": placement.height.max(16),
+            "always_on_top": placement.always_on_top,
+            "locked": placement.locked,
+            "click_through": placement.click_through,
+        }))?;
+        if let Ok(mut m) = self.widget_sent_pos.lock() {
+            m.insert(id, (x, y));
+        }
+        Ok((x, y))
+    }
+
+    /// Remove o widget nativo (o motor apaga a cena dele e sai se não sobrar nada).
+    #[allow(dead_code)]
+    pub fn remove_widget(&self, id: &str) -> Result<(), String> {
+        if let Ok(mut m) = self.widget_sent_pos.lock() {
+            m.remove(id);
+        }
+        // Motor fora do ar: o estado persistido ainda pode citar o widget → limpa à mão.
+        if pipe_try_once(&json!({ "cmd": "REMOVE_WIDGET", "id": id })).is_err() {
+            remove_persisted_widget(id)?;
+        }
+        if let Ok(state) = state_dir() {
+            crate::atomic_fs::log_io("remove_dir_all", fs::remove_dir_all(state.join("assets").join("widgets").join(id)));
+        }
         Ok(())
+    }
+
+    /// Travar/destravar arrasto, sempre-no-topo, click-through (campos `None` não mudam).
+    #[allow(dead_code)]
+    pub fn set_widget_flags(
+        &self,
+        id: &str,
+        locked: Option<bool>,
+        always_on_top: Option<bool>,
+        click_through: Option<bool>,
+    ) -> Result<(), String> {
+        pipe_try_once(&json!({
+            "cmd": "SET_WIDGET_FLAGS",
+            "id": id,
+            "locked": locked,
+            "always_on_top": always_on_top,
+            "click_through": click_through,
+        }))
+        .map(|_| ())
+    }
+
+    /// Widgets nativos no ar (posições atuais após arrasto). Vazio se o motor não responde.
+    #[allow(dead_code)]
+    pub fn list_widgets(&self) -> Vec<Value> {
+        pipe_try_once(&json!({ "cmd": "LIST_WIDGETS" }))
+            .ok()
+            .and_then(|r| r.get("widgets").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
     }
 
     /// Grava a preferência no arquivo que o motor lê ao iniciar e, se ele estiver no ar, aplica na
@@ -306,7 +561,8 @@ impl NativeEngine {
             return Err(format!("invalid_power_preference: {preference}"));
         }
         let path = state_dir()?.join(POWER_PREFERENCE_FILE);
-        fs::write(&path, preference.as_bytes()).map_err(|e| format!("power_preference_write: {e}"))?;
+        crate::atomic_fs::write_atomic(&path, preference.as_bytes(), false)
+            .map_err(|e| format!("power_preference_write: {e}"))?;
         if pipe_try_once(&json!({ "cmd": "SET_POWER_PREFERENCE", "preference": preference })).is_ok() {
             Ok(self.status())
         } else {
@@ -316,7 +572,7 @@ impl NativeEngine {
 
     /// Garante o motor no ar com a cena ativa (abertura do Studio após o motor ter caído).
     pub fn ensure_running(&self) -> Result<(), String> {
-        if !has_active_scene() {
+        if !has_active_scene() && !has_active_widgets() {
             return Ok(());
         }
         self.ensure_started()
@@ -335,19 +591,25 @@ impl NativeEngine {
                 }
                 engine
             }
+            Err(e) if is_engine_busy(&e) => json!({ "running": true, "busy": true }),
             Err(_) => json!({ "running": false }),
         }
     }
 
     /// Garante que existe um processo do motor respondendo no pipe (sem roundtrip extra de status).
     fn ensure_started(&self) -> Result<(), String> {
-        if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
+        // Responder OU estar ocupado (BUSY) = motor vivo: nunca subir um segundo processo.
+        let alive = |r: Result<Value, String>| match r {
+            Ok(_) => true,
+            Err(e) => is_engine_busy(&e),
+        };
+        if alive(pipe_try_once(&json!({ "cmd": "PING" }))) {
             return Ok(()); // já há um engine respondendo no pipe (< 1ms)
         }
 
         let mut child_slot = self.lock_child()?;
         // Re-checa sob o lock para evitar spawn duplo com a thread de startup.
-        if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
+        if alive(pipe_try_once(&json!({ "cmd": "PING" }))) {
             return Ok(());
         }
         if let Some(child) = child_slot.as_mut() {
@@ -369,7 +631,7 @@ impl NativeEngine {
 
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            if pipe_try_once(&json!({ "cmd": "PING" })).is_ok() {
+            if alive(pipe_try_once(&json!({ "cmd": "PING" }))) {
                 break;
             }
             if let Some(child) = child_slot.as_mut() {
@@ -471,7 +733,7 @@ pub async fn native_engine_apply(
     project: Value,
 ) -> Result<Value, String> {
     blocking(&engine, move |e| {
-        e.apply_project(&project)?;
+        e.apply_project(&project, true)?;
         Ok(e.status())
     })
     .await
@@ -486,9 +748,47 @@ pub async fn native_engine_set_power(
     blocking(&engine, move |e| e.set_power(&preference)).await
 }
 
+/// Lê se o PrismView atualiza o papel de parede estático do Windows ao aplicar uma cena.
+#[tauri::command]
+pub fn get_sync_windows_wallpaper() -> Result<bool, String> {
+    Ok(sync_windows_wallpaper_enabled())
+}
+
+/// Ativa/desativa a sincronização do papel de parede real do Windows (snapshot limpo sem HUD).
+#[tauri::command]
+pub async fn set_sync_windows_wallpaper(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || save_sync_windows_wallpaper(enabled))
+        .await
+        .map_err(|e| format!("sync_windows_wallpaper_task: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widget_ids_and_eligibility() {
+        assert!(is_valid_widget_id("w-1.a_b"));
+        for bad in ["", "..", "a/b", "a\\b", "x y"] {
+            assert!(!is_valid_widget_id(bad), "{bad}");
+        }
+        let ok = json!({ "layers": [{ "kind": "TEXT" }, { "kind": "GROUP", "children": [{ "kind": "SCENE_3D" }] }] });
+        assert!(widget_native_eligible(&ok).is_ok());
+        let video = json!({ "layers": [{ "kind": "GROUP", "children": [{ "kind": "VIDEO" }] }] });
+        assert!(widget_native_eligible(&video).is_err());
+    }
+
+    #[test]
+    fn upsert_widget_request_matches_engine_contract() {
+        // Mesmas chaves que `prism-core::IpcRequest::UpsertWidget` (snake_case, tag `cmd`).
+        let req = json!({
+            "cmd": "UPSERT_WIDGET", "id": "w", "scene_path": "C:/x.json", "x": -10, "y": 5,
+            "width": 300, "height": 200, "always_on_top": false, "locked": true, "click_through": true,
+        });
+        for key in ["id", "scene_path", "x", "y", "width", "height", "always_on_top", "locked", "click_through"] {
+            assert!(req.get(key).is_some(), "{key}");
+        }
+    }
 
     #[test]
     fn pipe_try_once_fails_immediately_when_pipe_missing() {

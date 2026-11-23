@@ -1,3 +1,5 @@
+import { NativeCompatPanel } from "./NativeCompatPanel";
+import type { NativeCompatIssue } from "../utils/nativeCompat";
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -60,8 +62,11 @@ import {
 } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
 import { Scene3DOutliner } from "./Scene3DOutliner";
+import { Scene3DQuickActions } from "./Scene3DQuickActions";
 import type { Scene3DEditorApi } from "./Scene3DLayer";
 import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
+
+import { BindingTargetOption, BindingTargetPicker, InspectorSlider, Vec3Field } from "./InspectorControls";
 
 function toHexColorInput(raw?: string, fallback = "#FFFFFF"): string {
   const s = (raw || "").trim();
@@ -130,6 +135,8 @@ export interface FxTargetRequest {
 
 export interface StudioInspectorProps {
   project: PrismProject;
+  /** O que o desktop não desenha (`nativeCompatIssues`), mostrado no topo. */
+  compatIssues?: NativeCompatIssue[];
   mode: InspectorMode;
   onModeChange: (mode: InspectorMode) => void;
   selectedLayer: SceneLayer | null;
@@ -171,6 +178,7 @@ export interface StudioInspectorProps {
 }
 
 export const StudioInspector: React.FC<StudioInspectorProps> = ({
+  compatIssues = [],
   project,
   mode,
   onModeChange,
@@ -210,6 +218,25 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   const [selectedDynTexId, setSelectedDynTexId] = useState<string | null>(null);
   const bindingsSectionRef = useRef<HTMLDivElement | null>(null);
   const dynTexSectionRef = useRef<HTMLDivElement | null>(null);
+  // Modo Pro do inspetor 3D: preferência em localStorage; abre sozinho ao focar binding/textura ou na Sala 3D
+  const [show3dPro, setShow3dProState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("prismview.inspector3dPro.v1") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setShow3dPro = (v: boolean) => {
+    setShow3dProState(v);
+    try {
+      localStorage.setItem("prismview.inspector3dPro.v1", v ? "1" : "0");
+    } catch {
+      /* storage indisponível */
+    }
+  };
+  useEffect(() => {
+    if (selectedBindingId || selectedDynTexId || room3dMode) setShow3dProState(true);
+  }, [selectedBindingId, selectedDynTexId, room3dMode]);
 
   useEffect(() => {
     if (!selectedBindingId) return;
@@ -343,7 +370,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               {!isTransparent && (
                 <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                   <span className="text-xs text-[#A1A1AA]">Cor do Fundo</span>
-                  <input
+                  <input aria-label="Cor do fundo"
                     type="color"
                     value={solidHex}
                     onChange={(e) =>
@@ -393,7 +420,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </div>
               <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                 <span className="text-xs text-[#A1A1AA]">Cor Sólida Personalizada</span>
-                <input
+                <input aria-label="Cor sólida personalizada"
                   type="color"
                   value={solidHex}
                   onChange={(e) =>
@@ -471,13 +498,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
           return (
             <div key={i} className="frosted-chrome-card p-3 space-y-2">
               <div className="flex items-center gap-1.5">
-                <input
+                <input aria-label="nome"
                   value={g.name}
                   placeholder="nome"
                   onChange={(e) => updateGlobal({ name: e.target.value })}
                   className="flex-1 bg-black/60 border border-white/10 rounded-lg px-2 py-1 font-mono-fx text-xs text-white outline-none"
                 />
-                <select
+                <select aria-label="Tipo da variável"
                   value={g.kind}
                   onChange={(e) =>
                     updateGlobal({ kind: e.target.value as GlobalVar["kind"] }, true)
@@ -491,6 +518,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 </select>
                 <button
                   type="button"
+                  aria-label={`Remover variável ${g.name || i + 1}`}
+                  title="Remover variável"
                   onClick={() =>
                     onApplyDiscreteProject({
                       ...project,
@@ -502,7 +531,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               </div>
-              <input
+              <input aria-label="Rótulo no Hub"
                 value={g.label}
                 placeholder="Rótulo no Hub"
                 onChange={(e) => updateGlobal({ label: e.target.value })}
@@ -510,13 +539,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               />
               <div className="flex items-center justify-between gap-2">
                 {g.kind === "COLOR" ? (
-                  <input
+                  <input aria-label="Valor da variável"
                     type="color"
                     value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#ffffff"}
                     onChange={(e) => updateGlobal({ value: e.target.value })}
                   />
                 ) : (
-                  <input
+                  <input aria-label="Valor"
                     value={g.value}
                     placeholder="Valor"
                     onChange={(e) => updateGlobal({ value: e.target.value })}
@@ -573,7 +602,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </button>
             )}
           </div>
-          <input
+          <input aria-label="Nome da camada"
             value={selectedLayer.name}
             onChange={(e) =>
               onPatchLayer(selectedLayer.id, (l) => ({ ...l, name: e.target.value }), "coalesced")
@@ -638,7 +667,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         }
                       />
                     </div>
-                    <textarea
+                    <textarea aria-label="Texto da camada"
                       rows={2}
                       value={selectedLayer.text.content}
                       onChange={(e) =>
@@ -653,7 +682,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <select
+                    <select aria-label="Família da fonte"
                       value={selectedLayer.text.fontFamily}
                       onChange={(e) =>
                         onPatchLayer(
@@ -729,6 +758,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         <button
                           key={id}
                           type="button"
+                          aria-label={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                          title={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                          aria-pressed={selectedLayer.text?.align === id}
                           onClick={() =>
                             onPatchLayer(
                               selectedLayer.id,
@@ -799,7 +831,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Texto</span>
                     <div className="flex items-center gap-2">
-                      <input
+                      <input aria-label="Cor do texto"
                         type="color"
                         value={toHexColorInput(selectedLayer.text.color)}
                         onChange={(e) =>
@@ -1072,7 +1104,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Preenchimento</span>
-                    <input
+                    <input aria-label="Cor do preenchimento"
                       type="color"
                       value={toHexColorInput(selectedLayer.progress.fillColor)}
                       onChange={(e) =>
@@ -1101,7 +1133,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   />
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor da Trilha</span>
-                    <input
+                    <input aria-label="Cor da trilha"
                       type="color"
                       value={toHexColorInput(selectedLayer.progress.trackColor)}
                       onChange={(e) =>
@@ -1195,7 +1227,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor Vetorial</span>
                     <div className="flex items-center gap-2">
-                      <input
+                      <input aria-label="Cor vetorial"
                         type="color"
                         value={toHexColorInput(selectedLayer.svg.color)}
                         onChange={(e) =>
@@ -1362,6 +1394,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 const activeDynTex = activeObj.dynamicTextures ?? [];
                 const activeSuggestions: Scene3DAutoSuggestion[] =
                   scene3dInfo?.byObject?.[activeObj.id]?.suggestions ?? [];
+                const quickNodeNames = Array.from(
+                  new Set([...(activeObjInfo?.boneNames ?? []), ...(activeObjInfo?.meshNames ?? [])])
+                );
 
                 return (
                   <div className="space-y-3">
@@ -1446,7 +1481,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                     <EyeOff className="w-3 h-3 opacity-60" />
                                   )}
                                 </button>
-                                <button
+                                <button aria-label="Duplicar objeto 3D"
                                   type="button"
                                   title="Duplicar objeto 3D"
                                   onClick={(e) => {
@@ -1464,7 +1499,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   <Copy className="w-3 h-3" />
                                 </button>
                                 {objs.length > 1 && (
-                                  <button
+                                  <button aria-label="Remover objeto 3D"
                                     type="button"
                                     title="Remover objeto 3D"
                                     onClick={(e) => {
@@ -1487,6 +1522,56 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       </div>
                     </div>
 
+                    {/* Modo Fácil: Ações Rápidas (mesmo estado que o Modo Pro abaixo) */}
+                    <Scene3DQuickActions
+                      objectId={activeObj.id}
+                      primaryObjectId={objs[0]?.id ?? activeObj.id}
+                      isGlb={activeObj.kind === "GLB" && Boolean(activeObj.modelSrc)}
+                      suggestions={activeSuggestions}
+                      materialNames={activeObjInfo?.materialNames ?? []}
+                      nodeNames={quickNodeNames}
+                      bindings={s3d.bindings ?? []}
+                      dynamicTextures={activeDynTex}
+                      pickedPart={pickedPart3d}
+                      onPatchBindings={(fn, commit) =>
+                        fn(s3d.bindings) !== s3d.bindings &&
+                        patch3d((c) => {
+                          const next = fn(c.bindings);
+                          return next === c.bindings ? c : { ...c, bindings: next };
+                        }, commit)
+                      }
+                      onPatchDynTex={(fn, commit) =>
+                        fn(activeObj.dynamicTextures) !== activeObj.dynamicTextures &&
+                        patchActiveObj((o) => {
+                          const next = fn(o.dynamicTextures);
+                          return next === o.dynamicTextures ? o : { ...o, dynamicTextures: next };
+                        }, commit)
+                      }
+                      onPickCustomImage={
+                        onPickDynamicTexImage
+                          ? (texId) => onPickDynamicTexImage(activeObj.id, texId)
+                          : undefined
+                      }
+                      onPickModel={() => onPickFile("model3d")}
+                      onBeginTx={onBeginTx}
+                      onCommitTx={onCommitTx}
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => setShow3dPro(!show3dPro)}
+                      className="w-full flex items-center gap-2 pt-2 border-t border-white/10 text-[11px] font-medium text-[#A1A1AA] hover:text-white transition"
+                      aria-expanded={show3dPro}
+                    >
+                      <span className="flex-1 text-left">
+                        Modo Pro{" "}
+                        <span className="text-[10px] font-normal text-[#71717A]">
+                          · ossos, transform, clips, luz, câmera, bindings ({(s3d.bindings ?? []).length})
+                        </span>
+                      </span>
+                      <span className="text-[10px]">{show3dPro ? "▾" : "▸"}</span>
+                    </button>
+                    {show3dPro && (<>
                     {/* Selected Object File & Blender GLB Replace */}
                     <div className="space-y-2 pt-2 border-t border-white/10">
                       <button
@@ -1775,7 +1860,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       {bgMode === "SOLID" && (
                         <div className="flex items-center justify-between frosted-chrome-card px-3 py-1.5">
                           <span className="text-[11px] text-[#A1A1AA]">Cor do Fundo 3D</span>
-                          <input
+                          <input aria-label="Cor do fundo 3D"
                             type="color"
                             value={toHexColorInput(s3d.backgroundColor, "#07080b")}
                             onChange={(e) =>
@@ -2014,6 +2099,19 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 title={sug.detail}
                                 onClick={() => {
                                   if (sug.kind === "BINDING" && sug.binding) {
+                                    // Idempotente: se já existe binding equivalente (ex.: criado pelas Ações Rápidas), só seleciona
+                                    const sb = sug.binding;
+                                    const twin = (s3d.bindings ?? []).find(
+                                      (x) =>
+                                        (x.objectId || objs[0]?.id) === activeObj.id &&
+                                        x.source === sb.source &&
+                                        x.targetType === sb.targetType &&
+                                        x.targetName === sb.targetName
+                                    );
+                                    if (twin) {
+                                      onSelectBindingId?.(twin.id);
+                                      return;
+                                    }
                                     const b: ReactiveBinding3D = {
                                       ...sug.binding,
                                       id: `b3d-${Math.random().toString(36).slice(2, 9)}`,
@@ -2297,7 +2395,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         Inválido
                                       </span>
                                     )}
-                                    <button
+                                    <button aria-label="Remover regra"
                                       type="button"
                                       onClick={(e) => {
                                         e.stopPropagation();
@@ -2636,7 +2734,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   <span className="text-[11px] text-white font-medium truncate">
                                     Material: {dt.materialName === "*" ? "Todos (*)" : dt.materialName}
                                   </span>
-                                  <button
+                                  <button aria-label="Remover textura dinâmica"
                                     type="button"
                                     onClick={removeDt}
                                     className="p-1 text-[#A1A1AA] hover:text-white"
@@ -2646,7 +2744,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   </button>
                                 </div>
                                 <div className="grid grid-cols-2 gap-1.5">
-                                  <select
+                                  <select aria-label="Material"
                                     value={dt.materialName || "*"}
                                     onChange={(e) => updateDt({ materialName: e.target.value })}
                                     className="bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
@@ -2658,7 +2756,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                       </option>
                                     ))}
                                   </select>
-                                  <select
+                                  <select aria-label="Origem da textura"
                                     value={dt.source}
                                     onChange={(e) =>
                                       updateDt({
@@ -2749,6 +2847,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         Econômico o teto vira 30 FPS e no Ultra, 15 FPS.
                       </p>
                     </div>
+                    </>)}
                   </div>
                 );
               })()}
@@ -3022,7 +3121,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </span>
                     <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                       <span className="text-xs text-[#A1A1AA]">Cor do Véu (Tint)</span>
-                      <input
+                      <input aria-label="Cor do véu"
                         type="color"
                         value={toHexColorInput(selectedLayer.glass.tintColor)}
                         onChange={(e) =>
@@ -3524,6 +3623,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
   return (
     <aside className="fixed top-20 right-4 bottom-4 z-30 w-[352px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
+      <NativeCompatPanel issues={compatIssues} onSelectLayer={onSelectLayer} />
       {/* Top 3-Way Context Switcher */}
       <div className="p-2.5 border-b border-white/10 grid grid-cols-3 gap-1">
         {(
@@ -3555,292 +3655,4 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     </aside>
   );
 };
-
-interface Vec3FieldProps {
-  label: string;
-  value: [number, number, number] | undefined;
-  step: number;
-  min?: number;
-  onCommit: (v: [number, number, number]) => void;
-  onRecordStep: () => void;
-  onFlushSave?: () => void;
-}
-
-/** Numeric X/Y/Z entry: commits on blur/Enter (one undo step), reverts invalid text */
-const Vec3Field: React.FC<Vec3FieldProps> = ({
-  label,
-  value,
-  step,
-  min,
-  onCommit,
-  onRecordStep,
-  onFlushSave,
-}) => {
-  const cur: [number, number, number] = [value?.[0] ?? 0, value?.[1] ?? 0, value?.[2] ?? 0];
-  const [drafts, setDrafts] = useState<[string | null, string | null, string | null]>([
-    null,
-    null,
-    null,
-  ]);
-  const setDraft = (i: number, v: string | null) =>
-    setDrafts((d) => {
-      const n: [string | null, string | null, string | null] = [d[0], d[1], d[2]];
-      n[i] = v;
-      return n;
-    });
-  const commit = (i: number) => {
-    const raw = drafts[i];
-    setDraft(i, null);
-    if (raw === null) return;
-    const parsed = Number(raw.replace(",", "."));
-    if (raw.trim() === "" || !Number.isFinite(parsed)) return;
-    const next = min !== undefined ? Math.max(min, parsed) : parsed;
-    const rounded = Number(next.toFixed(3));
-    if (rounded === cur[i]) return;
-    const out: [number, number, number] = [cur[0], cur[1], cur[2]];
-    out[i] = rounded;
-    onRecordStep();
-    onCommit(out);
-    onFlushSave?.();
-  };
-  const axes = ["X", "Y", "Z"] as const;
-  return (
-    <div className="space-y-1">
-      <span className="block text-xs text-[#A1A1AA]">{label}</span>
-      <div className="grid grid-cols-3 gap-1.5">
-        {axes.map((ax, i) => (
-          <label
-            key={ax}
-            className="flex items-center gap-1 bg-black border border-white/15 rounded-lg px-1.5 py-1 focus-within:border-white/50"
-          >
-            <span className="text-[10px] font-mono-fx text-[#A1A1AA]">{ax}</span>
-            <input
-              type="number"
-              step={step}
-              min={min}
-              value={drafts[i] ?? String(Number(cur[i].toFixed(3)))}
-              onChange={(e) => setDraft(i, e.target.value)}
-              onBlur={() => commit(i)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-                else if (e.key === "Escape") setDraft(i, null);
-              }}
-              className="w-full min-w-0 bg-transparent text-[11px] font-mono-fx text-white outline-none"
-            />
-          </label>
-        ))}
-      </div>
-    </div>
-  );
-};
-
-interface InspectorSliderProps {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  step: number;
-  unit?: string;
-  fxActive?: boolean;
-  onFx?: () => void;
-  onChange: (v: number) => void;
-  onBeginTx: () => void;
-  onCommitTx: () => void;
-  onRecordStep: () => void;
-  onFlushSave?: () => void;
-}
-
-const InspectorSlider: React.FC<InspectorSliderProps> = ({
-  label,
-  value,
-  min,
-  max,
-  step,
-  unit = "",
-  fxActive = false,
-  onFx,
-  onChange,
-  onBeginTx,
-  onCommitTx,
-  onRecordStep,
-  onFlushSave,
-}) => {
-  const clamp = (n: number) => Math.max(min, Math.min(max, Number(n.toFixed(3))));
-  const adjustKeys = new Set([
-    "ArrowLeft",
-    "ArrowRight",
-    "ArrowUp",
-    "ArrowDown",
-    "Home",
-    "End",
-    "PageUp",
-    "PageDown",
-  ]);
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-xs text-[#A1A1AA] truncate">{label}</span>
-        <div className="flex items-center gap-1 shrink-0">
-          <button
-            type="button"
-            onClick={() => {
-              const next = clamp(value - step);
-              if (next === value) return;
-              onRecordStep();
-              onChange(next);
-              onFlushSave?.();
-            }}
-            className="w-5 h-5 rounded bg-white/10 hover:bg-white hover:text-black text-[11px] text-white transition"
-          >
-            −
-          </button>
-          <span className="min-w-[44px] text-center font-mono-fx text-[11px] text-white">
-            {Number.isInteger(step) ? Math.round(value) : value.toFixed(2)}
-            {unit}
-          </span>
-          <button
-            type="button"
-            onClick={() => {
-              const next = clamp(value + step);
-              if (next === value) return;
-              onRecordStep();
-              onChange(next);
-              onFlushSave?.();
-            }}
-            className="w-5 h-5 rounded bg-white/10 hover:bg-white hover:text-black text-[11px] text-white transition"
-          >
-            +
-          </button>
-          {onFx && <FxButton active={fxActive} onClick={onFx} />}
-        </div>
-      </div>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onPointerDown={onBeginTx}
-        onKeyDown={(e) => {
-          if (adjustKeys.has(e.key)) onBeginTx();
-        }}
-        onChange={(e) => onChange(clamp(Number(e.target.value)))}
-        onPointerUp={onCommitTx}
-        onPointerCancel={onCommitTx}
-        onKeyUp={onCommitTx}
-        onBlur={onCommitTx}
-        className="prism-slider"
-      />
-    </div>
-  );
-};
-
-interface BindingTargetOption {
-  value: string;
-  label: string;
-}
-
-interface BindingTargetPickerProps {
-  label: string;
-  targetKind: Scene3DBindingTargetKind;
-  value: string;
-  options: BindingTargetOption[];
-  invalid: boolean;
-  emptyLabel: string;
-  onChange: (next: string) => void;
-}
-
-const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
-  label,
-  targetKind,
-  value,
-  options,
-  invalid,
-  emptyLabel,
-  onChange,
-}) => {
-  const [query, setQuery] = useState("");
-  useEffect(() => {
-    setQuery("");
-  }, [targetKind]);
-
-  const q = query.trim().toLowerCase();
-  const filtered = q
-    ? options.filter(
-        (opt) => opt.label.toLowerCase().includes(q) || opt.value.toLowerCase().includes(q)
-      )
-    : options;
-  const currentInAll = options.find((opt) => opt.value === value);
-  const currentInFiltered = filtered.some((opt) => opt.value === value);
-
-  return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between gap-2 text-[10px] text-[#A1A1AA]">
-        <span>{label}</span>
-        {q && (
-          <span className="font-mono-fx text-[9px] text-[#71717A]">
-            {filtered.length}/{options.length}
-          </span>
-        )}
-      </div>
-      {options.length > 1 && (
-        <div className="relative">
-          <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none" />
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Buscar alvo…"
-            className="w-full bg-black/40 border border-white/10 rounded-lg pl-6 pr-2 py-1 text-[10px] text-white placeholder:text-[#71717A] outline-none focus:border-white/30"
-          />
-        </div>
-      )}
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className={`w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
-          invalid ? "border-red-400/60" : "border-white/15"
-        }`}
-      >
-        {invalid && value && !currentInAll && (
-          <option value={value}>⚠ Inválido: {value}</option>
-        )}
-        {!invalid && currentInAll && !currentInFiltered && (
-          <option value={currentInAll.value}>{currentInAll.label}</option>
-        )}
-        {filtered.length === 0 ? (
-          !value ? (
-            <option value="">
-              {q ? "(Nenhum alvo corresponde à busca)" : emptyLabel}
-            </option>
-          ) : (
-            <option disabled value="__NO_MATCH__">
-              (Nenhum alvo corresponde à busca)
-            </option>
-          )
-        ) : (
-          filtered.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))
-        )}
-      </select>
-    </div>
-  );
-};
-
-// Re-export helper so StudioEditor can add children inside a GROUP cleanly
-export function createGroupChildLayer(kind: LayerKind): SceneLayer {
-  const child = createLayer(kind);
-  if (kind === "TEXT" && child.text) {
-    child.text.fontSize = 44;
-  } else if (kind === "GLASS") {
-    child.width = 240;
-    child.height = 100;
-  } else if (kind === "SVG") {
-    child.width = 48;
-    child.height = 48;
-  }
-  return child;
-}
+export { createGroupChildLayer } from "./InspectorControls";

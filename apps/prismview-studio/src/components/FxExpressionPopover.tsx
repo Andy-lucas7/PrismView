@@ -82,6 +82,8 @@ export const FxExpressionPopover: React.FC<FxExpressionPopoverProps> = ({
         </div>
         <button
           type="button"
+          aria-label="Fechar"
+          title="Fechar"
           onClick={onClose}
           className="p-1 rounded-full text-[#A1A1AA] hover:text-white hover:bg-white/10 transition"
         >
@@ -89,7 +91,7 @@ export const FxExpressionPopover: React.FC<FxExpressionPopoverProps> = ({
         </button>
       </div>
 
-      <textarea
+      <textarea aria-label="$df(HH:mm)$ · CPU $sys(cpu)$%"
         rows={3}
         autoFocus
         value={expr}

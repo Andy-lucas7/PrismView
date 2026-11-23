@@ -85,18 +85,31 @@ impl Drop for EventHandle {
 }
 
 pub(super) fn run(shared: Arc<Shared>) {
-    let _com = ComMta::init();
-    let mut analyzer = AudioAnalyzer::new(48_000);
-    let mut device_id: Vec<u16> = Vec::with_capacity(128);
-    let mut id_scratch: Vec<u16> = Vec::with_capacity(128);
+    let mut com: Option<ComMta> = None;
+    let mut analyzer: Option<AudioAnalyzer> = None;
+    let mut device_id: Vec<u16> = Vec::new();
+    let mut id_scratch: Vec<u16> = Vec::new();
 
     while !shared.stop.load(Ordering::Relaxed) {
         if !shared.bus.is_demanded(SignalKind::AUDIO) {
             shared.bus.clear_audio();
+            // Sem demanda de áudio: libera FFT, buffers e COM até ser necessário.
+            analyzer = None;
+            com = None;
+            device_id = Vec::new();
+            id_scratch = Vec::new();
             shared.idle_wait();
             continue;
         }
-        let end = unsafe { run_session(&shared, &mut analyzer, &mut device_id, &mut id_scratch) };
+        if com.is_none() {
+            com = Some(ComMta::init());
+        }
+        let analyzer = analyzer.get_or_insert_with(|| AudioAnalyzer::new(48_000));
+        if device_id.capacity() == 0 {
+            device_id.reserve(128);
+            id_scratch.reserve(128);
+        }
+        let end = unsafe { run_session(&shared, analyzer, &mut device_id, &mut id_scratch) };
         match end {
             SessionEnd::Idle | SessionEnd::DeviceChanged => {}
             SessionEnd::Failed => {

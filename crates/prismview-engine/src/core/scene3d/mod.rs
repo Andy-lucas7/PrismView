@@ -28,10 +28,14 @@ pub mod graph;
 pub mod instance;
 pub mod lighting;
 pub mod renderer;
+pub mod sculptures;
 
+#[allow(unused_imports)]
 pub use config::{
     Scene3dBackgroundMode, Scene3dCamera, Scene3dConfig, Scene3dEnvPreset, Scene3dObject,
     Scene3dObjectKind, Scene3dPlayback,
 };
+#[allow(unused_imports)]
 pub use graph::SceneGraph;
+#[allow(unused_imports)]
 pub use renderer::{Scene3dOptions, Scene3dRenderer, Scene3dShared, Scene3dStats};

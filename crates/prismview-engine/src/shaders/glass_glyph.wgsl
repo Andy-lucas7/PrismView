@@ -27,12 +27,20 @@ fn vs_full(@builtin(vertex_index) vi: u32) -> FVOut {
     return out;
 }
 
-fn region_clamp(p: vec2<i32>) -> vec2<i32> {
+fn in_region(p: vec2<i32>) -> bool {
     let r = vec2<i32>(i32(pp.b.x), i32(pp.b.y));
-    return clamp(p, vec2<i32>(0), r - vec2<i32>(1));
+    return p.x >= 0 && p.y >= 0 && p.x < r.x && p.y < r.y;
 }
 
-// Gaussiana separável (equivale ao `ctx.filter = blur(σpx)` do canvas 2D). Lê o canal alpha.
+fn mask_at(p: vec2<i32>) -> f32 {
+    if (!in_region(p)) {
+        return 0.0;
+    }
+    return textureLoad(src_a, p, 0).a;
+}
+
+// Gaussiana separável (equivale ao `ctx.filter = blur(σpx)` do canvas 2D). Lê o canal alpha
+// com zero-padding fora da região para que o bisel nas bordas da caixa decaia suavemente.
 @fragment
 fn fs_gauss(in: FVOut) -> @location(0) vec4<f32> {
     let p = vec2<i32>(in.pos.xy);
@@ -40,12 +48,11 @@ fn fs_gauss(in: FVOut) -> @location(0) vec4<f32> {
     let sigma = max(pp.a.z, 0.3);
     let radius = i32(pp.a.w);
     let inv2s2 = 0.5 / (sigma * sigma);
-    var sum = textureLoad(src_a, region_clamp(p), 0).a;
+    var sum = mask_at(p);
     var wsum = 1.0;
     for (var i = 1; i <= radius; i = i + 1) {
         let w = exp(-f32(i * i) * inv2s2);
-        sum = sum + (textureLoad(src_a, region_clamp(p + axis * i), 0).a
-            + textureLoad(src_a, region_clamp(p - axis * i), 0).a) * w;
+        sum = sum + (mask_at(p + axis * i) + mask_at(p - axis * i)) * w;
         wsum = wsum + 2.0 * w;
     }
     let v = sum / wsum;
@@ -53,14 +60,17 @@ fn fs_gauss(in: FVOut) -> @location(0) vec4<f32> {
 }
 
 fn height_at(p: vec2<i32>) -> f32 {
-    return textureLoad(src_b, region_clamp(p), 0).a;
+    if (!in_region(p)) {
+        return 0.0;
+    }
+    return textureLoad(src_b, p, 0).a;
 }
 
 // Sobel na GPU: R = nx, G = ny, B = inclinação da borda, A = alpha nítido (igual à passada do TS).
 @fragment
 fn fs_pack(in: FVOut) -> @location(0) vec4<f32> {
     let p = vec2<i32>(in.pos.xy);
-    let sharp_a = textureLoad(src_a, region_clamp(p), 0).a;
+    let sharp_a = mask_at(p);
     if (sharp_a * 255.0 < 3.0) {
         return vec4<f32>(128.0 / 255.0, 128.0 / 255.0, 0.0, 0.0);
     }
@@ -76,8 +86,9 @@ fn fs_pack(in: FVOut) -> @location(0) vec4<f32> {
     let gx = (tl + 2.0 * l + bl) - (tr + 2.0 * r + br);
     let gy = (tl + 2.0 * t + tr) - (bl + 2.0 * b + br);
     let slope = length(vec2<f32>(gx, gy));
-    if (slope > 0.004) {
-        let gain = min(1.0, slope * 2.2);
+    let bevel_sigma = max(pp.a.x, 1.5);
+    if (slope > 0.002) {
+        let gain = min(1.0, slope * max(2.2, bevel_sigma * 0.9));
         let n = vec2<f32>(gx, gy) / slope * gain;
         let packed = clamp(vec2<f32>(128.0) + n * 126.0, vec2<f32>(0.0), vec2<f32>(255.0)) / 255.0;
         return vec4<f32>(packed, gain, sharp_a);

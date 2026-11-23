@@ -240,7 +240,7 @@ export const Scene3DOutliner: React.FC<Scene3DOutlinerProps> = ({
       </div>
       <div className="relative">
         <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none" />
-        <input
+        <input aria-label="Buscar osso, malha, morph, material…"
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}

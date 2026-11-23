@@ -17,11 +17,15 @@ pub mod meshopt;
 pub mod model;
 pub mod vault;
 
+#[allow(unused_imports)]
 pub use gltf_loader::{parse_model, LoaderConfig};
+#[allow(unused_imports)]
 pub use loader::{load_model_file, AssetLoader, LoadEvent, Ticket};
+#[allow(unused_imports)]
 pub use model::{
     Aabb, AlphaMode, AnimPath, AnimationChannel, AnimationClip, AssetError, Interpolation,
     MaterialData, MeshData, ModelAsset, MorphTargetData, NodeData, PrimitiveData, SkinData,
     TexelFormat, TextureAsset, TextureLevel, TextureSlot,
 };
+#[allow(unused_imports)]
 pub use vault::{AssetHash, AssetVault, PathKey, Vault, VaultStats};

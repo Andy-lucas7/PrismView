@@ -141,6 +141,8 @@ pub struct PowerCaps {
     pub post_processing: bool,
     /// Teto da escala de render do 3D (`Scene3dRenderer::set_render_scale_cap`).
     pub render_scale_cap: f32,
+    /// Teto de MSAA do 3D (4 ou 1; `Scene3dRenderer::set_msaa_cap`).
+    pub msaa: u32,
 }
 
 impl PowerCaps {
@@ -214,16 +216,19 @@ impl Level {
                 fps_cap: None,
                 post_processing: true,
                 render_scale_cap: 1.0,
+                msaa: 4,
             },
             Self::Eco => PowerCaps {
                 fps_cap: Some(ECO_FPS),
                 post_processing: false,
                 render_scale_cap: 0.85,
+                msaa: 1,
             },
             Self::Ultra => PowerCaps {
                 fps_cap: Some(ULTRA_FPS),
                 post_processing: false,
                 render_scale_cap: 0.6,
+                msaa: 1,
             },
         }
     }

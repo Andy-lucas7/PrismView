@@ -25,6 +25,8 @@ export interface KeyboardShortcutsConfig {
   room?: RoomShortcuts;
   onUndo: () => void;
   onRedo: () => void;
+  /** Ctrl+S: força o salvamento pendente (funciona também com foco em campo de texto). */
+  onSave?: () => void;
   onDelete: () => void;
   onNudge: (dxPx: number, dyPx: number) => void;
   onCopy?: () => void;
@@ -49,10 +51,14 @@ export function useKeyboardShortcuts(config: KeyboardShortcutsConfig): void {
     const handleKeyDown = (e: KeyboardEvent) => {
       const cfg = ref.current;
       if (!cfg.enabled) return;
-      if (isEditableElement(e.target)) return;
-
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
+      if (mod && key === "s" && !e.shiftKey && !e.altKey && cfg.onSave) {
+        e.preventDefault();
+        cfg.onSave();
+        return;
+      }
+      if (isEditableElement(e.target)) return;
 
       if (mod && key === "z" && !e.shiftKey) {
         e.preventDefault();

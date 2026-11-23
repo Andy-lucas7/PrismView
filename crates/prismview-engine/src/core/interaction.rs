@@ -77,6 +77,29 @@ impl HitRegion {
         })
     }
 
+    /// Aplica `p' = lin·p + t` (delta de binding no caminho rápido do `scene2d`).
+    pub fn transform(&mut self, lin: [f32; 4], t: [f32; 2]) {
+        let c = self.center;
+        self.center = [
+            lin[0] * c[0] + lin[2] * c[1] + t[0],
+            lin[1] * c[0] + lin[3] * c[1] + t[1],
+        ];
+        // inv' = inv · lin⁻¹ (a nova parte linear é lin · M).
+        let det = lin[0] * lin[3] - lin[2] * lin[1];
+        if !det.is_finite() || det.abs() < 1e-8 {
+            return;
+        }
+        let k = 1.0 / det;
+        let li = [lin[3] * k, -lin[1] * k, -lin[2] * k, lin[0] * k];
+        let a = self.inv;
+        self.inv = [
+            a[0] * li[0] + a[2] * li[1],
+            a[1] * li[0] + a[3] * li[1],
+            a[0] * li[2] + a[2] * li[3],
+            a[1] * li[2] + a[3] * li[3],
+        ];
+    }
+
     pub fn contains(&self, p: [f32; 2]) -> bool {
         let d = [p[0] - self.center[0], p[1] - self.center[1]];
         let lx = self.inv[0] * d[0] + self.inv[2] * d[1];
@@ -89,11 +112,36 @@ impl HitRegion {
 #[derive(Debug, Default)]
 pub struct HitMap {
     regions: Vec<HitRegion>,
+    /// Cópia do último rebuild (base dos deltas de binding, sem deriva).
+    base: Vec<HitRegion>,
 }
 
 impl HitMap {
     pub fn clear(&mut self) {
         self.regions.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.regions.len()
+    }
+
+    pub fn snapshot_base(&mut self) {
+        self.base.clear();
+        self.base.extend_from_slice(&self.regions);
+    }
+
+    pub fn reset_to_base(&mut self) {
+        if self.base.len() == self.regions.len() {
+            self.regions.copy_from_slice(&self.base);
+        }
+    }
+
+    pub fn transform_range(&mut self, range: std::ops::Range<usize>, lin: [f32; 4], t: [f32; 2]) {
+        if let Some(slice) = self.regions.get_mut(range) {
+            for region in slice {
+                region.transform(lin, t);
+            }
+        }
     }
 
     pub fn push(&mut self, region: HitRegion) {

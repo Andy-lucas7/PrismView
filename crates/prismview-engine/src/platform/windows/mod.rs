@@ -21,15 +21,20 @@
 //! event_loop::run(&mut host, &mut renderer);
 //! ```
 
+mod dcomp_surface;
 mod desktop_hit;
+pub mod log_file;
 pub mod event_loop;
+pub mod fonts;
 pub mod monitors;
 pub mod sensors;
 mod shell;
 mod signals;
+pub mod tray;
 mod util;
 pub mod video;
 mod visibility;
+pub mod widget;
 mod win_events;
 mod window;
 pub mod workerw;
@@ -45,18 +50,39 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer, RegisterWindowMessageW,
 };
 
+pub use dcomp_surface::wallpaper_presenter;
 pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
+pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
-pub use shell::shell_open;
+pub use shell::{acquire_single_instance, open_studio, set_windows_desktop_wallpaper, shell_open};
+pub use tray::{parse_tray_enabled, TrayAction};
+#[allow(unused_imports)]
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
+pub use widget::{WidgetWindow, WidgetWindowConfig};
 pub use workerw::{DesktopLayer, ShellLayout};
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn SetProcessWorkingSetSize(hprocess: *mut std::ffi::c_void, min: usize, max: usize) -> i32;
+}
+
+/// Solicita ao gerenciador de memória do Windows devolver páginas frias (compilação de shaders,
+/// decodificação inicial de PNGs, hibernação) sem impactar o caminho quente de renderização.
+pub fn trim_working_set() {
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
 
 use self::monitors::{enumerate, ensure_per_monitor_dpi_awareness, same_layout};
 use self::signals::{
     ExpectedDestroy, ALL_TIMERS, LOOP_SIGNALS, SIG_FOREGROUND, SIG_MONITORS, SIG_SESSION,
-    SIG_SHELL_RETRY, SIG_VISIBILITY, SIG_WINDOW_LOST, TIMER_SHELL, TIMER_VISIBILITY,
+    SIG_SHELL_RETRY, SIG_TASKBAR_CREATED, SIG_VISIBILITY, SIG_WINDOW_LOST, TIMER_SHELL,
+    TIMER_VISIBILITY,
 };
+use self::tray::TrayIcon;
 use self::util::{hwnd_from_id, id_from_hwnd, os_error, window_pid};
 use self::visibility::Presence;
 use self::win_events::WinEventHooks;
@@ -128,6 +154,7 @@ pub struct Win32DesktopHost {
     attachments: Vec<Attachment>,
     pending: Vec<DesktopEvent>,
     hooks: Option<WinEventHooks>,
+    tray: TrayIcon,
 }
 
 impl Win32DesktopHost {
@@ -142,6 +169,7 @@ impl Win32DesktopHost {
             .map_err(|e| os_error("GetModuleHandleW", e))?
             .into();
         window::register_classes(hinstance)?;
+        widget::register_class(hinstance)?;
         let controller = window::create_controller(hinstance)?;
 
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -174,6 +202,7 @@ impl Win32DesktopHost {
             attachments: Vec::new(),
             pending: Vec::with_capacity(EVENT_QUEUE_CAPACITY),
             hooks: None,
+            tray: TrayIcon::new(controller),
         };
 
         enumerate(&mut host.monitors)?;
@@ -202,6 +231,21 @@ impl Win32DesktopHost {
     /// Proxy `Send + Sync` para acordar/encerrar o loop de outra thread.
     pub fn proxy(&self) -> LoopProxy {
         LoopProxy::new(self.controller)
+    }
+
+    /// Mostra ou oculta o ícone da engine na bandeja do sistema em tempo real.
+    pub fn set_tray_visible(&mut self, visible: bool) {
+        self.tray.set_visible(visible);
+    }
+
+    /// Atualiza o tooltip do ícone da bandeja conforme o estado de pausa.
+    pub fn set_tray_paused(&mut self, paused: bool) {
+        self.tray.set_paused(paused);
+    }
+
+    /// Exibe o menu de contexto nativo da bandeja e devolve a ação escolhida.
+    pub fn show_tray_menu(&self, paused: bool) -> Option<TrayAction> {
+        self.tray.show_context_menu(paused)
     }
 
     /// Monitores atuais (sem alocar).
@@ -274,6 +318,43 @@ impl Win32DesktopHost {
         Ok(id_from_hwnd(hwnd))
     }
 
+    /// Cria uma janela de widget nativo (independente dos monitores de wallpaper). O chamador é
+    /// dono dela: soltar a superfície/presenter antes de soltar a janela.
+    pub fn create_widget_window(&self, cfg: &WidgetWindowConfig) -> PlatformResult<WidgetWindow> {
+        WidgetWindow::create(self.hinstance, cfg)
+    }
+
+    /// Presenter DirectComposition por superfície (alpha pré-multiplicado, sem `Present`: overlays
+    /// de jogos não se penduram no widget) para a janela de widget.
+    pub fn create_widget_presenter(
+        &self,
+        gpu: &crate::engine_core::gpu::GpuContext,
+        window: &WidgetWindow,
+        width: u32,
+        height: u32,
+    ) -> PlatformResult<dcomp_surface::DCompSurfacePresenter> {
+        dcomp_surface::DCompSurfacePresenter::new(gpu, window.hwnd(), width, height, true)
+    }
+
+    /// Último clique local em widget: `(janela, x, y)` em px do cliente.
+    pub fn take_widget_click(&self) -> Option<(NativeWindowId, i32, i32)> {
+        let (hwnd, x, y) = signals::take_widget_click();
+        (hwnd != 0).then_some((NativeWindowId(hwnd), x, y))
+    }
+
+    /// Solta todas as superfícies de wallpaper (o Windows volta a pintar o próprio fundo).
+    /// Superfícies wgpu delas devem ter caído antes.
+    pub fn detach_all_wallpapers(&mut self) {
+        let attachments = std::mem::take(&mut self.attachments);
+        let had = !attachments.is_empty();
+        for attachment in &attachments {
+            self.release_attachment(attachment);
+        }
+        if had && self.config.refresh_wallpaper_on_detach {
+            window::refresh_system_wallpaper();
+        }
+    }
+
     /// Move os eventos pendentes para `out` sem alocar (troca de buffers).
     pub(crate) fn drain_events_into(&mut self, out: &mut Vec<DesktopEvent>) {
         out.clear();
@@ -303,6 +384,9 @@ impl Win32DesktopHost {
         let mut reevaluate = sig & (SIG_VISIBILITY | SIG_FOREGROUND | SIG_SESSION) != 0;
         if sig & SIG_MONITORS != 0 && self.refresh_monitors() {
             reevaluate = true;
+        }
+        if sig & SIG_TASKBAR_CREATED != 0 {
+            self.tray.restore_if_visible();
         }
         if sig & SIG_SHELL_RETRY != 0 {
             self.reattach_after_shell_change();
@@ -394,9 +478,20 @@ impl Win32DesktopHost {
         }
     }
 
+    /// Redescobre a camada WorkerW/Progman e reanexa/reordena todas as superfícies de wallpaper
+    /// (ex.: logo após `SPI_SETDESKWALLPAPER`, quando o Explorer traz o WorkerW estático para cima).
+    /// Retorna `true` se a camada do desktop ou algum HWND mudou (exigindo recriar superfícies GPU).
+    pub fn reattach_wallpapers(&mut self) -> bool {
+        self.reattach_after_shell_change_inner(false)
+    }
+
     /// Explorer reiniciou ou destruiu nossas janelas: redescobre a camada, recria as
     /// superfícies próprias perdidas e reanexa tudo. Emite `ShellRestarted` se algo mudou.
     fn reattach_after_shell_change(&mut self) {
+        let _ = self.reattach_after_shell_change_inner(true);
+    }
+
+    fn reattach_after_shell_change_inner(&mut self, emit_event: bool) -> bool {
         let layer = match workerw::discover(self.config.shell_message_timeout_ms) {
             Ok(layer) => layer,
             Err(_) => {
@@ -404,7 +499,7 @@ impl Win32DesktopHost {
                     self.shell_retries += 1;
                     signals::schedule_ms(TIMER_SHELL, SHELL_RETRY_INTERVAL_MS);
                 }
-                return;
+                return false;
             }
         };
         self.shell_retries = 0;
@@ -435,9 +530,13 @@ impl Win32DesktopHost {
         }
         self.attachments.retain(|a| unsafe { IsWindow(a.hwnd) }.as_bool());
 
-        if changed {
+        if !self.attachments.is_empty() {
+            signals::raise(signals::SIG_REPAINT);
+        }
+        if emit_event && changed {
             self.pending.push(DesktopEvent::ShellRestarted);
         }
+        changed
     }
 
     fn evaluate_visibility(&mut self, emit: bool) {
@@ -552,6 +651,7 @@ impl DesktopHost for Win32DesktopHost {
 
 impl Drop for Win32DesktopHost {
     fn drop(&mut self) {
+        self.tray.hide();
         let had_attachments = !self.attachments.is_empty();
         let attachments = std::mem::take(&mut self.attachments);
         for attachment in &attachments {

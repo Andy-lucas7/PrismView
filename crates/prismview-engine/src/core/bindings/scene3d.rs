@@ -16,7 +16,7 @@ use glam::{EulerRot, Quat};
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{or_default, spring_alpha, spring_step, Axis, BindingInput};
+use super::{formula_unit, or_default, spring_alpha, spring_step, spring_step_wrapped, Axis, BindingInput};
 use crate::engine_core::scene3d::instance::ModelInstance;
 use crate::engine_core::signals::{SignalKind, SignalSnapshot};
 
@@ -41,6 +41,12 @@ struct Binding3dSpec {
     invert_y: bool,
     axis: Option<String>,
     invert_axis: bool,
+    /// `source = FORMULA`: expressão FX (`$df(m)$`, `$mi(pos)$ / $mi(dur)$`...).
+    formula: String,
+    formula_min: Option<f32>,
+    formula_max: Option<f32>,
+    /// Faixa circular (ponteiro de relógio, loop de clipe): a mola segue o caminho mais curto.
+    formula_wrap: bool,
 }
 
 impl Default for Binding3dSpec {
@@ -59,6 +65,10 @@ impl Default for Binding3dSpec {
             invert_y: false,
             axis: None,
             invert_axis: false,
+            formula: String::new(),
+            formula_min: None,
+            formula_max: None,
+            formula_wrap: false,
         }
     }
 }
@@ -73,11 +83,14 @@ enum Target3d {
     RotateSpin,
     RotateSwing,
     MoveOffset,
+    /// Tempo do clipe = valor do binding × duração (pose dirigida por fórmula/sinal).
+    ClipScrub,
 }
 
 impl Target3d {
     fn parse(raw: &str) -> Option<Self> {
         Some(match raw.trim() {
+            "CLIP_SCRUB" => Self::ClipScrub,
             "NODE_LOOK_AT" => Self::LookAt,
             "PLAY_CLIP" => Self::PlayClip,
             "EMISSIVE_GLOW" => Self::EmissiveGlow,
@@ -146,6 +159,12 @@ struct Binding3d {
     invert_y: bool,
     axis: Axis,
     sign: f32,
+    /// `FORMULA`: expressão, faixa e último valor bruto avaliado pelo host.
+    formula: String,
+    formula_min: f32,
+    formula_max: f32,
+    formula_wrap: bool,
+    formula_value: f32,
     state: State,
     res: Resolved,
 }
@@ -201,14 +220,18 @@ impl BindingSolver3d {
             else {
                 continue;
             };
+            if input == BindingInput::Formula && spec.formula.trim().is_empty() {
+                continue;
+            }
             demand |= input.kind();
             has_hover |= input == BindingInput::HoverMesh;
             has_click |= input == BindingInput::ClickMesh;
-            let state = old
-                .iter()
-                .find(|b| !spec.id.is_empty() && b.id == spec.id)
-                .map(|b| b.state)
-                .unwrap_or_default();
+            let prev = old.iter().find(|b| !spec.id.is_empty() && b.id == spec.id);
+            let state = prev.map(|b| b.state).unwrap_or_default();
+            // Mesma fórmula: mantém o último valor até o host reavaliar (sem salto para 0).
+            let formula_value = prev
+                .filter(|b| b.formula == spec.formula)
+                .map_or(f32::NAN, |b| b.formula_value);
             let key = u32::try_from(self.bindings.len()).unwrap_or(u32::MAX);
             self.bindings.push(Binding3d {
                 id: spec.id,
@@ -224,6 +247,11 @@ impl BindingSolver3d {
                 invert_y: spec.invert_y,
                 axis: Axis::parse(spec.axis.as_deref()),
                 sign: if spec.invert_axis { -1.0 } else { 1.0 },
+                formula: spec.formula,
+                formula_min: spec.formula_min.unwrap_or(0.0),
+                formula_max: spec.formula_max.unwrap_or(1.0),
+                formula_wrap: spec.formula_wrap,
+                formula_value,
                 state,
                 res: Resolved::default(),
             });
@@ -259,6 +287,32 @@ impl BindingSolver3d {
 
     pub fn set_hover(&mut self, hit: Option<PickHit>) {
         self.hover = hit;
+    }
+
+    /// Há bindings `FORMULA` (o host precisa avaliá-las quando o contexto FX muda).
+    pub fn has_formulas(&self) -> bool {
+        self.bindings.iter().any(|b| b.input == BindingInput::Formula)
+    }
+
+    /// Reavalia as fórmulas com `eval` (expressão → número; `None` = inválida, conta como 0).
+    /// Chamar só quando o contexto FX mudou (relógio/mídia/telemetria/globais), nunca por quadro.
+    /// `true` se algum valor mudou (o renderer precisa de um quadro).
+    pub fn update_formulas(&mut self, mut eval: impl FnMut(&str) -> Option<f32>) -> bool {
+        let mut changed = false;
+        for b in &mut self.bindings {
+            if b.input != BindingInput::Formula {
+                continue;
+            }
+            let v = eval(&b.formula).filter(|v| v.is_finite()).unwrap_or(0.0);
+            if v.to_bits() != b.formula_value.to_bits() {
+                b.formula_value = v;
+                changed = true;
+            }
+        }
+        if changed {
+            self.animating = true;
+        }
+        changed
     }
 
     /// Alguma mola/giro/pulso ainda se move → o loop precisa de mais quadros.
@@ -331,6 +385,10 @@ impl BindingSolver3d {
                     }
                 }
                 Target3d::PlayClip => b.res.clip = inst.clip_index(name),
+                // Scrub sem nome = 1º clipe do modelo (rig de "pose por valor").
+                Target3d::ClipScrub => {
+                    b.res.clip = inst.clip_index(name).or_else(|| (name.is_empty() && inst.model.rig.animations.first().is_some()).then_some(0));
+                }
                 _ => {}
             }
 
@@ -418,6 +476,14 @@ impl BindingSolver3d {
             match b.input {
                 BindingInput::Signal(_) => {
                     let raw = b.input.scalar(snap);
+                    let alpha = spring_alpha(b.smoothing, 0.18, dt);
+                    animating |= apply_scalar(b, inst, raw, alpha, dt);
+                }
+                BindingInput::Formula => {
+                    if b.formula_value.is_nan() {
+                        continue; // ainda não avaliada pelo host
+                    }
+                    let raw = formula_unit(b.formula_value, b.formula_min, b.formula_max);
                     let alpha = spring_alpha(b.smoothing, 0.18, dt);
                     animating |= apply_scalar(b, inst, raw, alpha, dt);
                 }
@@ -536,7 +602,11 @@ fn apply_scalar(b: &mut Binding3d, inst: &mut ModelInstance, raw: f32, alpha: f3
         return false; // o próprio clipe mantém o loop acordado
     }
 
-    let moved = spring_step(&mut b.state.weight, raw, alpha);
+    let moved = if b.formula_wrap {
+        spring_step_wrapped(&mut b.state.weight, raw, alpha)
+    } else {
+        spring_step(&mut b.state.weight, raw, alpha)
+    };
     let w = b.state.weight;
     let spinning = b.target == Target3d::RotateSpin && w.abs() > 1e-4;
     let moving = moved || spinning;
@@ -580,6 +650,13 @@ fn apply_scalar(b: &mut Binding3d, inst: &mut ModelInstance, raw: f32, alpha: f3
         }
         Target3d::MoveOffset => {
             add_axis_offset(inst, b.res.node, b.axis, w * or_default(b.strength, 0.15) * b.sign);
+        }
+        Target3d::ClipScrub => {
+            if let Some(clip) = b.res.clip {
+                // `strength` = fração do clipe percorrida (padrão 1 = clipe inteiro).
+                let span = or_default(b.strength, 1.0).clamp(0.0, 1.0);
+                inst.scrub_clip(clip, w * span);
+            }
         }
         Target3d::LookAt | Target3d::PlayClip => {}
     }
@@ -664,6 +741,34 @@ mod tests {
         assert_eq!(s.bindings[0].axis, Axis::X);
         assert_eq!(s.bindings[0].sign, -1.0);
         assert!(s.demand().contains(SignalKind::AUDIO));
+    }
+
+    #[test]
+    fn formula_binding_and_clip_scrub_parse() {
+        let arm = serde_json::json!({
+            "id": "arm", "enabled": true, "source": "FORMULA", "formula": "$df(m)$",
+            "formulaMin": 0, "formulaMax": 60, "formulaWrap": true,
+            "targetType": "NODE_ROTATE_SWING", "targetName": "UpperArm_R", "strength": 360, "axis": "Z"
+        });
+        let pose = serde_json::json!({
+            "id": "pose", "source": "FORMULA", "formula": "$df(H)$", "formulaMax": 24,
+            "targetType": "CLIP_SCRUB", "targetName": "Clock"
+        });
+        // Fórmula vazia é descartada (nada a avaliar).
+        let empty = serde_json::json!({ "id": "x", "source": "FORMULA", "targetType": "NODE_ROTATE_SWING" });
+        let mut s = BindingSolver3d::new();
+        s.set_specs(&[arm, pose, empty]);
+        assert_eq!(s.bindings.len(), 2);
+        assert!(s.has_formulas());
+        assert_eq!(s.bindings[0].formula_max, 60.0);
+        assert!(s.bindings[0].formula_wrap);
+        assert_eq!(s.bindings[1].target, Target3d::ClipScrub);
+        // Fórmulas não acordam sensores sozinhas (o host decide pelas dependências FX).
+        assert_eq!(s.demand(), SignalKind::NONE);
+        // Host avalia: 1ª vez muda; mesmo valor de novo não pede quadro.
+        assert!(s.update_formulas(|e| Some(if e.contains('m') { 30.0 } else { 6.0 })));
+        assert!(!s.update_formulas(|e| Some(if e.contains('m') { 30.0 } else { 6.0 })));
+        assert_eq!(s.bindings[0].formula_value, 30.0);
     }
 
     #[test]

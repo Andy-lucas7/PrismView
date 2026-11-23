@@ -1,17 +1,13 @@
-// Pirâmide de blur do vidro óptico (core/glass.rs): Dual Kawase em resolução reduzida.
+// Pirâmide de blur do vidro óptico (core/glass/blur.rs): downsample 2× anti-aliased +
+// Gaussiana separável contínua de 15 taps (passo exato de 1,0 texel — zero ghosting, zero
+// artefatos de caixa e paridade 1:1 com `opticalGlassWebGL.ts` do Estúdio).
 //
-// Três passes de fragmento sobre um triângulo de tela cheia, todos lendo `src_tex` e
-// escrevendo num alvo Rgba16Float:
-//   fs_down_first : fonte em resolução cheia -> 1/4 (4 taps bilineares em ±1 texel = caixa 4x4
-//                   exata, sem aliasing num único passe).
-//   fs_down       : nível i-1 -> nível i (1/2), filtro Kawase de 5 taps.
-//   fs_up         : nível i+1 -> nível i (2x), filtro Kawase de 8 taps; `offset` controla o raio.
-//
-// `texel` = 1 / tamanho da TEXTURA DE ORIGEM de cada passe. Os valores ficam em codificação de
-// tela (sem linearizar), igual ao WebGL2 do Estúdio (opticalGlassWebGL.ts).
+// Preserva os 4 canais RGBA pré-multiplicados quando `a.w < 0.5` (ex.: cena 3D transparente),
+// ou força alpha = 1.0 quando `a.w >= 0.5` (vídeo/imagem opacos).
 
-// Slot de 32 bytes do `ParamRing` (compartilhado com os passes de glifo): a = (texel.xy, offset, 0).
 struct Params {
+    // fs_down:  (half_texel.xy, 0, force_opaque)
+    // fs_gauss: (axis_step.xy, sigma, force_opaque)
     a: vec4<f32>,
     b: vec4<f32>,
 };
@@ -27,7 +23,6 @@ struct VOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
-    // Triângulo gigante: (0,0) (2,0) (0,2) -> clip (-1,-1) (3,-1) (-1,3).
     let x = f32((vi << 1u) & 2u);
     let y = f32(vi & 2u);
     var out: VOut;
@@ -37,41 +32,40 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
     return out;
 }
 
-fn tap(uv: vec2<f32>) -> vec3<f32> {
-    return textureSampleLevel(src_tex, src_smp, uv, 0.0).rgb;
-}
-
-@fragment
-fn fs_down_first(in: VOut) -> @location(0) vec4<f32> {
-    let t = p.a.xy;
-    var c = tap(in.uv + vec2<f32>(-t.x, -t.y));
-    c += tap(in.uv + vec2<f32>(t.x, -t.y));
-    c += tap(in.uv + vec2<f32>(-t.x, t.y));
-    c += tap(in.uv + vec2<f32>(t.x, t.y));
-    return vec4<f32>(c * 0.25, 1.0);
+fn tap(uv: vec2<f32>) -> vec4<f32> {
+    let c = clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999));
+    let s = textureSampleLevel(src_tex, src_smp, c, 0.0);
+    if (p.a.w >= 0.5) {
+        return vec4<f32>(s.rgb, 1.0);
+    }
+    return s;
 }
 
 @fragment
 fn fs_down(in: VOut) -> @location(0) vec4<f32> {
-    let t = p.a.xy * p.a.z;
-    var c = tap(in.uv) * 4.0;
-    c += tap(in.uv + vec2<f32>(-t.x, -t.y));
-    c += tap(in.uv + vec2<f32>(t.x, -t.y));
-    c += tap(in.uv + vec2<f32>(-t.x, t.y));
-    c += tap(in.uv + vec2<f32>(t.x, t.y));
-    return vec4<f32>(c * 0.125, 1.0);
+    let h = p.a.xy;
+    var c = tap(in.uv + vec2<f32>(-h.x, -h.y));
+    c += tap(in.uv + vec2<f32>(h.x, -h.y));
+    c += tap(in.uv + vec2<f32>(-h.x, h.y));
+    c += tap(in.uv + vec2<f32>(h.x, h.y));
+    return c * 0.25;
 }
 
 @fragment
-fn fs_up(in: VOut) -> @location(0) vec4<f32> {
-    let h = p.a.xy * (0.5 * p.a.z);
-    var c = tap(in.uv + vec2<f32>(-2.0 * h.x, 0.0));
-    c += tap(in.uv + vec2<f32>(-h.x, h.y)) * 2.0;
-    c += tap(in.uv + vec2<f32>(0.0, 2.0 * h.y));
-    c += tap(in.uv + vec2<f32>(h.x, h.y)) * 2.0;
-    c += tap(in.uv + vec2<f32>(2.0 * h.x, 0.0));
-    c += tap(in.uv + vec2<f32>(h.x, -h.y)) * 2.0;
-    c += tap(in.uv + vec2<f32>(0.0, -2.0 * h.y));
-    c += tap(in.uv + vec2<f32>(-h.x, -h.y)) * 2.0;
-    return vec4<f32>(c * (1.0 / 12.0), 1.0);
+fn fs_gauss(in: VOut) -> @location(0) vec4<f32> {
+    let step = p.a.xy;
+    let sigma = max(p.a.z, 0.28);
+    let inv2s2 = 0.5 / (sigma * sigma);
+    var sum = tap(in.uv);
+    var wsum = 1.0;
+
+    for (var i = 1; i <= 7; i = i + 1) {
+        let fi = f32(i);
+        let w = exp(-fi * fi * inv2s2);
+        let off = step * fi;
+        sum += (tap(in.uv + off) + tap(in.uv - off)) * w;
+        wsum += 2.0 * w;
+    }
+
+    return sum / wsum;
 }
