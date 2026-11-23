@@ -1,5 +1,6 @@
 // Controles reutilizáveis do Inspetor (PLANO_CORRECAO 5.1): Vec3Field, InspectorSlider, BindingTargetPicker e createGroupChildLayer.
 import { NativeCompatPanel } from "./NativeCompatPanel";
+import { Select } from "./ui/Controls";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -307,7 +308,7 @@ export const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
           />
         </div>
       )}
-      <select aria-label={label}
+      <Select aria-label={label}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={`w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
@@ -337,7 +338,7 @@ export const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
             </option>
           ))
         )}
-      </select>
+      </Select>
     </div>
   );
 };

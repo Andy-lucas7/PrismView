@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { COLLAPSE, POP } from "./motion/Presence";
+import { COLLAPSE, POP, ROW } from "./motion/Presence";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowDown,
@@ -1472,7 +1472,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     const dropInside = isDropTarget && treeDrag?.placement === "inside";
 
     return (
-      <div key={layer.id} className="space-y-1">
+      <motion.div key={layer.id} layout="position" {...ROW} className="space-y-1">
         <div
           data-layer-drop-id={layer.id}
           data-layer-is-group={isGroup ? "1" : "0"}
@@ -1592,16 +1592,18 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </button>
           </div>
         </div>
-        {isGroup && expanded && children.length > 0 && (
-          <div className="space-y-1 border-l border-white/15 ml-2.5 pl-1">
-            {[...children]
-              .reverse()
-              .map((child, childRevIdx) =>
-                renderLayerTreeRow(child, children.length - 1 - childRevIdx, depth + 1)
-              )}
-          </div>
-        )}
-      </div>
+        <AnimatePresence initial={false}>{isGroup && expanded && children.length > 0 && (
+          <motion.div {...COLLAPSE} className="space-y-1 border-l border-white/15 ml-2.5 pl-1">
+            <AnimatePresence initial={false}>
+              {[...children]
+                .reverse()
+                .map((child, childRevIdx) =>
+                  renderLayerTreeRow(child, children.length - 1 - childRevIdx, depth + 1)
+                )}
+            </AnimatePresence>
+          </motion.div>
+        )}</AnimatePresence>
+      </motion.div>
     );
   };
 
@@ -1949,11 +1951,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </div>
           )}
 
-          {[...project.layers]
-            .reverse()
-            .map((layer, revIdx) =>
-              renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
-            )}
+          <AnimatePresence initial={false}>
+            {[...project.layers]
+              .reverse()
+              .map((layer, revIdx) =>
+                renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
+              )}
+          </AnimatePresence>
 
           {treeDrag?.active && treeDrag.hasNestedSource && (
             <div

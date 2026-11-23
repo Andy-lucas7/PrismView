@@ -1,4 +1,5 @@
 import React from "react";
+import { Select } from "./ui/Controls";
 import { AudioLines, ImageIcon, MousePointer2, MousePointerClick, Sparkles, Upload } from "lucide-react";
 import type {
   ReactiveBinding3D,
@@ -150,7 +151,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         {on && (
           <div className="flex items-center gap-1.5">
             {hasSubParts ? (
-              <select
+              <Select
                 aria-label="Alvo da ação"
                 value={target || ROOT}
                 onChange={(e) => setQuick(kind, true, e.target.value, undefined)}
@@ -163,7 +164,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
                     {n}
                   </option>
                 ))}
-              </select>
+              </Select>
             ) : (
               <span className="text-[10px] text-[#71717A] flex-1">Intensidade</span>
             )}
@@ -284,7 +285,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         {coverOn && cover && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5">
-              <select
+              <Select
                 aria-label="Material da textura"
                 value={cover.materialName || "*"}
                 onChange={(e) => setCover({ enabled: true, materialName: e.target.value })}
@@ -300,7 +301,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
                     {m}
                   </option>
                 ))}
-              </select>
+              </Select>
               <label className="flex items-center gap-1 text-[10px] text-[#A1A1AA] shrink-0" title="Brilho de tela (emissive)">
                 <input
                   type="checkbox"

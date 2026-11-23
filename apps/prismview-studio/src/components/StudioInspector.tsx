@@ -1,4 +1,5 @@
 import { NativeCompatPanel } from "./NativeCompatPanel";
+import { Select, ColorInput } from "./ui/Controls";
 import { AnimatePresence, motion } from "framer-motion";
 import { COLLAPSE, TAB_LITE } from "./motion/Presence";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
@@ -372,8 +373,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               {!isTransparent && (
                 <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                   <span className="text-xs text-[#A1A1AA]">Cor do Fundo</span>
-                  <input aria-label="Cor do fundo"
-                    type="color"
+                  <ColorInput aria-label="Cor do fundo"
+                    
                     value={solidHex}
                     onChange={(e) =>
                       onApplyCoalescedProject({
@@ -422,8 +423,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </div>
               <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                 <span className="text-xs text-[#A1A1AA]">Cor Sólida Personalizada</span>
-                <input aria-label="Cor sólida personalizada"
-                  type="color"
+                <ColorInput aria-label="Cor sólida personalizada"
+                  
                   value={solidHex}
                   onChange={(e) =>
                     onApplyCoalescedProject({
@@ -506,7 +507,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   onChange={(e) => updateGlobal({ name: e.target.value })}
                   className="flex-1 bg-black/60 border border-white/10 rounded-lg px-2 py-1 font-mono-fx text-xs text-white outline-none"
                 />
-                <select aria-label="Tipo da variável"
+                <Select aria-label="Tipo da variável"
                   value={g.kind}
                   onChange={(e) =>
                     updateGlobal({ kind: e.target.value as GlobalVar["kind"] }, true)
@@ -517,7 +518,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <option value="NUMBER">Número</option>
                   <option value="TEXT">Texto</option>
                   <option value="COLOR">Cor</option>
-                </select>
+                </Select>
                 <button
                   type="button"
                   aria-label={`Remover variável ${g.name || i + 1}`}
@@ -541,8 +542,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               />
               <div className="flex items-center justify-between gap-2">
                 {g.kind === "COLOR" ? (
-                  <input aria-label="Valor da variável"
-                    type="color"
+                  <ColorInput aria-label="Valor da variável"
+                    
                     value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#ffffff"}
                     onChange={(e) => updateGlobal({ value: e.target.value })}
                   />
@@ -686,7 +687,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <select aria-label="Família da fonte"
+                    <Select aria-label="Família da fonte"
                       value={selectedLayer.text.fontFamily}
                       onChange={(e) =>
                         onPatchLayer(
@@ -707,7 +708,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                             {f}
                           </option>
                         ))}
-                    </select>
+                    </Select>
                     <button
                       type="button"
                       onClick={() => onPickFile("font")}
@@ -835,8 +836,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Texto</span>
                     <div className="flex items-center gap-2">
-                      <input aria-label="Cor do texto"
-                        type="color"
+                      <ColorInput aria-label="Cor do texto"
+                        
                         value={toHexColorInput(selectedLayer.text.color)}
                         onChange={(e) =>
                           onPatchLayer(
@@ -1108,8 +1109,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Preenchimento</span>
-                    <input aria-label="Cor do preenchimento"
-                      type="color"
+                    <ColorInput aria-label="Cor do preenchimento"
+                      
                       value={toHexColorInput(selectedLayer.progress.fillColor)}
                       onChange={(e) =>
                         onPatchLayer(
@@ -1137,8 +1138,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   />
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor da Trilha</span>
-                    <input aria-label="Cor da trilha"
-                      type="color"
+                    <ColorInput aria-label="Cor da trilha"
+                      
                       value={toHexColorInput(selectedLayer.progress.trackColor)}
                       onChange={(e) =>
                         onPatchLayer(
@@ -1231,8 +1232,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor Vetorial</span>
                     <div className="flex items-center gap-2">
-                      <input aria-label="Cor vetorial"
-                        type="color"
+                      <ColorInput aria-label="Cor vetorial"
+                        
                         value={toHexColorInput(selectedLayer.svg.color)}
                         onChange={(e) =>
                           onPatchLayer(
@@ -1765,7 +1766,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       <div className="space-y-2 pt-2 border-t border-white/10">
                         <label className="block text-xs text-[#A1A1AA]">
                           Animação ({activeObj.name})
-                          <select
+                          <Select
                             value={activeObj.playback.clipName}
                             onChange={(e) =>
                               patchActiveObj(
@@ -1785,7 +1786,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 {name}
                               </option>
                             ))}
-                          </select>
+                          </Select>
                         </label>
                         <InspectorSlider
                           label="Velocidade da Animação"
@@ -1864,8 +1865,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       {bgMode === "SOLID" && (
                         <div className="flex items-center justify-between frosted-chrome-card px-3 py-1.5">
                           <span className="text-[11px] text-[#A1A1AA]">Cor do Fundo 3D</span>
-                          <input aria-label="Cor do fundo 3D"
-                            type="color"
+                          <ColorInput aria-label="Cor do fundo 3D"
+                            
                             value={toHexColorInput(s3d.backgroundColor, "#07080b")}
                             onChange={(e) =>
                               patch3d(
@@ -2421,7 +2422,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
                                 <label className="block text-[10px] text-[#A1A1AA]">
                                   Objeto na Sala
-                                  <select
+                                  <Select
                                     value={bObjId}
                                     onChange={(e) => updateBinding({ objectId: e.target.value })}
                                     className={`mt-1 w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
@@ -2440,14 +2441,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         {o.name}
                                       </option>
                                     ))}
-                                  </select>
+                                  </Select>
                                 </label>
 
                                 <div className="space-y-1">
                                   <div className="grid grid-cols-2 gap-1.5">
                                     <label className="block text-[10px] text-[#A1A1AA]">
                                       Fonte do Sinal
-                                      <select
+                                      <Select
                                         value={b.source}
                                         onChange={(e) => {
                                           const nextSrc = e.target.value as Scene3DBindingSource;
@@ -2485,12 +2486,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         <option value="KEY_PULSE">Teclado (Anônimo)</option>
                                         <option value="MEDIA_PLAYING">Música Tocando</option>
                                         <option value="CPU_USAGE">Uso de CPU</option>
-                                      </select>
+                                      </Select>
                                     </label>
 
                                     <label className="block text-[10px] text-[#A1A1AA]">
                                       Ação 3D
-                                      <select
+                                      <Select
                                         value={b.targetType}
                                         onChange={(e) => {
                                           const nextType = e.target.value as Scene3DBindingTarget;
@@ -2536,7 +2537,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                             {m.label}
                                           </option>
                                         ))}
-                                      </select>
+                                      </Select>
                                     </label>
                                   </div>
                                   <p className="text-[10px] text-[#71717A] leading-tight">
@@ -2547,7 +2548,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 {(b.source === "HOVER_MESH" || b.source === "CLICK_MESH") && (
                                   <label className="block text-[10px] text-[#A1A1AA]">
                                     Malha Gatilho (Raycast)
-                                    <select
+                                    <Select
                                       value={b.sourceNode || "*"}
                                       onChange={(e) => updateBinding({ sourceNode: e.target.value })}
                                       className={`mt-1 w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${
@@ -2567,7 +2568,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                           {m}
                                         </option>
                                       ))}
-                                    </select>
+                                    </Select>
                                   </label>
                                 )}
 
@@ -2748,7 +2749,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   </button>
                                 </div>
                                 <div className="grid grid-cols-2 gap-1.5">
-                                  <select aria-label="Material"
+                                  <Select aria-label="Material"
                                     value={dt.materialName || "*"}
                                     onChange={(e) => updateDt({ materialName: e.target.value })}
                                     className="bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
@@ -2759,8 +2760,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         {mat}
                                       </option>
                                     ))}
-                                  </select>
-                                  <select aria-label="Origem da textura"
+                                  </Select>
+                                  <Select aria-label="Origem da textura"
                                     value={dt.source}
                                     onChange={(e) =>
                                       updateDt({
@@ -2771,7 +2772,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   >
                                     <option value="MEDIA_COVER">Capa da Música</option>
                                     <option value="CUSTOM_IMAGE">Imagem Local</option>
-                                  </select>
+                                  </Select>
                                 </div>
                                 {dt.source === "CUSTOM_IMAGE" && onPickDynamicTexImage && (
                                   <button
@@ -3125,8 +3126,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </span>
                     <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                       <span className="text-xs text-[#A1A1AA]">Cor do Véu (Tint)</span>
-                      <input aria-label="Cor do véu"
-                        type="color"
+                      <ColorInput aria-label="Cor do véu"
+                        
                         value={toHexColorInput(selectedLayer.glass.tintColor)}
                         onChange={(e) =>
                           onPatchLayer(
@@ -3362,7 +3363,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
                 <label className="block text-xs text-[#A1A1AA]">
                   Blend Mode
-                  <select
+                  <Select
                     value={selectedLayer.blendMode}
                     onChange={(e) =>
                       onPatchLayer(
@@ -3378,7 +3379,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         {bm}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </label>
               </div>
             </>
@@ -3535,7 +3536,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               <div className="space-y-2 pt-2.5 border-t border-white/10">
                 <label className="block text-xs text-[#A1A1AA]">
                   Ação ao Clicar (Widgets / Player)
-                  <select
+                  <Select
                     value={selectedLayer.clickAction ?? "NONE"}
                     onChange={(e) =>
                       onPatchLayer(
@@ -3555,7 +3556,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <option value="TOGGLE_GLOBAL">Alternar Variável (liga/desliga)</option>
                     <option value="SET_GLOBAL">Definir Variável</option>
                     <option value="NEXT_GLOBAL_LIST">Próximo Valor da Lista</option>
-                  </select>
+                  </Select>
                 </label>
                 {(() => {
                   const action = selectedLayer.clickAction ?? "NONE";

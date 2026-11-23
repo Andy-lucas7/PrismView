@@ -944,12 +944,11 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           mixBlendMode: g.enabled ? undefined : layer.blendMode,
           willChange: hasParallax && !paused ? "transform" : undefined,
           // Sala 3D: 2D layers stop hit-testing; only the edited 3D canvas opts back in
-          pointerEvents: roomActive ? "none" : undefined,
+          // Camada bloqueada no editor é intangível: cliques/arrastes atravessam até o que está embaixo
+          pointerEvents: roomActive || (interactive && layer.locked) ? "none" : undefined,
           cursor: interactive
             ? isTopLevel || selectedLayerId === layer.id
-              ? layer.locked
-                ? "not-allowed"
-                : "grab"
+              ? "grab"
               : "default"
             : !isThumbnail && layer.clickAction && layer.clickAction !== "NONE"
             ? "pointer"
@@ -1030,7 +1029,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 height={hPx}
                 paused={paused}
                 isThumbnail={isThumbnail}
-                interactive={interactive}
+                interactive={interactive && !layer.locked}
                 testMode={test3dMode}
                 cursorNormRef={test3dMode ? previewCursorRef : cursorNormRef}
                 subscribeCursorTick={test3dMode ? subscribePreviewTick : subscribeCursorTick}

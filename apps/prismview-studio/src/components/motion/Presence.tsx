@@ -31,6 +31,14 @@ export const TAB = {
   exit: { opacity: 0, y: -8, filter: `blur(${BLUR.exit}px)`, transition: exitT },
 } as const;
 
+/** Linha de lista que entra/sai (camadas): altura + fade + deslize; `overflow: clip` com margem p/ o brilho da seleção. */
+export const ROW = {
+  initial: { opacity: 0, height: 0, x: -12 },
+  animate: { opacity: 1, height: "auto", x: 0, transition: { height: { ...SPRING.expand }, opacity: enterT, x: enterT } },
+  exit: { opacity: 0, height: 0, x: 12, transition: { height: { duration: sec(DURATION.base), ease: [...EASE.emphasized] as [number, number, number, number] }, opacity: exitT, x: exitT } },
+  style: { overflow: "clip", overflowClipMargin: 12 },
+} as const;
+
 /** Troca de aba com muito conteúdo (inspetor): só fade + deslize curto, sem blur no painel inteiro. */
 export const TAB_LITE = {
   initial: { opacity: 0, y: 10 },

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Select, ColorInput } from "./components/ui/Controls";
 import { COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
@@ -427,8 +428,8 @@ const ExposedGlobalsPanel: React.FC<{
                 className="prism-slider w-24"
               />
             ) : g.kind === "COLOR" ? (
-              <input aria-label={g.label || g.name}
-                type="color"
+              <ColorInput aria-label={g.label || g.name}
+                
                 value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#FFFFFF"}
                 onChange={(e) => onDebouncedChange(patchGlobalValue(idx, e.target.value))}
                 onBlur={(e) => onCommitChange(patchGlobalValue(idx, e.currentTarget.value))}
@@ -1616,6 +1617,22 @@ const StudioHubApp: React.FC = () => {
     if (n <= 0) fn();
     else requestAnimationFrame(() => afterFrames(n - 1, fn));
   }
+  /** Espera fontes + ociosidade (até ~1,2 s) antes de continuar. */
+  function whenIdle(fn: () => void): void {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      fn();
+    };
+    window.setTimeout(go, 1200);
+    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+    const fonts = document.fonts?.ready ?? Promise.resolve();
+    void fonts.then(() => {
+      if (idle) idle(go, { timeout: 900 });
+      else window.setTimeout(go, DURATION.fast);
+    });
+  }
   function cardRects(id: string): { rect: HeroRect | null; innerRect: HeroRect | null } {
     const sel = (k: string) => document.querySelector(`[data-hub-${k}="${CSS.escape(id)}"]`) as HTMLElement | null;
     const card = sel("card");
@@ -1661,10 +1678,12 @@ const StudioHubApp: React.FC = () => {
       animate(heroOpacity, 1, { duration: sec(DURATION.instant) });
       animate(heroP, 1, heroEase).then(() => {
         setEditing(project); // monta o Studio por baixo do hero já em tela cheia
+        // Só revela quando o Studio terminou de montar e a thread principal está ociosa (em PC lento o
+        // card fica parado em tela cheia, sem tela preta e sem engasgar o fade).
         afterFrames(2, () =>
-          window.setTimeout(() => {
+          whenIdle(() => {
             animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
-          }, DURATION.fast)
+          })
         );
       });
     });
@@ -2088,7 +2107,7 @@ const StudioHubApp: React.FC = () => {
                         {POWER_PREFERENCE_LABELS[power.state]}
                       </span>
                     </div>
-                    <select aria-label="Modo de energia"
+                    <Select aria-label="Modo de energia"
                       value={power.preference}
                       onChange={(e) => changePowerPreference(e.target.value as PowerPreference)}
                       className="w-full bg-black/70 border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
@@ -2100,7 +2119,7 @@ const StudioHubApp: React.FC = () => {
                             : POWER_PREFERENCE_LABELS[p]}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                     <p className="text-[10px] text-[#71717A] leading-snug">
                       {POWER_STATE_HINTS[power.state]}
                     </p>
@@ -2678,11 +2697,13 @@ const StudioHubApp: React.FC = () => {
                     >
                       <div>
                         <div
+                          data-hub-card={tpl.id}
                           onClick={() => void openOrCloneTemplate(false)}
                           className="relative aspect-video bg-[#08080A] overflow-hidden border-b border-white/10 cursor-pointer flex items-center justify-center"
                         >
                           {isWidgetTpl ? (
                             <div
+                              data-hub-inner={tpl.id}
                               className="w-full max-w-[290px] p-3"
                               style={{ aspectRatio: `${tpl.widget.width} / ${tpl.widget.height}` }}
                             >
