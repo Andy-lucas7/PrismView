@@ -138,7 +138,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         </div>
         {(on || (!suggested && kind !== "AUDIO")) && (
           <div className="flex items-center gap-1.5">
-            <select
+            <select aria-label="Alvo da ação"
               value={target || ""}
               onChange={(e) => setQuick(kind, true, e.target.value, undefined)}
               className={selectCls}
@@ -153,7 +153,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
               ))}
             </select>
             {on && (
-              <input
+              <input aria-label="Intensidade"
                 type="range"
                 min={range.min}
                 max={range.max}
@@ -240,7 +240,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         {coverOn && cover && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5">
-              <select
+              <select aria-label="Material da capa"
                 value={cover.materialName || "*"}
                 onChange={(e) => setCover({ enabled: true, materialName: e.target.value })}
                 className={selectCls}

@@ -67,6 +67,8 @@ import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { friendlyError } from "../utils/friendlyError";
 import { collectOpenAppReview } from "../utils/importReview";
+import { SaveStatus, SaveStatusChip } from "./SaveStatusChip";
+import { nativeCompatIssues } from "../utils/nativeCompat";
 import {
   cloneLayerWithFreshIds,
   collectAllLayerIds,
@@ -113,6 +115,10 @@ interface StudioEditorProps {
   /** Signals active slider/canvas drag transactions so autosave & desktop sync wait for commit. */
   onTxStateChange?: (active: boolean) => void;
   onFlushSave?: () => void;
+  /** Estado do salvamento (chip no cabeçalho). */
+  saveStatus?: SaveStatus;
+  /** Ctrl+S / "Tentar de novo": grava o pendente e o que falhou. */
+  onSaveNow?: () => void;
   onBack: () => void;
   onApply: () => void;
   onExport: () => void;
@@ -176,6 +182,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   onChangeProjectLive,
   onTxStateChange,
   onFlushSave,
+  saveStatus,
+  onSaveNow,
   onBack,
   onApply,
   onExport,
@@ -443,6 +451,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     [project.layers, primarySelectedId]
   );
   const selectedLayer = selectedLocation?.layer ?? null;
+  // O que o desktop (motor nativo) não desenha: painel no Inspetor + badge no "Aplicar".
+  const compatIssues = useMemo(() => nativeCompatIssues(project), [project]);
   const selectedParent = selectedLocation?.parent ?? null;
   const selectedLayerIdRef = useRef<string | null>(null);
   selectedLayerIdRef.current = selectedLayer?.id ?? null;
@@ -1063,6 +1073,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     room: roomShortcuts,
     onUndo: handleUndo,
     onRedo: handleRedo,
+    onSave: onSaveNow,
     onDelete: () => deleteLayers(selectedIdsRef.current),
     onNudge: nudgeSelectedLayers,
     onCopy: handleCopy,
@@ -1530,14 +1541,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
-            <button
+            <button aria-label="Trazer para frente (Ctrl+])"
               onClick={() => moveZ([layer.id], 1)}
               title="Trazer para frente (Ctrl+])"
               className="p-1 hover:text-white"
             >
               <ArrowUp className="w-3 h-3" />
             </button>
-            <button
+            <button aria-label="Enviar para trás (Ctrl+[)"
               onClick={() => moveZ([layer.id], -1)}
               title="Enviar para trás (Ctrl+[)"
               className="p-1 hover:text-white"
@@ -1562,14 +1573,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             >
               {layer.locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
             </button>
-            <button
+            <button aria-label="Duplicar (Ctrl+D)"
               onClick={() => duplicateLayers([layer.id])}
               title="Duplicar (Ctrl+D)"
               className="p-1 hover:text-white"
             >
               <Copy className="w-3 h-3" />
             </button>
-            <button
+            <button aria-label="Excluir (Del)"
               onClick={() => deleteLayers([layer.id])}
               title="Excluir (Del)"
               className="p-1 hover:text-white"
@@ -1597,21 +1608,26 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
         <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
           <button
+            type="button"
+            aria-label="Voltar ao Hub"
+            title="Voltar ao Hub"
             onClick={onBack}
             className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
           <input
+            aria-label="Nome do projeto"
             value={project.title}
             onChange={(e) => applyCoalescedChange({ ...project, title: e.target.value })}
             className="bg-transparent text-xs font-semibold text-white outline-none px-1.5 w-48"
           />
+          {saveStatus && onSaveNow && <SaveStatusChip status={saveStatus} onSaveNow={onSaveNow} />}
           <span className="px-2.5 py-1 rounded-full bg-white/10 text-[10px] uppercase tracking-wider text-[#A1A1AA]">
             {project.packageType === "WIDGET" ? ".widget.prism" : ".prism"}
           </span>
           <span className="h-4 w-px bg-white/15 mx-0.5" />
-          <button
+          <button aria-label="Desfazer (Ctrl+Z)"
             type="button"
             onClick={handleUndo}
             disabled={!history.canUndo}
@@ -1624,7 +1640,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Undo2 className="w-3.5 h-3.5" />
           </button>
-          <button
+          <button aria-label="Refazer (Ctrl+Y)"
             type="button"
             onClick={handleRedo}
             disabled={!history.canRedo}
@@ -1637,7 +1653,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Redo2 className="w-3.5 h-3.5" />
           </button>
-          <button
+          <button aria-label="Atalhos do Estúdio"
             type="button"
             onClick={() => setShortcutsOpen((v) => !v)}
             title="Atalhos do Estúdio"
@@ -1687,7 +1703,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 const active = scene3dEditMode === m.id;
                 const Icon = m.icon;
                 return (
-                  <button
+                  <button aria-label={m.title}
                     key={m.id}
                     type="button"
                     onClick={() => setViewMode(m.id)}
@@ -1713,11 +1729,25 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             {exporting ? "Exportando…" : "Exportar"}
           </button>
           <button
+            type="button"
             onClick={onApply}
             disabled={applying}
             aria-busy={applying}
-            className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+            title={
+              compatIssues.length > 0
+                ? `${compatIssues.length} item(ns) não aparecem no desktop (veja o Inspetor)`
+                : undefined
+            }
+            className="relative prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
           >
+            {compatIssues.length > 0 && (
+              <span
+                className="absolute -top-1.5 -right-1.5 min-w-5 h-5 px-1 rounded-full bg-amber-400 text-black text-[10px] font-semibold flex items-center justify-center"
+                aria-label={`${compatIssues.length} aviso(s) de compatibilidade`}
+              >
+                {compatIssues.length}
+              </span>
+            )}
             <Sparkles className={`w-3.5 h-3.5 ${applying ? "animate-spin" : ""}`} />
             {applying
               ? project.packageType === "WIDGET"
@@ -2008,7 +2038,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               ).map((g) => {
                 const Icon = g.icon;
                 return (
-                  <button
+                  <button aria-label={`${g.label} (${g.key})`}
                     key={g.mode}
                     type="button"
                     onClick={() => setGizmoMode(g.mode)}
@@ -2023,7 +2053,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 );
               })}
               <span className="h-4 w-px bg-white/15 mx-1" />
-              <button
+              <button aria-label="Mostrar / ocultar grade"
                 type="button"
                 onClick={() => setShowGrid3d((v) => !v)}
                 title="Mostrar / ocultar grade"
@@ -2031,7 +2061,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Grid3x3 className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Snap (0,25 · 15° · 0,1×)"
                 type="button"
                 onClick={() => setSnap3d((v) => !v)}
                 title="Snap (0,25 · 15° · 0,1×)"
@@ -2039,7 +2069,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Magnet className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Focar objeto selecionado (F)"
                 type="button"
                 onClick={() => editorApiRef.current?.focusSelected()}
                 title="Focar objeto selecionado (F)"
@@ -2055,7 +2085,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 + .glb
               </button>
-              <button
+              <button aria-label="Duplicar objeto (Ctrl+D)"
                 type="button"
                 onClick={duplicateRoomObject}
                 disabled={!selected3dObjectId}
@@ -2064,7 +2094,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Copy className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Excluir objeto (Del)"
                 type="button"
                 onClick={removeRoomObject}
                 disabled={!selected3dObjectId}
@@ -2073,7 +2103,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Mostrar / ocultar esqueleto do objeto selecionado"
                 type="button"
                 onClick={() => setShowSkeleton3d((v) => !v)}
                 title="Mostrar / ocultar esqueleto do objeto selecionado"
@@ -2124,7 +2154,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 + Interagir com esta parte
               </button>
-              <button
+              <button aria-label="Limpar seleção da parte"
                 type="button"
                 title="Limpar seleção da parte"
                 onClick={() => {
@@ -2179,6 +2209,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
       {/* RIGHT PANEL: Clean Tabbed Minimalist Inspector */}
       <StudioInspector
+        compatIssues={compatIssues}
         project={project}
         mode={inspectorMode}
         onModeChange={setInspectorMode}

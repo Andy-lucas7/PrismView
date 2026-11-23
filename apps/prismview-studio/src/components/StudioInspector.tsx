@@ -1,3 +1,5 @@
+import { NativeCompatPanel } from "./NativeCompatPanel";
+import type { NativeCompatIssue } from "../utils/nativeCompat";
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
@@ -131,6 +133,8 @@ export interface FxTargetRequest {
 
 export interface StudioInspectorProps {
   project: PrismProject;
+  /** O que o desktop não desenha (`nativeCompatIssues`), mostrado no topo. */
+  compatIssues?: NativeCompatIssue[];
   mode: InspectorMode;
   onModeChange: (mode: InspectorMode) => void;
   selectedLayer: SceneLayer | null;
@@ -172,6 +176,7 @@ export interface StudioInspectorProps {
 }
 
 export const StudioInspector: React.FC<StudioInspectorProps> = ({
+  compatIssues = [],
   project,
   mode,
   onModeChange,
@@ -363,7 +368,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               {!isTransparent && (
                 <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                   <span className="text-xs text-[#A1A1AA]">Cor do Fundo</span>
-                  <input
+                  <input aria-label="Cor do fundo"
                     type="color"
                     value={solidHex}
                     onChange={(e) =>
@@ -413,7 +418,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </div>
               <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                 <span className="text-xs text-[#A1A1AA]">Cor Sólida Personalizada</span>
-                <input
+                <input aria-label="Cor sólida personalizada"
                   type="color"
                   value={solidHex}
                   onChange={(e) =>
@@ -491,13 +496,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
           return (
             <div key={i} className="frosted-chrome-card p-3 space-y-2">
               <div className="flex items-center gap-1.5">
-                <input
+                <input aria-label="nome"
                   value={g.name}
                   placeholder="nome"
                   onChange={(e) => updateGlobal({ name: e.target.value })}
                   className="flex-1 bg-black/60 border border-white/10 rounded-lg px-2 py-1 font-mono-fx text-xs text-white outline-none"
                 />
-                <select
+                <select aria-label="Tipo da variável"
                   value={g.kind}
                   onChange={(e) =>
                     updateGlobal({ kind: e.target.value as GlobalVar["kind"] }, true)
@@ -511,6 +516,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 </select>
                 <button
                   type="button"
+                  aria-label={`Remover variável ${g.name || i + 1}`}
+                  title="Remover variável"
                   onClick={() =>
                     onApplyDiscreteProject({
                       ...project,
@@ -522,7 +529,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
               </div>
-              <input
+              <input aria-label="Rótulo no Hub"
                 value={g.label}
                 placeholder="Rótulo no Hub"
                 onChange={(e) => updateGlobal({ label: e.target.value })}
@@ -530,13 +537,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               />
               <div className="flex items-center justify-between gap-2">
                 {g.kind === "COLOR" ? (
-                  <input
+                  <input aria-label="Valor da variável"
                     type="color"
                     value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#ffffff"}
                     onChange={(e) => updateGlobal({ value: e.target.value })}
                   />
                 ) : (
-                  <input
+                  <input aria-label="Valor"
                     value={g.value}
                     placeholder="Valor"
                     onChange={(e) => updateGlobal({ value: e.target.value })}
@@ -593,7 +600,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </button>
             )}
           </div>
-          <input
+          <input aria-label="Nome da camada"
             value={selectedLayer.name}
             onChange={(e) =>
               onPatchLayer(selectedLayer.id, (l) => ({ ...l, name: e.target.value }), "coalesced")
@@ -658,7 +665,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         }
                       />
                     </div>
-                    <textarea
+                    <textarea aria-label="Texto da camada"
                       rows={2}
                       value={selectedLayer.text.content}
                       onChange={(e) =>
@@ -673,7 +680,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2">
-                    <select
+                    <select aria-label="Família da fonte"
                       value={selectedLayer.text.fontFamily}
                       onChange={(e) =>
                         onPatchLayer(
@@ -749,6 +756,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         <button
                           key={id}
                           type="button"
+                          aria-label={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                          title={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                          aria-pressed={selectedLayer.text?.align === id}
                           onClick={() =>
                             onPatchLayer(
                               selectedLayer.id,
@@ -819,7 +829,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Texto</span>
                     <div className="flex items-center gap-2">
-                      <input
+                      <input aria-label="Cor do texto"
                         type="color"
                         value={toHexColorInput(selectedLayer.text.color)}
                         onChange={(e) =>
@@ -1092,7 +1102,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   </div>
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Preenchimento</span>
-                    <input
+                    <input aria-label="Cor do preenchimento"
                       type="color"
                       value={toHexColorInput(selectedLayer.progress.fillColor)}
                       onChange={(e) =>
@@ -1121,7 +1131,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   />
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor da Trilha</span>
-                    <input
+                    <input aria-label="Cor da trilha"
                       type="color"
                       value={toHexColorInput(selectedLayer.progress.trackColor)}
                       onChange={(e) =>
@@ -1215,7 +1225,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor Vetorial</span>
                     <div className="flex items-center gap-2">
-                      <input
+                      <input aria-label="Cor vetorial"
                         type="color"
                         value={toHexColorInput(selectedLayer.svg.color)}
                         onChange={(e) =>
@@ -1469,7 +1479,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                     <EyeOff className="w-3 h-3 opacity-60" />
                                   )}
                                 </button>
-                                <button
+                                <button aria-label="Duplicar objeto 3D"
                                   type="button"
                                   title="Duplicar objeto 3D"
                                   onClick={(e) => {
@@ -1487,7 +1497,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   <Copy className="w-3 h-3" />
                                 </button>
                                 {objs.length > 1 && (
-                                  <button
+                                  <button aria-label="Remover objeto 3D"
                                     type="button"
                                     title="Remover objeto 3D"
                                     onClick={(e) => {
@@ -1848,7 +1858,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       {bgMode === "SOLID" && (
                         <div className="flex items-center justify-between frosted-chrome-card px-3 py-1.5">
                           <span className="text-[11px] text-[#A1A1AA]">Cor do Fundo 3D</span>
-                          <input
+                          <input aria-label="Cor do fundo 3D"
                             type="color"
                             value={toHexColorInput(s3d.backgroundColor, "#07080b")}
                             onChange={(e) =>
@@ -2383,7 +2393,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                         Inválido
                                       </span>
                                     )}
-                                    <button
+                                    <button aria-label="Remover regra"
                                       type="button"
                                       onClick={(e) => {
                                         e.stopPropagation();
@@ -2722,7 +2732,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   <span className="text-[11px] text-white font-medium truncate">
                                     Material: {dt.materialName === "*" ? "Todos (*)" : dt.materialName}
                                   </span>
-                                  <button
+                                  <button aria-label="Remover textura dinâmica"
                                     type="button"
                                     onClick={removeDt}
                                     className="p-1 text-[#A1A1AA] hover:text-white"
@@ -2732,7 +2742,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                   </button>
                                 </div>
                                 <div className="grid grid-cols-2 gap-1.5">
-                                  <select
+                                  <select aria-label="Material"
                                     value={dt.materialName || "*"}
                                     onChange={(e) => updateDt({ materialName: e.target.value })}
                                     className="bg-black border border-white/15 rounded-lg px-2 py-1 text-[11px] text-white outline-none"
@@ -2744,7 +2754,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                       </option>
                                     ))}
                                   </select>
-                                  <select
+                                  <select aria-label="Origem da textura"
                                     value={dt.source}
                                     onChange={(e) =>
                                       updateDt({
@@ -3109,7 +3119,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </span>
                     <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                       <span className="text-xs text-[#A1A1AA]">Cor do Véu (Tint)</span>
-                      <input
+                      <input aria-label="Cor do véu"
                         type="color"
                         value={toHexColorInput(selectedLayer.glass.tintColor)}
                         onChange={(e) =>
@@ -3611,6 +3621,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
   return (
     <aside className="fixed top-20 right-4 bottom-4 z-30 w-[352px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
+      <NativeCompatPanel issues={compatIssues} onSelectLayer={onSelectLayer} />
       {/* Top 3-Way Context Switcher */}
       <div className="p-2.5 border-b border-white/10 grid grid-cols-3 gap-1">
         {(
@@ -3801,7 +3812,7 @@ const InspectorSlider: React.FC<InspectorSliderProps> = ({
           {onFx && <FxButton active={fxActive} onClick={onFx} />}
         </div>
       </div>
-      <input
+      <input aria-label={label}
         type="range"
         min={min}
         max={max}
@@ -3873,7 +3884,7 @@ const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
       {options.length > 1 && (
         <div className="relative">
           <Search className="w-3 h-3 absolute left-2 top-1/2 -translate-y-1/2 text-[#71717A] pointer-events-none" />
-          <input
+          <input aria-label="Buscar alvo…"
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
@@ -3882,7 +3893,7 @@ const BindingTargetPicker: React.FC<BindingTargetPickerProps> = ({
           />
         </div>
       )}
-      <select
+      <select aria-label={label}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className={`w-full bg-black border rounded-lg px-2 py-1 text-[11px] text-white outline-none ${

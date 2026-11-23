@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion, MotionConfig } from "framer-motion";
 import {
   Box,
   ChevronDown,
@@ -49,6 +49,8 @@ import {
   withNativeAssets,
 } from "./types/prism";
 import { friendlyError } from "./utils/friendlyError";
+import { useDialogFocus } from "./hooks/useDialogFocus";
+import type { SaveStatus } from "./components/SaveStatusChip";
 import { collectOpenAppReview, OpenAppReviewItem, resolveOpenAppReview } from "./utils/importReview";
 import { nativeCompatIssues } from "./utils/nativeCompat";
 
@@ -161,6 +163,8 @@ const ConfirmDialog: React.FC<{
   onDismiss,
 }) => {
   const dismiss = onDismiss ?? onCancel;
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocus(open, panelRef);
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -183,6 +187,7 @@ const ConfirmDialog: React.FC<{
           }}
         >
           <motion.div
+            ref={panelRef}
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="confirm-title"
@@ -248,6 +253,8 @@ const OpenAppReviewDialog: React.FC<{
     setAllowed(new Set());
   }, [items]);
   const open = items !== null;
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useDialogFocus(open, panelRef);
   const denyAll = useCallback(() => onConfirm(new Set()), [onConfirm]);
   useEffect(() => {
     if (!open) return;
@@ -269,6 +276,7 @@ const OpenAppReviewDialog: React.FC<{
           onClick={denyAll}
         >
           <motion.div
+            ref={panelRef}
             role="dialog"
             aria-modal="true"
             aria-labelledby="open-app-review-title"
@@ -409,13 +417,13 @@ const ExposedGlobalsPanel: React.FC<{
           <div key={idx} className="flex items-center justify-between gap-2 text-[11px]">
             <span className="text-[#A1A1AA] truncate">{g.label || g.name}</span>
             {g.kind === "SWITCH" ? (
-              <input
+              <input aria-label={g.label || g.name}
                 type="checkbox"
                 checked={g.value === "1" || g.value.toLowerCase() === "true"}
                 onChange={(e) => onImmediateChange(patchGlobalValue(idx, e.target.checked ? "1" : "0"))}
               />
             ) : g.kind === "NUMBER" ? (
-              <input
+              <input aria-label={g.label || g.name}
                 type="range"
                 min={0}
                 max={maxRange}
@@ -427,14 +435,14 @@ const ExposedGlobalsPanel: React.FC<{
                 className="prism-slider w-24"
               />
             ) : g.kind === "COLOR" ? (
-              <input
+              <input aria-label={g.label || g.name}
                 type="color"
                 value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#FFFFFF"}
                 onChange={(e) => onDebouncedChange(patchGlobalValue(idx, e.target.value))}
                 onBlur={(e) => onCommitChange(patchGlobalValue(idx, e.currentTarget.value))}
               />
             ) : (
-              <input
+              <input aria-label={g.label || g.name}
                 value={g.value}
                 onChange={(e) => onDebouncedChange(patchGlobalValue(idx, e.target.value))}
                 onBlur={(e) => onCommitChange(patchGlobalValue(idx, e.currentTarget.value))}
@@ -567,6 +575,13 @@ const StudioHubApp: React.FC = () => {
   // ── Salvamento com aviso e nova tentativa ──
   // Falha ao salvar nunca é silenciosa: o projeto fica em `failedSavesRef` (sujo), o usuário vê o
   // aviso uma vez e novas tentativas seguem com backoff até dar certo.
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>({ state: "idle", desktopStale: false });
+  /** Atualiza o chip sem re-render quando nada mudou (chamado a cada tique de slider). */
+  const patchSaveStatus = useCallback((patch: Partial<SaveStatus>) => {
+    setSaveStatus((cur) =>
+      Object.entries(patch).every(([k, v]) => cur[k as keyof SaveStatus] === v) ? cur : { ...cur, ...patch }
+    );
+  }, []);
   const failedSavesRef = useRef(new Map<string, PrismProject>());
   const saveRetryRef = useRef<{ attempt: number; timer: number | null }>({ attempt: 0, timer: null });
   const saveProjectOrReportRef = useRef<(project: PrismProject) => Promise<boolean>>(async () => false);
@@ -578,6 +593,7 @@ const StudioHubApp: React.FC = () => {
         await invokeCmd("save_project", { project });
         failedSavesRef.current.delete(project.id);
         if (failedSavesRef.current.size === 0) {
+          patchSaveStatus({ state: pendingSaveRef.current ? "saving" : "saved", error: undefined });
           retry.attempt = 0;
           if (retry.timer !== null) {
             window.clearTimeout(retry.timer);
@@ -588,8 +604,10 @@ const StudioHubApp: React.FC = () => {
       } catch (err) {
         if (!isTauriRuntime()) return false;
         failedSavesRef.current.set(project.id, project);
+        const reason = friendlyError(err, "erro desconhecido");
+        patchSaveStatus({ state: "error", error: reason });
         if (retry.attempt === 0) {
-          notify(`Não foi possível salvar: ${friendlyError(err, "erro desconhecido")} Tentaremos de novo.`);
+          notify(`Não foi possível salvar: ${reason} Tentaremos de novo.`);
         }
         if (retry.timer === null) {
           const delay = SAVE_RETRY_DELAYS_MS[Math.min(retry.attempt, SAVE_RETRY_DELAYS_MS.length - 1)];
@@ -604,7 +622,7 @@ const StudioHubApp: React.FC = () => {
         return false;
       }
     },
-    [notify]
+    [notify, patchSaveStatus]
   );
   saveProjectOrReportRef.current = saveProjectOrReport;
 
@@ -811,7 +829,9 @@ const StudioHubApp: React.FC = () => {
       try {
         setRuntime(await request);
         desktopSyncFailedRef.current = false;
+        patchSaveStatus({ desktopStale: false });
       } catch (err) {
+        patchSaveStatus({ desktopStale: true });
         if (!desktopSyncFailedRef.current) {
           desktopSyncFailedRef.current = true;
           notify(
@@ -822,7 +842,7 @@ const StudioHubApp: React.FC = () => {
         }
       }
     },
-    [notify]
+    [notify, patchSaveStatus]
   );
 
   const syncIfActiveOnDesktop = useCallback(
@@ -964,6 +984,7 @@ const StudioHubApp: React.FC = () => {
         void saveProjectOrReport(previous);
       }
       pendingSaveRef.current = next;
+      if (failedSavesRef.current.size === 0) patchSaveStatus({ state: "saving" });
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
@@ -977,7 +998,7 @@ const StudioHubApp: React.FC = () => {
         void flushPendingSave();
       }, 450);
     },
-    [flushPendingSave]
+    [flushPendingSave, patchSaveStatus]
   );
 
   const persistProjectLive = useCallback(
@@ -1508,6 +1529,10 @@ const StudioHubApp: React.FC = () => {
           onChangeProjectLive={persistProjectLive}
           onTxStateChange={setEditingTxActive}
           onFlushSave={() => void flushPendingSave()}
+          saveStatus={saveStatus}
+          onSaveNow={() => {
+            void flushPendingSave().then(flushFailedSaves);
+          }}
           onBack={() => {
             setEditingTxActive(false);
             void flushPendingSave();
@@ -1730,7 +1755,7 @@ const StudioHubApp: React.FC = () => {
               {runtime.paused ? "Retomar" : "Pausar"}
             </button>
             <div ref={optionsRef} className="relative">
-              <button
+              <button aria-label="Opções do PrismView e da Engine"
                 type="button"
                 onClick={() => setOptionsOpen((open) => !open)}
                 title="Opções do PrismView e da Engine"
@@ -1826,7 +1851,7 @@ const StudioHubApp: React.FC = () => {
                         {POWER_PREFERENCE_LABELS[power.state]}
                       </span>
                     </div>
-                    <select
+                    <select aria-label="Modo de energia"
                       value={power.preference}
                       onChange={(e) => changePowerPreference(e.target.value as PowerPreference)}
                       className="w-full bg-black/70 border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
@@ -1946,7 +1971,13 @@ const StudioHubApp: React.FC = () => {
             {/* Search Input */}
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-[#71717A] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
+              <input aria-label={
+                  hubTab === "WALLPAPERS"
+                    ? "Buscar wallpapers…"
+                    : hubTab === "WIDGETS"
+                      ? "Buscar widgets…"
+                      : "Buscar modelos…"
+                }
                 type="text"
                 value={hubQuery}
                 onChange={(e) => setHubQuery(e.target.value)}
@@ -2095,7 +2126,7 @@ const StudioHubApp: React.FC = () => {
                               )}
                             </button>
                             {wallpapers.length > 1 && (
-                              <button
+                              <button aria-label="Excluir"
                                 type="button"
                                 onClick={() => setPendingDelete(wp)}
                                 disabled={busy !== null}
@@ -2249,7 +2280,7 @@ const StudioHubApp: React.FC = () => {
                               )}
                             </button>
                             {widgets.length > 1 && (
-                              <button
+                              <button aria-label="Excluir widget"
                                 type="button"
                                 onClick={() => setPendingDelete(w)}
                                 disabled={busy !== null}
@@ -2745,6 +2776,9 @@ const StudioHubApp: React.FC = () => {
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <StudioHubApp />
+    {/* Respeita "reduzir movimento" do sistema em todas as animações do framer-motion. */}
+    <MotionConfig reducedMotion="user">
+      <StudioHubApp />
+    </MotionConfig>
   </React.StrictMode>
 );
