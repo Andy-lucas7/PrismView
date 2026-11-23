@@ -59,7 +59,7 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, log_file, open_studio, parse_tray_enabled, resolve_font_files,
+    acquire_single_instance, log_file, open_studio, overlay_injected, parse_tray_enabled, resolve_font_files,
     run as run_loop,
     trim_working_set, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
     SensorsConfig, TrayAction, Win32DesktopHost, Win32SystemSensors,
@@ -1699,6 +1699,7 @@ impl NativeApp {
                     active_monitor_count: u32::try_from(self.outputs.len()).unwrap_or(u32::MAX),
                     rendered_frames: self.frames,
                     errors: self.status_issues(),
+                    overlay_injected: overlay_injected(),
                     gpu_adapter: self
                         .gpu
                         .as_ref()

@@ -55,7 +55,7 @@ pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
-pub use shell::{acquire_single_instance, open_studio, shell_open};
+pub use shell::{acquire_single_instance, open_studio, overlay_injected, shell_open};
 pub use tray::{parse_tray_enabled, TrayAction};
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
 pub use widget::{WidgetWindow, WidgetWindowConfig};

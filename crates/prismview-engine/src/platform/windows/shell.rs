@@ -12,6 +12,16 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::platform::{PlatformError, PlatformResult};
 
+/// DLLs de hook do RivaTuner Statistics Server (overlay do MSI Afterburner) carregadas neste
+/// processo: o OSD dele está sendo desenhado por cima do wallpaper.
+pub fn overlay_injected() -> bool {
+    // SAFETY: só consulta módulos já carregados (sem carregar nada).
+    unsafe {
+        ::windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("RTSSHooks64.dll")).is_ok()
+            || ::windows::Win32::System::LibraryLoader::GetModuleHandleW(w!("RTSSHooks.dll")).is_ok()
+    }
+}
+
 /// Mutex nomeado que garante um único motor por sessão. Mantido vivo até o processo sair
 /// (o handle nunca é fechado explicitamente: o SO libera na saída).
 pub struct SingleInstance {

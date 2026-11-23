@@ -531,6 +531,16 @@ impl NativeEngine {
         }
     }
 
+    /// Reinicia o motor se estiver no ar (ex.: um overlay de terceiros passou a excluí-lo e só
+    /// vale para processos novos). A cena ativa é relida do disco.
+    pub fn restart_if_running(&self) -> Result<(), String> {
+        if pipe_try_once(&json!({ "cmd": "PING" })).is_err() {
+            return Ok(());
+        }
+        self.stop()?;
+        self.ensure_running()
+    }
+
     /// Garante o motor no ar com a cena ativa (abertura do Studio após o motor ter caído).
     pub fn ensure_running(&self) -> Result<(), String> {
         if !has_active_scene() && !has_active_widgets() {
