@@ -21,7 +21,7 @@
 //! event_loop::run(&mut host, &mut renderer);
 //! ```
 
-mod composition;
+mod dcomp_surface;
 mod desktop_hit;
 pub mod log_file;
 pub mod event_loop;
@@ -50,12 +50,12 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer, RegisterWindowMessageW,
 };
 
-pub use composition::DCompPresenter;
+pub use dcomp_surface::wallpaper_presenter;
 pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
-pub use shell::{acquire_single_instance, open_studio, overlay_injected, shell_open};
+pub use shell::{acquire_single_instance, open_studio, shell_open};
 pub use tray::{parse_tray_enabled, TrayAction};
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
 pub use widget::{WidgetWindow, WidgetWindowConfig};
@@ -323,15 +323,16 @@ impl Win32DesktopHost {
         WidgetWindow::create(self.hinstance, cfg)
     }
 
-    /// Presenter DirectComposition (alpha pré-multiplicado) para a janela de widget.
+    /// Presenter DirectComposition por superfície (alpha pré-multiplicado, sem `Present`: overlays
+    /// de jogos não se penduram no widget) para a janela de widget.
     pub fn create_widget_presenter(
         &self,
         gpu: &crate::engine_core::gpu::GpuContext,
         window: &WidgetWindow,
         width: u32,
         height: u32,
-    ) -> PlatformResult<DCompPresenter> {
-        DCompPresenter::new(gpu, window.hwnd(), width, height)
+    ) -> PlatformResult<dcomp_surface::DCompSurfacePresenter> {
+        dcomp_surface::DCompSurfacePresenter::new(gpu, window.hwnd(), width, height, true)
     }
 
     /// Último clique local em widget: `(janela, x, y)` em px do cliente.

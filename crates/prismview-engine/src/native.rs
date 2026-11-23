@@ -59,7 +59,7 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, log_file, open_studio, overlay_injected, parse_tray_enabled, resolve_font_files,
+    acquire_single_instance, log_file, open_studio, wallpaper_presenter, parse_tray_enabled, resolve_font_files,
     run as run_loop,
     trim_working_set, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
     SensorsConfig, TrayAction, Win32DesktopHost, Win32SystemSensors,
@@ -1515,17 +1515,29 @@ impl NativeApp {
             if self.gpu.is_none() {
                 match GpuContext::new(handles, width, height) {
                     Ok((gpu, surface)) => {
+                        // A swapchain de bootstrap sai antes do alvo DirectComposition da janela.
+                        drop(surface);
                         self.gpu = Some(gpu);
-                        pending.push((monitor_id, scale, origin, surface));
                     }
-                    Err(err) => eprintln!("[prismview-engine] gpu: {err}"),
+                    Err(err) => {
+                        eprintln!("[prismview-engine] gpu: {err}");
+                        continue;
+                    }
                 }
-                continue;
             }
             let Some(gpu) = self.gpu.as_ref() else {
                 continue;
             };
-            match gpu.create_surface(handles, width, height) {
+            // Superfície DirectComposition (sem `Present`: overlays de jogos — RivaTuner/MSI
+            // Afterburner, NVIDIA, Steam… — não se penduram no wallpaper). Swapchain só de reserva.
+            let surface = match wallpaper_presenter(gpu, window, width, height) {
+                Ok(presenter) => Ok(gpu.create_external_surface(presenter, width, height)),
+                Err(err) => {
+                    eprintln!("[prismview-engine] DirectComposition {monitor_id}: {err}; usando swapchain");
+                    gpu.create_surface(handles, width, height)
+                }
+            };
+            match surface {
                 Ok(surface) => pending.push((monitor_id, scale, origin, surface)),
                 Err(err) => eprintln!("[prismview-engine] superfície {monitor_id}: {err}"),
             }
@@ -1699,7 +1711,6 @@ impl NativeApp {
                     active_monitor_count: u32::try_from(self.outputs.len()).unwrap_or(u32::MAX),
                     rendered_frames: self.frames,
                     errors: self.status_issues(),
-                    overlay_injected: overlay_injected(),
                     gpu_adapter: self
                         .gpu
                         .as_ref()

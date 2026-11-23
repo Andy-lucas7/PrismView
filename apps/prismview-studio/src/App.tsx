@@ -58,7 +58,6 @@ import { nativeCompatIssues } from "./utils/nativeCompat";
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
-const RTSS_DISMISS_KEY = "prismview.rtssOverlayDismissed.v1";
 import { UnifiedCompositor } from "./components/UnifiedCompositor";
 import { StudioEditor } from "./components/StudioEditor";
 import {
@@ -531,12 +530,6 @@ const StudioHubApp: React.FC = () => {
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<PrismProject | null>(null);
   const [brokenProjects, setBrokenProjects] = useState<BrokenProjectDto[]>([]);
-  // RivaTuner/MSI Afterburner: o overlay dele se injeta no motor e aparece no wallpaper.
-  const [rtss, setRtss] = useState<{ installed: boolean; excluded: boolean } | null>(null);
-  const [rtssDismissed, setRtssDismissed] = useState(
-    () => window.localStorage.getItem(RTSS_DISMISS_KEY) === "1"
-  );
-  const [rtssBusy, setRtssBusy] = useState(false);
   const [brokenDetailsOpen, setBrokenDetailsOpen] = useState(false);
   const [importConflict, setImportConflict] = useState<{ path: string; existingTitle: string } | null>(null);
   const [openAppReview, setOpenAppReview] = useState<{
@@ -1064,16 +1057,10 @@ const StudioHubApp: React.FC = () => {
           }
           // Vídeo/modelo/imagem carregam depois no motor: confere os erros dele um pouco depois.
           window.setTimeout(() => {
-            void invokeCmd<{
-              errors?: { layer_id?: string | null; message: string }[];
-              overlay_injected?: boolean;
-            }>("native_engine_status")
+            void invokeCmd<{ errors?: { layer_id?: string | null; message: string }[] }>(
+              "native_engine_status"
+            )
               .then((status) => {
-                if (status.overlay_injected) {
-                  // Overlay de terceiros desenhando no wallpaper: reexibe o aviso com a correção.
-                  setRtssDismissed(false);
-                  setRtss((cur) => cur ?? { installed: true, excluded: false });
-                }
                 const errors = status.errors ?? [];
                 if (errors.length === 0) return;
                 console.warn("[PrismView] erros do motor:", errors);
@@ -1097,26 +1084,6 @@ const StudioHubApp: React.FC = () => {
       },
       silent
     );
-  };
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return;
-    void invokeCmd<{ installed: boolean; excluded: boolean }>("rtss_status")
-      .then(setRtss)
-      .catch((err) => console.error("[PrismView] rtss_status:", err));
-  }, []);
-
-  const hideRtssOverlay = async () => {
-    setRtssBusy(true);
-    try {
-      const next = await invokeCmd<{ installed: boolean; excluded: boolean }>("hide_rtss_overlay");
-      setRtss(next);
-      notify("Overlay do RivaTuner desativado no wallpaper.");
-    } catch (err) {
-      notify(friendlyError(err, "Não foi possível ocultar o overlay do RivaTuner."));
-    } finally {
-      setRtssBusy(false);
-    }
   };
 
   const clearWallpaper = async () => {
@@ -1923,37 +1890,6 @@ const StudioHubApp: React.FC = () => {
 
       {/* Main Content Area */}
       <div className="relative z-10 flex-1 flex flex-col min-w-0 overflow-hidden">
-        {rtss?.installed && !rtss.excluded && !rtssDismissed && (
-          <div
-            role="alert"
-            className="mx-7 mt-4 flex items-start gap-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-xs text-amber-100 shrink-0"
-          >
-            <span className="flex-1 leading-relaxed">
-              O overlay do MSI Afterburner / RivaTuner trata o wallpaper como um jogo e aparece
-              nele. Ocultar grava um perfil no RivaTuner só para o motor do PrismView (o Windows
-              pede permissão uma vez).
-            </span>
-            <button
-              type="button"
-              disabled={rtssBusy}
-              onClick={() => void hideRtssOverlay()}
-              className={`shrink-0 rounded-full bg-white/90 hover:bg-white text-black px-3 py-1 font-medium ${LOCK_CLS}`}
-            >
-              {rtssBusy ? "Aplicando…" : "Ocultar no wallpaper"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                window.localStorage.setItem(RTSS_DISMISS_KEY, "1");
-                setRtssDismissed(true);
-              }}
-              aria-label="Dispensar aviso"
-              className="shrink-0 text-amber-100/70 hover:text-white"
-            >
-              <X size={14} />
-            </button>
-          </div>
-        )}
         {brokenProjects.length > 0 && (
           <div
             role="alert"

@@ -5,7 +5,6 @@ mod log_file;
 mod native_engine;
 mod native_scene;
 mod reactive_sensors;
-mod rtss;
 mod vis_events;
 mod projects;
 mod package;
@@ -543,30 +542,6 @@ fn get_live_telemetry(state: tauri::State<'_, SharedState>) -> Result<LiveTeleme
     Ok(build_telemetry_snapshot(&hostname, &media_cache))
 }
 
-/// RivaTuner (overlay do MSI Afterburner) instalado e se o motor já está excluído dele.
-#[tauri::command]
-async fn rtss_status() -> Result<rtss::RtssStatusDto, String> {
-    tauri::async_runtime::spawn_blocking(rtss::status)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Exclui o motor do RivaTuner (perfil com hook desligado, via UAC) e reinicia o motor para o
-/// overlay sumir do wallpaper.
-#[tauri::command]
-async fn hide_rtss_overlay(
-    engine: tauri::State<'_, native_engine::SharedEngine>,
-) -> Result<rtss::RtssStatusDto, String> {
-    let engine = Arc::clone(engine.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        let status = rtss::exclude_engine()?;
-        engine.restart_if_running()?;
-        Ok(status)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
 #[tauri::command]
 fn media_control(state: tauri::State<'_, SharedState>, action: String) -> Result<(), String> {
     let cmd = match action.trim().to_ascii_lowercase().as_str() {
@@ -922,8 +897,6 @@ pub fn run() {
             native_engine::native_engine_status,
             native_engine::native_engine_apply,
             native_engine::native_engine_set_power,
-            rtss_status,
-            hide_rtss_overlay,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir PrismView");

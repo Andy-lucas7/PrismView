@@ -1407,10 +1407,6 @@ pub struct EngineStatus {
     /// No máximo `ENGINE_ISSUES_MAX`; limpo a cada cena nova.
     #[serde(default)]
     pub errors: Vec<EngineIssue>,
-    /// Um overlay de terceiros (RivaTuner/MSI Afterburner) se injetou no motor e desenha por cima
-    /// do wallpaper. O Studio oferece excluir o motor no perfil do RTSS.
-    #[serde(default)]
-    pub overlay_injected: bool,
 }
 
 /// Teto de `EngineStatus::errors`.
