@@ -346,8 +346,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
     onCanvasElRef.current?.(canvas);
 
     // 3.6: MSAA only when the effective pixel ratio is low; decided at boot (needs a new
-    // context to change). 3.3: the buffer is only preserved for thumbnail snapshots (toBlob);
-    // the glass backdrop reads the canvas synchronously inside onFrameReady.
+    // context to change). Keep preserveDrawingBuffer=true so OpticalGlassSurface (which reads
+    // this canvas via texImage2D in rAF and on idle slider edits) never samples a cleared buffer.
     const bootCaps = powerCapsRef.current;
     const bootDpr = isThumbRef.current
       ? 1
@@ -364,7 +364,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         alpha: true,
         premultipliedAlpha: true,
         powerPreference: "high-performance",
-        preserveDrawingBuffer: isThumbRef.current,
+        preserveDrawingBuffer: true,
       });
       renderer.setClearColor(0x000000, 0);
     } catch {

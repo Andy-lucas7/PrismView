@@ -128,9 +128,9 @@ impl GlyphMaps {
             source.size.0.clamp(1, MAX_GLYPH_DIM),
             source.size.1.clamp(1, MAX_GLYPH_DIM),
         );
-        // Mesma conversão do TS: bevel = clamp(round(bevelPx * 0.48), 2, 32); σ = max(2, bevel * 0.55).
-        let bevel = (fin(source.bevel_px, 0.0) * 0.48).round().clamp(2.0, 32.0);
-        let bevel_q = bevel as u32;
+        // Mesma conversão contínua do TS (`glassLens.ts`): σ = clamp(bevel_px * 0.3575, 0.8, 31.2).
+        let sigma = (fin(source.bevel_px, 0.0) * 0.3575).clamp(0.8, 31.2);
+        let bevel_q = (sigma * 2.0).round() as u32;
 
         if let Some(e) = self.entries.get_mut(source.key.as_ref()) {
             if e.token == source.token && e.size == size && e.bevel_q == bevel_q {
@@ -142,8 +142,7 @@ impl GlyphMaps {
             return false;
         }
 
-        let sigma = (bevel * 0.55).max(2.0);
-        let radius = (sigma * 3.0).ceil().clamp(1.0, 64.0);
+        let radius = (sigma * 3.0).ceil().clamp(1.0, 96.0);
         let region = [size.0 as f32, size.1 as f32, 0.0, 0.0];
 
         let tmp = make_target(device, "prismview_glyph_tmp", size, GLYPH_FORMAT);
@@ -178,7 +177,7 @@ impl GlyphMaps {
             b: region,
         };
         let params_pack = PassParams {
-            a: [0.0; 4],
+            a: [sigma, 0.0, 0.0, 0.0],
             b: region,
         };
         let (Some(off_h), Some(off_v), Some(off_pack)) = (

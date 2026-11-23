@@ -27,6 +27,7 @@ const ACTIVE_SCENE_FILE: &str = "active_scene.json";
 /// Widgets nativos persistidos pelo motor (mesmo formato de `prism-core::ActiveWidgetsFile`).
 const ACTIVE_WIDGETS_FILE: &str = "active_widgets.json";
 /// Cenas dos widgets nativos (`native/widgets/<id>.json`).
+#[allow(dead_code)] // API de widgets nativos (Entrega 3) aguardando ligação em `widgets.rs`
 const WIDGET_SCENES_DIR: &str = "widgets";
 /// Preferência de energia lida pelo motor ao iniciar (mesmo arquivo que ele grava no IPC).
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
@@ -59,10 +60,12 @@ pub struct NativeEngine {
     export_worker_active: AtomicBool,
     /// Última posição (física) que o Studio mandou por widget: decide se o arrasto feito no
     /// desktop (estado do motor) ou a edição no Studio vence no próximo `UPSERT_WIDGET`.
+    #[allow(dead_code)]
     widget_sent_pos: Mutex<HashMap<String, (i32, i32)>>,
 }
 
 /// Posição/tamanho (px físicos) e flags de um widget nativo.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeWidgetPlacement {
     pub x: i32,
@@ -227,6 +230,7 @@ pub fn has_active_widgets() -> bool {
 }
 
 /// Mesmo critério do motor (`NativeWidgetSpec::is_valid_id`): vira nome de arquivo/janela.
+#[allow(dead_code)]
 pub fn is_valid_widget_id(id: &str) -> bool {
     !id.trim().is_empty()
         && id.len() <= 128
@@ -237,6 +241,7 @@ pub fn is_valid_widget_id(id: &str) -> bool {
 
 /// Widget pode rodar nativo? Vídeo em widget ainda não tem decoder no motor por widget:
 /// esses continuam no WebView (fallback explícito, sem quebrar projetos existentes).
+#[allow(dead_code)]
 pub fn widget_native_eligible(project: &Value) -> Result<(), String> {
     fn has_video(layers: &[Value]) -> bool {
         layers.iter().any(|l| {
@@ -252,6 +257,7 @@ pub fn widget_native_eligible(project: &Value) -> Result<(), String> {
 }
 
 /// Tira `id` do `active_widgets.json` (motor fora do ar) e apaga a cena dele.
+#[allow(dead_code)]
 fn remove_persisted_widget(id: &str) -> Result<(), String> {
     let dir = state_dir()?;
     let path = dir.join(ACTIVE_WIDGETS_FILE);
@@ -415,6 +421,7 @@ impl NativeEngine {
     /// `native/widgets/<id>.json` e manda `UPSERT_WIDGET`. Devolve a posição efetiva (física):
     /// se o usuário arrastou o widget no desktop, a posição do motor vence a do projeto, a menos
     /// que o Studio tenha mudado `posX/posY` desde o último envio.
+    #[allow(dead_code)]
     pub fn upsert_widget(&self, project: &Value, placement: &NativeWidgetPlacement) -> Result<(i32, i32), String> {
         let id = project
             .get("id")
@@ -474,6 +481,7 @@ impl NativeEngine {
     }
 
     /// Remove o widget nativo (o motor apaga a cena dele e sai se não sobrar nada).
+    #[allow(dead_code)]
     pub fn remove_widget(&self, id: &str) -> Result<(), String> {
         if let Ok(mut m) = self.widget_sent_pos.lock() {
             m.remove(id);
@@ -489,6 +497,7 @@ impl NativeEngine {
     }
 
     /// Travar/destravar arrasto, sempre-no-topo, click-through (campos `None` não mudam).
+    #[allow(dead_code)]
     pub fn set_widget_flags(
         &self,
         id: &str,
@@ -507,6 +516,7 @@ impl NativeEngine {
     }
 
     /// Widgets nativos no ar (posições atuais após arrasto). Vazio se o motor não responde.
+    #[allow(dead_code)]
     pub fn list_widgets(&self) -> Vec<Value> {
         pipe_try_once(&json!({ "cmd": "LIST_WIDGETS" }))
             .ok()

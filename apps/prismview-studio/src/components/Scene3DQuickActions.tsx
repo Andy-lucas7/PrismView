@@ -1,12 +1,11 @@
 import React from "react";
-import { AudioLines, ImageIcon, MousePointer2, Sparkles, Upload } from "lucide-react";
+import { AudioLines, ImageIcon, MousePointer2, MousePointerClick, Sparkles, Upload } from "lucide-react";
 import type {
   ReactiveBinding3D,
   Scene3DAutoSuggestion,
   Scene3DDynamicTexture,
   Scene3DPickedPart,
 } from "../types/prism";
-import { matchBody, splitNameTokens } from "../engine/scene3d/partHeuristics";
 import {
   QUICK_RANGES,
   QUICK_SPECS,
@@ -16,6 +15,7 @@ import {
   findQuickCover,
   quickBindingId,
   suggestedQuickTarget,
+  toggleSuggestionBinding,
   type QuickActionKind,
 } from "../engine/scene3d/quickActions";
 
@@ -62,8 +62,9 @@ const Toggle: React.FC<{ on: boolean; onChange: (v: boolean) => void; label: str
 );
 
 /**
- * "Ações Rápidas" (modo fácil). Edits the same `config.bindings` / `object.dynamicTextures` the Pro
- * editor shows; every toggle is idempotent (see engine/scene3d/quickActions.ts).
+ * "Ações Rápidas" (modo fácil): comportamentos universais para qualquer objeto 3D (seguir cursor,
+ * pulso ao clicar, reagir ao áudio, textura dinâmica em material) + chips contextuais somente para
+ * partes realmente detectadas no modelo. Edita a mesma fonte da verdade do Modo Pro.
  */
 export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
   objectId,
@@ -85,14 +86,14 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
   const cover = findQuickCover(dynamicTextures, objectId);
   const coverSuggestion = suggestions.find((s) => s.kind === "DYNAMIC_TEXTURE")?.dynamicTexture?.materialName ?? null;
   const picked = pickedPart && pickedPart.objectId === objectId ? pickedPart : null;
+  const bindingSuggestions = suggestions.filter((s) => s.kind === "BINDING" && Boolean(s.binding));
 
-  /** Current quick binding of `kind` (quick id first, else an equivalent one on the suggested target) */
+  /** Current quick binding of `kind` (quick id first, else an equivalent binding on this object) */
   const current = (kind: QuickActionKind): ReactiveBinding3D | null => {
     const byId = bindings.find((b) => b.id === quickBindingId(kind, objectId));
     if (byId) return byId;
-    const target = suggestedQuickTarget(suggestions, kind) ?? (kind === "AUDIO" ? ROOT : null);
-    const hit = findQuickBindings(bindings, kind, objectId, primaryObjectId, target)[0];
-    return hit ?? null;
+    const target = suggestedQuickTarget(suggestions, kind) ?? ROOT;
+    return findQuickBindings(bindings, kind, objectId, primaryObjectId, target)[0] ?? null;
   };
 
   const setQuick = (
@@ -110,14 +111,27 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
   const setCover = (patch: { enabled: boolean; materialName?: string; emissiveMap?: boolean; source?: Scene3DDynamicTexture["source"] }) =>
     onPatchDynTex((cur) => applyQuickCover(cur, { objectId, ...patch }), "discrete");
 
-  const renderFollow = (kind: QuickActionKind, title: string, hint: string, icon: React.ReactNode) => {
+  const isSuggestionActive = (sug: Scene3DAutoSuggestion): boolean => {
+    const tpl = sug.binding;
+    if (!tpl) return false;
+    return bindings.some(
+      (b) =>
+        b.enabled &&
+        (b.objectId || primaryObjectId) === objectId &&
+        b.source === tpl.source &&
+        b.targetType === tpl.targetType &&
+        b.targetName === tpl.targetName
+    );
+  };
+
+  const renderBehavior = (kind: QuickActionKind, title: string, hint: string, icon: React.ReactNode) => {
     const b = current(kind);
     const on = Boolean(b?.enabled);
-    const suggested = suggestedQuickTarget(suggestions, kind);
-    const target = b?.targetName ?? suggested ?? (kind === "AUDIO" ? ROOT : "");
-    const canEnable = Boolean(target);
+    const defaultTarget = suggestedQuickTarget(suggestions, kind) ?? ROOT;
+    const target = b?.targetName ?? defaultTarget;
     const range = QUICK_RANGES[kind];
     const strength = b?.strength ?? QUICK_SPECS[kind].strength;
+    const hasSubParts = nodeNames.length > 0;
     const options = target && !nodeNames.includes(target) && target !== ROOT ? [target, ...nodeNames] : nodeNames;
     return (
       <div className="rounded-xl bg-white/[0.03] border border-white/10 px-2 py-1.5 space-y-1">
@@ -126,46 +140,46 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
           <span className="text-[11px] text-white flex-1 truncate" title={hint}>
             {title}
           </span>
-          {!suggested && !b && kind !== "AUDIO" && <span className="text-[9px] text-[#71717A]">não detectado</span>}
-          <Toggle
-            label={title}
-            on={on}
-            onChange={(v) => {
-              if (!canEnable && v) return;
-              setQuick(kind, v, target || ROOT);
-            }}
-          />
+          {on && target !== ROOT && (
+            <span className="text-[9px] text-[#A1A1AA] truncate max-w-[72px]" title={target}>
+              {target}
+            </span>
+          )}
+          <Toggle label={title} on={on} onChange={(v) => setQuick(kind, v, target || ROOT)} />
         </div>
-        {(on || (!suggested && kind !== "AUDIO")) && (
+        {on && (
           <div className="flex items-center gap-1.5">
-            <select aria-label="Alvo da ação"
-              value={target || ""}
-              onChange={(e) => setQuick(kind, true, e.target.value, undefined)}
-              className={selectCls}
-              title="Osso / peça alvo"
-            >
-              {!target && <option value="">Escolher parte…</option>}
-              <option value={ROOT}>Modelo inteiro</option>
-              {options.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-            {on && (
-              <input aria-label="Intensidade"
-                type="range"
-                min={range.min}
-                max={range.max}
-                step={range.step}
-                value={strength}
-                onPointerDown={onBeginTx}
-                onPointerUp={onCommitTx}
-                onChange={(e) => setQuick(kind, true, target, Number(e.target.value), "raw")}
-                className="w-20 accent-white"
-                title={`Intensidade: ${strength}`}
-              />
+            {hasSubParts ? (
+              <select
+                aria-label="Alvo da ação"
+                value={target || ROOT}
+                onChange={(e) => setQuick(kind, true, e.target.value, undefined)}
+                className={selectCls}
+                title="Objeto inteiro ou peça específica"
+              >
+                <option value={ROOT}>Modelo inteiro</option>
+                {options.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="text-[10px] text-[#71717A] flex-1">Intensidade</span>
             )}
+            <input
+              aria-label="Intensidade"
+              type="range"
+              min={range.min}
+              max={range.max}
+              step={range.step}
+              value={strength}
+              onPointerDown={onBeginTx}
+              onPointerUp={onCommitTx}
+              onChange={(e) => setQuick(kind, true, target || ROOT, Number(e.target.value), "raw")}
+              className={hasSubParts ? "w-20 accent-white" : "w-28 accent-white"}
+              title={`Intensidade: ${strength}`}
+            />
           </div>
         )}
       </div>
@@ -190,19 +204,32 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         </button>
       </div>
 
+      {/* Contextual bar when the user clicks a specific part/mesh in the 3D viewport */}
       {picked && (
         <div className="flex flex-wrap items-center gap-1 rounded-lg bg-amber-400/10 border border-amber-300/25 px-2 py-1 text-[10px] text-amber-100">
           <span className="truncate max-w-full">
-            Parte: <b>{picked.name === ROOT ? "Modelo inteiro" : picked.name}</b> →
+            Peça: <b>{picked.name === ROOT ? "Modelo inteiro" : picked.name}</b> →
           </span>
           <button
             type="button"
             className="px-1.5 py-0.5 rounded-full bg-white/10 hover:bg-white/20"
-            onClick={() =>
-              setQuick(matchBody(picked.name, splitNameTokens(picked.name)) ? "BODY" : "HEAD", true, picked.name)
-            }
+            onClick={() => setQuick("LOOK", true, picked.name)}
           >
-            Seguir mouse
+            Seguir cursor
+          </button>
+          <button
+            type="button"
+            className="px-1.5 py-0.5 rounded-full bg-white/10 hover:bg-white/20"
+            onClick={() => setQuick("CLICK", true, picked.name)}
+          >
+            Reagir ao clique
+          </button>
+          <button
+            type="button"
+            className="px-1.5 py-0.5 rounded-full bg-white/10 hover:bg-white/20"
+            onClick={() => setQuick("AUDIO", true, picked.name)}
+          >
+            Pulsar áudio
           </button>
           {picked.materials.length > 0 && (
             <button
@@ -210,29 +237,46 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
               className="px-1.5 py-0.5 rounded-full bg-white/10 hover:bg-white/20"
               onClick={() => setCover({ enabled: true, materialName: picked.materials[0], source: "MEDIA_COVER" })}
             >
-              Colocar capa da música
+              Aplicar capa/imagem
             </button>
           )}
-          <button
-            type="button"
-            className="px-1.5 py-0.5 rounded-full bg-white/10 hover:bg-white/20"
-            onClick={() => setQuick("AUDIO", true, picked.name)}
-          >
-            Reagir ao áudio
-          </button>
         </div>
       )}
 
-      {/* Capa da música em material/tela */}
+      {/* 4 comportamentos universais (funcionam em qualquer modelo 3D) */}
+      {renderBehavior(
+        "LOOK",
+        "Seguir o cursor",
+        "Inclina o objeto (ou peça escolhida) na direção do mouse",
+        <MousePointer2 className="w-3 h-3 text-[#A1A1AA]" />
+      )}
+      {renderBehavior(
+        "CLICK",
+        "Reagir ao clique",
+        "Pulso tátil com mola ao clicar no objeto",
+        <MousePointerClick className="w-3 h-3 text-[#A1A1AA]" />
+      )}
+      {renderBehavior(
+        "AUDIO",
+        "Pulsar com o áudio",
+        "Reage aos graves da música tocando no PC",
+        <AudioLines className="w-3 h-3 text-[#A1A1AA]" />
+      )}
+
+      {/* Textura dinâmica em material (Capa da Música ou Imagem do PC) */}
       <div className="rounded-xl bg-white/[0.03] border border-white/10 px-2 py-1.5 space-y-1">
         <div className="flex items-center gap-1.5">
           <ImageIcon className="w-3 h-3 text-[#A1A1AA]" />
-          <span className="text-[11px] text-white flex-1 truncate">
-            {cover?.source === "CUSTOM_IMAGE" ? "Imagem em Material" : "Capa da Música em Tela"}
+          <span className="text-[11px] text-white flex-1 truncate" title="Projeta a capa da música atual ou uma imagem em um material do modelo">
+            {cover?.source === "CUSTOM_IMAGE" ? "Imagem em Material" : "Capa / Imagem em Material"}
           </span>
-          {!coverOn && coverSuggestion && <span className="text-[9px] text-amber-200/80 truncate max-w-[80px]">{coverSuggestion}</span>}
+          {!coverOn && coverSuggestion && (
+            <span className="text-[9px] text-amber-200/80 truncate max-w-[80px]" title={`Material detectado: ${coverSuggestion}`}>
+              {coverSuggestion}
+            </span>
+          )}
           <Toggle
-            label="Capa da música"
+            label="Textura dinâmica em material"
             on={coverOn}
             onChange={(v) => setCover({ enabled: v, materialName: v ? coverMat : undefined })}
           />
@@ -240,7 +284,8 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         {coverOn && cover && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5">
-              <select aria-label="Material da capa"
+              <select
+                aria-label="Material da textura"
                 value={cover.materialName || "*"}
                 onChange={(e) => setCover({ enabled: true, materialName: e.target.value })}
                 className={selectCls}
@@ -271,7 +316,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
                 onClick={() => setCover({ enabled: true, source: "MEDIA_COVER" })}
                 className={`flex-1 py-0.5 rounded-lg text-[10px] ${cover.source === "MEDIA_COVER" ? "prism-pill-active" : "prism-pill-idle"}`}
               >
-                Música atual
+                Capa da música
               </button>
               {onPickCustomImage && (
                 <button
@@ -285,7 +330,7 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
                 >
                   {cover.source === "CUSTOM_IMAGE" && cover.customSrc
                     ? cover.customSrc.split(/[\\/]/).pop()
-                    : "Usar imagem do PC"}
+                    : "Imagem do PC"}
                 </button>
               )}
             </div>
@@ -293,23 +338,39 @@ export const Scene3DQuickActions: React.FC<Scene3DQuickActionsProps> = ({
         )}
       </div>
 
-      {renderFollow(
-        "HEAD",
-        "Cabeça segue o mouse",
-        "Olhar p/ Cursor (NODE_LOOK_AT)",
-        <MousePointer2 className="w-3 h-3 text-[#A1A1AA]" />
-      )}
-      {renderFollow(
-        "BODY",
-        "Corpo acompanha (leve)",
-        "Inclinação sutil do tronco p/ o cursor; braços e objetos seguram a pose",
-        <MousePointer2 className="w-3 h-3 text-[#71717A]" />
-      )}
-      {renderFollow(
-        "AUDIO",
-        "Pulsar com a batida",
-        "Pulso de escala no Áudio Grave (NODE_SCALE_PULSE)",
-        <AudioLines className="w-3 h-3 text-[#A1A1AA]" />
+      {/* Sugestões contextuais: só aparecem se o .glb realmente tiver partes nomeadas detectadas */}
+      {bindingSuggestions.length > 0 && (
+        <div className="pt-0.5 space-y-1">
+          <div className="text-[9px] uppercase tracking-wider text-[#71717A] px-0.5">
+            Detectado neste modelo
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {bindingSuggestions.map((sug) => {
+              const active = isSuggestionActive(sug);
+              return (
+                <button
+                  key={sug.id}
+                  type="button"
+                  onClick={() =>
+                    onPatchBindings(
+                      (cur) => toggleSuggestionBinding(cur, sug, objectId, primaryObjectId),
+                      "discrete"
+                    )
+                  }
+                  title={sug.detail}
+                  className={`px-2 py-0.5 rounded-full text-[10px] border transition ${
+                    active
+                      ? "bg-emerald-400/15 border-emerald-400/40 text-emerald-200"
+                      : "bg-white/[0.03] border-white/10 text-[#D4D4D8] hover:bg-white/10"
+                  }`}
+                >
+                  {active ? "✓ " : "+ "}
+                  {sug.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
       )}
     </div>
   );

@@ -14,6 +14,10 @@ export interface GlyphGlassMaps {
   webglCanvas: HTMLCanvasElement;
   /** Blurred glyph heightfield (alpha channel) used by the GPU Sobel pass. */
   heightCanvas: HTMLCanvasElement;
+  /** Heightfield Gaussian sigma in heightCanvas pixels (normalizes Sobel slope across bevel widths). */
+  heightSigmaPx: number;
+  /** CSS padding added around the glyph box (subtracted from dome normal for 1:1 native parity). */
+  padPx: number;
   /** Lazily generated PNG data URLs only if pure CSS fallback is ever needed */
   getMaskUrl: () => string;
   getSpecularUrl: () => string;
@@ -78,7 +82,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   if (typeof document === "undefined") return null;
   const text = params.text || " ";
   const fontSize = Math.max(10, Math.min(360, Math.round(params.fontSize)));
-  const bevel = Math.max(2, Math.min(32, Math.round(params.bevelPx * 0.48)));
+  // Continuous sigma proportional to bevelPx (0.55 * 0.65 = 0.3575, 1:1 parity with native glyph.rs)
+  const heightBlurPx = Math.max(0.8, Math.min(31.2, Math.round(params.bevelPx * 0.3575 * 2) / 2));
 
   const key = [
     text,
@@ -87,7 +92,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     params.fontWeight,
     params.letterSpacingEm.toFixed(3),
     params.align,
-    bevel,
+    heightBlurPx.toFixed(1),
     params.fontRev,
   ].join("|");
 
@@ -192,7 +197,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   heightCanvas.height = ch;
   const heightCtx = heightCanvas.getContext("2d");
   if (!heightCtx) return null;
-  drawTextOnto(heightCtx, Math.max(2, bevel * 0.55));
+  const heightSigmaPx = Math.max(0.8, heightBlurPx * renderScale);
+  drawTextOnto(heightCtx, heightBlurPx);
 
   let lazyMaskUrl: string | null = null;
   let lazySpecUrl: string | null = null;
@@ -231,7 +237,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
         const gy = (tl + 2 * t + tr) - (bl + 2 * b + br);
         const slope = Math.hypot(gx, gy);
         if (slope > 0.004) {
-          const gain = Math.min(1, slope * 2.2);
+          const gain = Math.min(1, slope * Math.max(2.2, heightSigmaPx * 0.9));
           out[idx] = Math.round(128 + (gx / slope) * gain * 126);
           out[idx + 1] = Math.round(128 + (gy / slope) * gain * 126);
           out[idx + 2] = Math.round(gain * 255);
@@ -253,6 +259,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     height: cssH,
     webglCanvas: maskCanvas,
     heightCanvas,
+    heightSigmaPx,
+    padPx: pad,
     getMaskUrl: () => {
       if (lazyMaskUrl !== null) return lazyMaskUrl;
       const pData = getPackedCpu();

@@ -313,7 +313,7 @@ impl Ctx {
     fn fill_text(&self, node: &mut Value, layer: &Value, t: &Value) {
         node["kind"] = json!("TEXT");
         node["fill"] = json!("SOLID");
-        node["color"] = fx_str(layer, "color", css_to_argb(text(t, "color"), number(t, "colorAlpha", 1.0)));
+        node["color"] = fx_color(layer, "color", text(t, "color"), number(t, "colorAlpha", 1.0));
         let mut content = json!({
             "text": text(t, "content"),
             "font_id": non_empty(text(t, "fontFamily"), "Outfit"),
@@ -333,7 +333,7 @@ impl Ctx {
         node["text"] = content;
         let shadow = number(t, "shadowBlur", 0.0);
         if shadow > 0.0 {
-            node["shadow"] = json!({ "radius_px": shadow, "color_rgba": "#80000000", "dx_px": 0.0, "dy_px": 0.0 });
+            node["shadow"] = json!({ "radius_px": shadow, "color_rgba": "#66000000", "dx_px": 0.0, "dy_px": 2.0 });
         }
     }
 
@@ -382,7 +382,7 @@ impl Ctx {
         let alpha = number(&svg, "colorAlpha", 1.0);
         node["kind"] = json!("SVG");
         node["color"] = if tintable {
-            fx_str(layer, "color", css_to_argb(text(&svg, "color"), alpha))
+            fx_color(layer, "color", text(&svg, "color"), alpha)
         } else {
             json!(css_to_argb("#FFFFFF", alpha))
         };
@@ -1006,8 +1006,27 @@ fn fx_num(layer: &Value, key: &str, fallback: f64) -> Value {
     }
 }
 
-fn fx_str(layer: &Value, key: &str, fallback: String) -> Value {
+/// Cor estática ou FX preservando `alpha` (`colorAlpha`) mesmo quando a fórmula retorna `#RRGGBB`
+/// opaco (ex.: `$mi(color)$` → `$ce(mi(color), alpha, 16)$`).
+fn fx_color(layer: &Value, key: &str, raw_color: &str, alpha: f64) -> Value {
+    let alpha = if alpha.is_finite() { alpha.clamp(0.0, 1.0) } else { 1.0 };
+    let fallback = css_to_argb(raw_color, alpha);
     match fx_expr(layer, key) {
+        Some(expr) if alpha < 0.999 => {
+            let trimmed = expr.trim();
+            let wrapped = if let Some(inner) = trimmed.strip_prefix('$').and_then(|s| s.strip_suffix('$')) {
+                let inner = inner.trim();
+                if !inner.is_empty() && !inner.contains('$') {
+                    let pct = (alpha * 100.0).round().clamp(0.0, 100.0) as u32;
+                    format!("$ce({inner}, alpha, {pct})$")
+                } else {
+                    expr.to_owned()
+                }
+            } else {
+                expr.to_owned()
+            };
+            json!({ "fallback": fallback, "expr": wrapped })
+        }
         Some(expr) => json!({ "fallback": fallback, "expr": expr }),
         None => json!(fallback),
     }
@@ -1129,23 +1148,6 @@ fn normalize_dynamic_textures(map: &mut Map<String, Value>) {
 }
 
 // ───────────────────────── SVG ─────────────────────────
-
-/// Atributos `d` dos `<path>` de um SVG próprio (sem parser XML: só o necessário).
-fn svg_paths(markup: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = markup;
-    while let Some(start) = rest.find("<path") {
-        rest = &rest[start + 5..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        if let Some(d) = attr(&rest[..end], "d") {
-            if !d.trim().is_empty() {
-                out.push(d.to_string());
-            }
-        }
-        rest = &rest[end..];
-    }
-    out
-}
 
 fn svg_viewbox(markup: &str) -> Option<(f64, f64)> {
     let start = markup.find("<svg")?;

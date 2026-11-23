@@ -492,12 +492,12 @@ impl TextSystem {
         let letter_spacing_px = letter_spacing_em * size;
         let use_letter_spacing = letter_spacing_px.abs() >= 0.25;
 
-        let family_ref = match family.as_deref() {
+        let (matched_family, matched_weight, matched_stretch, matched_style) =
+            match_face_attrs(fs.db(), family.as_deref(), spec.weight);
+        let family_ref = match matched_family.as_deref().or(family.as_deref()) {
             Some(name) => Family::Name(name),
             None => Family::SansSerif,
         };
-        let (matched_weight, matched_stretch, matched_style) =
-            match_face_attrs(fs.db(), family.as_deref(), spec.weight);
         let attrs = Attrs::new()
             .family(family_ref)
             .weight(matched_weight)
@@ -828,25 +828,51 @@ fn stretch_rank(stretch: fontdb::Stretch) -> u8 {
     }
 }
 
-/// Ajusta `(weight, stretch, style)` para uma face realmente presente na família alvo.
+/// Verifica se uma face pertence à família `target_norm`: nome exato, nome com sufixo de
+/// peso/estilo (ex.: `"Outfit Thin"`, `"Segoe UI Semibold"`, `"Arial Black"`), ou stem do arquivo.
+fn face_matches_family(face: &fontdb::FaceInfo, target_norm: &str) -> bool {
+    for (name, _) in &face.families {
+        let norm = normalize(name);
+        if norm == target_norm || stem_matches_family(&norm, target_norm) {
+            return true;
+        }
+    }
+    if let fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) = &face.source {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(normalize)
+            .unwrap_or_default();
+        if stem_matches_family(&stem, target_norm) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ajusta `(family, weight, stretch, style)` para a face real mais próxima presente na família alvo.
 ///
 /// O `cosmic-text 0.12` rejeita famílias quando `face.stretch != attrs.stretch` (ex.: `Impact` tem
 /// `Stretch::Condensed`) ou quando nenhuma face da família tem exatamente `font_weight_diff == 0`
 /// (ex.: `weight = 500` em `Segoe UI`), saltando para fontes aleatórias de fallback no banco.
+/// Também resolve subfamílias estáticas cujo `Name ID 1` inclui o peso (ex.: `Outfit Thin` = 300,
+/// `Outfit Bold` = 700, `Segoe UI Semibold` = 600).
 fn match_face_attrs(
     db: &fontdb::Database,
     family: Option<&str>,
     requested_weight: u16,
-) -> (Weight, fontdb::Stretch, fontdb::Style) {
+) -> (Option<String>, Weight, fontdb::Stretch, fontdb::Style) {
     let clamped = requested_weight.clamp(1, 1000);
     let sans = Family::SansSerif;
     let target = match family {
         Some(name) => name,
         None => db.family_name(&sans),
     };
-    let mut best: Option<((u8, u8, u16, u16), Weight, fontdb::Stretch, fontdb::Style)> = None;
+    let target_norm = normalize(target);
+    let mut best: Option<((u8, u8, u16, u8, u16), Option<String>, Weight, fontdb::Stretch, fontdb::Style)> = None;
     for face in db.faces() {
-        if !face.families.iter().any(|(n, _)| n == target) {
+        let exact = face.families.iter().any(|(n, _)| n == target || normalize(n) == target_norm);
+        if !exact && !face_matches_family(face, &target_norm) {
             continue;
         }
         let style_pen: u8 = match face.style {
@@ -856,19 +882,31 @@ fn match_face_attrs(
         };
         let stretch_pen = (stretch_rank(face.stretch) as i32 - 4).unsigned_abs() as u8;
         let weight_diff = face.weight.0.abs_diff(clamped);
+        let name_pen: u8 = u8::from(!exact);
         let weight_tie = if clamped >= 500 {
             u16::MAX - face.weight.0
         } else {
             face.weight.0
         };
-        let score = (style_pen, stretch_pen, weight_diff, weight_tie);
-        if best.as_ref().map_or(true, |(b, _, _, _)| score < *b) {
-            best = Some((score, face.weight, face.stretch, face.style));
+        let score = (style_pen, stretch_pen, weight_diff, name_pen, weight_tie);
+        if best.as_ref().map_or(true, |(b, _, _, _, _)| score < *b) {
+            let face_family = face
+                .families
+                .iter()
+                .find(|(n, _)| n == target)
+                .or_else(|| face.families.first())
+                .map(|(n, _)| n.clone());
+            best = Some((score, face_family, face.weight, face.stretch, face.style));
         }
     }
     match best {
-        Some((_, w, st, sy)) => (w, st, sy),
-        None => (Weight(clamped), fontdb::Stretch::Normal, fontdb::Style::Normal),
+        Some((_, fam, w, st, sy)) => (fam, w, st, sy),
+        None => (
+            family.map(str::to_owned),
+            Weight(clamped),
+            fontdb::Stretch::Normal,
+            fontdb::Style::Normal,
+        ),
     }
 }
 
@@ -879,6 +917,18 @@ fn stem_matches_family(stem: &str, needle: &str) -> bool {
     let Some(rest) = stem.strip_prefix(needle) else {
         return false;
     };
+    let trimmed = rest
+        .strip_suffix("italic")
+        .or_else(|| rest.strip_suffix("oblique"))
+        .or_else(|| rest.strip_suffix("roman"))
+        .unwrap_or(rest);
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(weight) = trimmed.parse::<u16>() {
+            if (100..=1000).contains(&weight) {
+                return true;
+            }
+        }
+    }
     matches!(
         rest,
         "regular"
@@ -908,9 +958,10 @@ fn stem_matches_family(stem: &str, needle: &str) -> bool {
 }
 
 /// Família real no banco que corresponde a `font_id`: nome exato (ignorando caixa/espaços/`-`/`_`)
-/// e, em seguida, stem exato ou com sufixo de peso do arquivo (sem casar substring arbitrária).
+/// e, em seguida, subfamília com sufixo de peso (ex.: `Outfit Thin`/`Outfit Bold`) ou stem do arquivo.
 fn find_family(db: &fontdb::Database, font_id: &str) -> Option<String> {
-    let needle = normalize(primary_font_name(font_id));
+    let primary = primary_font_name(font_id);
+    let needle = normalize(primary);
     if needle.is_empty() {
         return None;
     }
@@ -921,21 +972,8 @@ fn find_family(db: &fontdb::Database, font_id: &str) -> Option<String> {
             }
         }
     }
-    for face in db.faces() {
-        let path = match &face.source {
-            fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => path,
-            fontdb::Source::Binary(_) => continue,
-        };
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(normalize)
-            .unwrap_or_default();
-        if stem_matches_family(&stem, &needle) {
-            if let Some((name, _)) = face.families.first() {
-                return Some(name.clone());
-            }
-        }
+    if db.faces().any(|face| face_matches_family(face, &needle)) {
+        return Some(primary.to_owned());
     }
     None
 }
@@ -962,9 +1000,9 @@ mod tests {
             let _ = fs.db_mut().load_font_file(p);
         }
         let fam = find_family(fs.db(), "Impact").expect("Impact family loaded");
-        let (w, st, sy) = match_face_attrs(fs.db(), Some(&fam), 200);
+        let (matched_fam, w, st, sy) = match_face_attrs(fs.db(), Some(&fam), 200);
         let attrs = Attrs::new()
-            .family(Family::Name(&fam))
+            .family(Family::Name(matched_fam.as_deref().unwrap_or(&fam)))
             .weight(w)
             .stretch(st)
             .style(sy);
@@ -980,5 +1018,48 @@ mod tests {
             "expected Impact, got {:?}",
             used_face.families
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn bundled_numeric_weight_fonts_shape_with_real_faces() {
+        for family in ["Inter", "Outfit", "JetBrains Mono"] {
+            let paths = crate::platform::windows::resolve_font_files(family);
+            if paths.is_empty() {
+                continue;
+            }
+            let mut fs = FontSystem::new_with_locale_and_db(
+                TEXT_ATLAS_LOCALE.to_string(),
+                fontdb::Database::new(),
+            );
+            for p in crate::platform::windows::resolve_font_files("Segoe UI") {
+                let _ = fs.db_mut().load_font_file(p);
+            }
+            for p in &paths {
+                let _ = fs.db_mut().load_font_file(p);
+            }
+            let fam = find_family(fs.db(), family).unwrap_or_else(|| panic!("{family} family loaded"));
+            let needle = normalize(family);
+            for requested in [300u16, 400, 500, 600, 700] {
+                let (matched_fam, w, st, sy) = match_face_attrs(fs.db(), Some(&fam), requested);
+                let attrs = Attrs::new()
+                    .family(Family::Name(matched_fam.as_deref().unwrap_or(&fam)))
+                    .weight(w)
+                    .stretch(st)
+                    .style(sy);
+                let mut buf = Buffer::new(&mut fs, Metrics::new(64.0, 72.0));
+                buf.set_wrap(&mut fs, Wrap::None);
+                buf.set_text(&mut fs, "PrismView 12:34", attrs, Shaping::Advanced);
+                buf.shape_until_scroll(&mut fs, false);
+                let run = buf.layout_runs().next().expect("shaped run");
+                assert!(!run.glyphs.is_empty());
+                let used_face = fs.db().face(run.glyphs[0].font_id).expect("used face");
+                assert!(
+                    face_matches_family(used_face, &needle),
+                    "expected {family} (weight {requested}), got {:?}",
+                    used_face.families
+                );
+            }
+        }
     }
 }

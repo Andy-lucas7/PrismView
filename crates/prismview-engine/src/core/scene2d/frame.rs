@@ -110,6 +110,7 @@ impl Frame<'_> {
         size: (u32, u32),
         content_hash: u64,
         live: bool,
+        opaque: bool,
     ) -> GlassBackdrop {
         let (iw, ih) = (size.0.max(1) as f32, size.1.max(1) as f32);
         let k = (self.vw / iw).max(self.vh / ih).max(1e-3);
@@ -120,6 +121,7 @@ impl Frame<'_> {
             src_per_screen_px: 1.0 / k,
             content_hash,
             live,
+            opaque,
         }
     }
 
@@ -168,7 +170,7 @@ impl Frame<'_> {
             ..GlassParams::default()
         };
         if layer.fill == FillMode::OpticalCrystal {
-            p.refraction_px = (self.f(&c.refraction) + g.refraction).clamp(0.0, 60.0) * ui.max(0.5);
+            p.refraction_px = (self.f(&c.refraction) + g.refraction).clamp(0.0, 60.0) * ui;
             p.chroma_px = ((self.f(&c.dispersion_rgb) + g.dispersion) * 400.0).clamp(0.0, 6.0);
             p.specular = (self.f(&c.fresnel_intensity) + g.specular).clamp(0.0, 1.0);
             p.border = (self.f(&c.prismatic_rim_intensity) + g.rim).clamp(0.0, 0.8);
@@ -179,7 +181,8 @@ impl Frame<'_> {
         p
     }
 
-    /// Enfileira um vidro-placa ou glifo. `false` se não há backdrop de mídia (cai no preenchimento).
+    /// Enfileira um vidro-placa ou glifo. Usa sempre o backdrop composto da saída (gradiente,
+    /// imagem, vídeo e cena 3D juntos, 1:1 com a viewport e opaco).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_glass(
         &mut self,
@@ -193,8 +196,14 @@ impl Frame<'_> {
         radius: f32,
         glyph: Option<GlyphSource>,
     ) -> bool {
-        let Some(backdrop) = self.backdrop else {
-            return false;
+        let backdrop = GlassBackdrop {
+            texture: TextureId::WHITE,
+            size: (self.vw.round().max(1.0) as u32, self.vh.round().max(1.0) as u32),
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            src_per_screen_px: 1.0,
+            content_hash: hash_str(self.canvas_key),
+            live: true,
+            opaque: true,
         };
         let params = self.glass_params(layer, mode, opacity, radius);
         let Some(glass) = self.canvas.glass.as_mut() else {
@@ -233,7 +242,7 @@ impl Frame<'_> {
                     .kind(QuadKind::Opaque)
                     .uv(cover_uv(v.size.0, v.size.1, vw, vh));
                 self.canvas.push(0, BlendKind::Normal, id, inst);
-                self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true));
+                self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true, true));
             }
         } else if let BackgroundSource::Image { path } = &scene.background {
             if let Some(path) = self.resolve_asset(path) {
@@ -246,7 +255,7 @@ impl Frame<'_> {
                         .uv(cover_uv(img.w, img.h, vw, vh));
                     self.canvas.push(0, BlendKind::Normal, img.id, inst);
                     let hash = hash_str(&path.to_string_lossy());
-                    self.backdrop = Some(self.backdrop_for(img.id, (img.w, img.h), hash, false));
+                    self.backdrop = Some(self.backdrop_for(img.id, (img.w, img.h), hash, false, true));
                 }
             }
         }
@@ -507,11 +516,11 @@ impl Frame<'_> {
 
         // Fim da subárvore: pós-ordem (filhos já gravados antes deste pai).
         if let Some((center_base, rot_base)) = bound_base {
-            let rigid = self.canvas.marker_count() != markers0
-                || (!had_scene3d && self.canvas.scene3d.is_some());
+            let rigid = !had_scene3d && self.canvas.scene3d.is_some();
             let entry = BoundSubtree {
                 key: Arc::from(layer.id.as_str()),
                 seq: seq0..self.canvas.next_seq(),
+                markers: (markers0 as usize)..(self.canvas.marker_count() as usize),
                 hits: hits0..self.canvas.hits.len(),
                 parent_m: parent_xf.m,
                 parent_t: parent_xf.t,
@@ -677,7 +686,7 @@ impl Frame<'_> {
         let scale = text_xf.scale();
         let half = [draw.layout.quad_width * 0.5, draw.layout.quad_height * 0.5];
         let mut center = text_xf.t;
-        let glass_glyph = Self::is_glass(layer) && self.backdrop.is_some();
+        let glass_glyph = Self::is_glass(layer);
         // Sem rotação/escala e em repouso (fora de vidro/parallax): alinha à grade de pixels (1:1).
         // Em glifos de vidro ou durante parallax, mantém subpixel contínuo para movimento liso 60+ FPS.
         if !glass_glyph && !moving && text_xf.is_identity_linear() {
@@ -720,10 +729,11 @@ impl Frame<'_> {
             }
         }
 
-        // Sombra do texto: cópia deslocada da máscara (sem blur até a Fase 2).
-        if layer.shadow.radius_px > 0.0 {
+        let fill = self.fill_style(layer, opacity);
+        // Sombra do texto proporcional ao alpha real da cor do texto (evita silhueta preta em alpha 0%).
+        if layer.shadow.radius_px > 0.0 && fill.color[3] > 0.003 {
             let ui = self.ui;
-            let color = with_alpha(parse_color(&layer.shadow.color_rgba), opacity);
+            let color = with_alpha(parse_color(&layer.shadow.color_rgba), fill.color[3]);
             if color[3] > 0.003 {
                 let c = [
                     center[0] + layer.shadow.dx_px * ui,
@@ -737,7 +747,9 @@ impl Frame<'_> {
             }
         }
 
-        let fill = self.fill_style(layer, opacity);
+        if fill.color[3] <= 0.003 && fill.gradient.is_none() {
+            return;
+        }
         let mut inst = QuadInstance::new(center, half, text_xf.m, scale)
             .kind(QuadKind::Mask)
             .color(fill.color)
@@ -886,9 +898,9 @@ impl Frame<'_> {
             .color([1.0, 1.0, 1.0, opacity])
             .uv(cover_uv(out.size.0, out.size.1, size.w, size.h));
         self.canvas.push(z, blend, out.id, inst);
-        // 3D full-bleed: vira o backdrop do vidro desenhado por cima (blur refeito por quadro 3D).
+        // 3D full-bleed: vira o backdrop do vidro desenhado por cima (preserva alpha da cena 3D).
         if fill_parent {
-            self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true));
+            self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true, false));
         }
     }
 
@@ -934,7 +946,7 @@ impl Frame<'_> {
             .uv(cover_uv(v.size.0, v.size.1, size.w, size.h));
         self.canvas.push(z, blend, id, inst);
         if layer.fill_parent {
-            self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true));
+            self.backdrop = Some(self.backdrop_for(id, v.size, v.content_hash, true, true));
         }
     }
 
@@ -1009,6 +1021,10 @@ impl Frame<'_> {
             .color([1.0, 1.0, 1.0, opacity])
             .uv(cover_uv(img.w, img.h, size.w, size.h));
         self.canvas.push(z, blend, img.id, inst);
+        if layer.fill_parent {
+            let hash = hash_str(&path.to_string_lossy());
+            self.backdrop = Some(self.backdrop_for(img.id, (img.w, img.h), hash, false, true));
+        }
     }
 }
 

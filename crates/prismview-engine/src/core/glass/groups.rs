@@ -29,6 +29,8 @@ pub struct GlassBackdrop {
     pub content_hash: u64,
     /// `true` para vídeo/cena viva: o blur é refeito a cada `frame_token` novo.
     pub live: bool,
+    /// `true` para imagem/vídeo opacos (força alpha = 1); `false` para cena 3D transparente.
+    pub opaque: bool,
 }
 
 /// Parâmetros ópticos já em **px físicos** (escala de UI aplicada). Equivalentes diretos de
@@ -160,7 +162,7 @@ impl GlassInstance {
                 fin(p.tint[0], 1.0).clamp(0.0, 1.0),
                 fin(p.tint[1], 1.0).clamp(0.0, 1.0),
                 fin(p.tint[2], 1.0).clamp(0.0, 1.0),
-                1.0,
+                if d.backdrop.opaque { 1.0 } else { 0.0 },
             ],
             pigment: [
                 fin(p.pigment[0], 1.0).clamp(0.0, 1.0),
@@ -202,6 +204,8 @@ pub struct GlassLayer {
     pub(super) draws: Vec<GlassDraw>,
     pub(super) groups: Vec<Option<GroupKey>>,
     pub(super) gpu: Vec<GlassInstance>,
+    /// Cópia das instâncias do último `flush`: base sem deriva para deltas de parallax/molas.
+    pub(super) base_gpu: Vec<GlassInstance>,
 }
 
 impl GlassLayer {
@@ -210,6 +214,38 @@ impl GlassLayer {
         self.viewport = (width.max(1), height.max(1));
         self.draws.clear();
         self.groups.clear();
+    }
+
+    /// Volta as instâncias GPU ao estado do último `flush` (caminho rápido de bindings).
+    pub fn reset_to_base(&mut self) {
+        if self.base_gpu.len() == self.gpu.len() {
+            self.gpu.copy_from_slice(&self.base_gpu);
+        }
+    }
+
+    /// Aplica `p' = lin·p + t` às instâncias de vidro no intervalo de marcadores (sem rebuild).
+    pub fn transform_range(&mut self, range: std::ops::Range<usize>, lin: [f32; 4], t: [f32; 2]) {
+        let end = range.end.min(self.gpu.len());
+        let start = range.start.min(end);
+        for inst in &mut self.gpu[start..end] {
+            let c = [inst.geo[0], inst.geo[1]];
+            inst.geo[0] = lin[0] * c[0] + lin[2] * c[1] + t[0];
+            inst.geo[1] = lin[1] * c[0] + lin[3] * c[1] + t[1];
+            let b = inst.xf;
+            inst.xf = [
+                lin[0] * b[0] + lin[2] * b[1],
+                lin[1] * b[0] + lin[3] * b[1],
+                lin[0] * b[2] + lin[2] * b[3],
+                lin[1] * b[2] + lin[3] * b[3],
+            ];
+        }
+    }
+
+    /// Envia somente as instâncias atualizadas de vidro à GPU (O(1), zero alocação).
+    pub fn upload_instances(&self, queue: &wgpu::Queue) {
+        if !self.gpu.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.gpu));
+        }
     }
 
     /// Adiciona um vidro e devolve o id do marcador (`Canvas::push_marker`).

@@ -57,6 +57,7 @@ pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
 pub use shell::{acquire_single_instance, open_studio, shell_open};
 pub use tray::{parse_tray_enabled, TrayAction};
+#[allow(unused_imports)]
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
 pub use widget::{WidgetWindow, WidgetWindowConfig};
 pub use workerw::{DesktopLayer, ShellLayout};

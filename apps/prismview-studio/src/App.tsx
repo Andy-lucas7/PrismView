@@ -866,12 +866,18 @@ const StudioHubApp: React.FC = () => {
 
   const txActiveRef = useRef(false);
   const txReleaseCleanupRef = useRef<(() => void) | null>(null);
+  const liveSyncTimerRef = useRef<number | null>(null);
+  const lastLiveSyncAtRef = useRef(0);
 
   const flushPendingSave = useCallback(
     async (skipDesktopSync = false) => {
       if (saveTimerRef.current !== null) {
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
+      }
+      if (liveSyncTimerRef.current !== null) {
+        window.clearTimeout(liveSyncTimerRef.current);
+        liveSyncTimerRef.current = null;
       }
       const pending = pendingSaveRef.current;
       if (!pending) return;
@@ -963,6 +969,10 @@ const StudioHubApp: React.FC = () => {
         txReleaseCleanupRef.current();
         txReleaseCleanupRef.current = null;
       }
+      if (liveSyncTimerRef.current !== null) {
+        window.clearTimeout(liveSyncTimerRef.current);
+        liveSyncTimerRef.current = null;
+      }
       void flushPendingSave();
     };
   }, [flushPendingSave, flushFailedSaves]);
@@ -989,8 +999,28 @@ const StudioHubApp: React.FC = () => {
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
       }
-      // Pause debounced disk save & desktop sync while a drag/slider transaction is in progress.
+      // Pause debounced disk save while dragging a slider, but stream throttled live updates
+      // (~16 Hz, serialized) to the applied desktop wallpaper so blur/refraction/alpha update live.
       if (txActiveRef.current) {
+        const LIVE_SYNC_MS = 65;
+        const elapsed = performance.now() - lastLiveSyncAtRef.current;
+        if (elapsed >= LIVE_SYNC_MS) {
+          if (liveSyncTimerRef.current !== null) {
+            window.clearTimeout(liveSyncTimerRef.current);
+            liveSyncTimerRef.current = null;
+          }
+          lastLiveSyncAtRef.current = performance.now();
+          void syncIfActiveOnDesktop(next);
+        } else if (liveSyncTimerRef.current === null) {
+          liveSyncTimerRef.current = window.setTimeout(() => {
+            liveSyncTimerRef.current = null;
+            const latest = pendingSaveRef.current;
+            if (latest && txActiveRef.current) {
+              lastLiveSyncAtRef.current = performance.now();
+              void syncIfActiveOnDesktop(latest);
+            }
+          }, Math.max(12, LIVE_SYNC_MS - elapsed));
+        }
         return;
       }
       saveTimerRef.current = window.setTimeout(() => {
@@ -998,7 +1028,7 @@ const StudioHubApp: React.FC = () => {
         void flushPendingSave();
       }, 450);
     },
-    [flushPendingSave, patchSaveStatus]
+    [flushPendingSave, patchSaveStatus, syncIfActiveOnDesktop]
   );
 
   const persistProjectLive = useCallback(

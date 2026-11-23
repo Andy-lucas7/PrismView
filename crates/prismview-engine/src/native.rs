@@ -1016,7 +1016,6 @@ impl NativeApp {
         self.scene_demand = scene_demand;
         let demand = scene_demand | SignalKind::POWER;
         bus.set_demand(demand);
-        bus.set_wake_mask(demand);
     }
 
     /// Lê o bus, avança os bindings 2D/vidro e trata toques no desktop. Sem alocação.
@@ -2156,6 +2155,28 @@ impl LoopHandler for NativeApp {
                 push(after_present + Duration::from_millis(ms.max(1)));
             }
         }
+        // Enquanto já há próximo quadro agendado (3D / parallax / throttle), suprime wakes de
+        // `MOUSE` (mouses 500-1000 Hz não acordam o loop 1000×/s entre quadros de 60 FPS). O
+        // cursor exato continua sendo lido em `process_signals` no instante de cada quadro; ao
+        // assentar, `MOUSE` volta imediatamente para `wake_mask` (0% CPU em repouso, <0,1ms wake).
+        let frame_scheduled = binding_poll
+            || scene3d_at.is_some()
+            || binding_at.is_some()
+            || throttle_at.is_some()
+            || widget3d_at.is_some();
+        let mut mouse_race_wake: Option<Instant> = None;
+        if let Some(sensors) = self.sensors.as_ref() {
+            let bus = sensors.bus();
+            let base = self.scene_demand | SignalKind::POWER;
+            if frame_scheduled && base.contains(SignalKind::MOUSE) {
+                bus.set_wake_mask(SignalKind(base.0 & !SignalKind::MOUSE.0));
+            } else {
+                bus.set_wake_mask(base);
+                if base.contains(SignalKind::MOUSE) && bus.has_pending(SignalKind::MOUSE) {
+                    mouse_race_wake = Some(Instant::now() + Duration::from_millis(8));
+                }
+            }
+        }
         if binding_poll {
             return ControlFlow::Poll;
         }
@@ -2169,6 +2190,7 @@ impl LoopHandler for NativeApp {
             scene3d_at,
             video_at,
             widget_at,
+            mouse_race_wake,
         ]
         .into_iter()
         .flatten()

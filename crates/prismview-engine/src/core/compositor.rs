@@ -224,6 +224,7 @@ struct TextureEntry {
 }
 
 pub struct Compositor2D {
+    format: wgpu::TextureFormat,
     pipelines: [wgpu::RenderPipeline; BlendKind::COUNT],
     canvas_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
@@ -340,6 +341,7 @@ impl Compositor2D {
         let pipelines = BlendKind::ALL.map(make);
 
         let mut this = Self {
+            format,
             pipelines,
             canvas_layout,
             texture_layout,
@@ -352,6 +354,10 @@ impl Compositor2D {
         };
         this.install_white(device, queue);
         this
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
     }
 
     fn install_white(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -710,6 +716,56 @@ impl Compositor2D {
         });
         self.draw_with(canvas, &mut pass, on_marker);
     }
+
+    /// Renderiza em `view` tudo que aparece **antes do primeiro marcador** (fundo, gradientes,
+    /// imagem, vídeo, cena 3D e camadas abaixo do vidro) para servir de backdrop composto real
+    /// do vidro óptico (sempre opaco e 1:1 com a viewport).
+    pub fn render_before_first_marker(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: [f32; 4],
+        canvas: &Canvas,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("prismview_c2d_glass_backdrop"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: f64::from(clear[0]),
+                        g: f64::from(clear[1]),
+                        b: f64::from(clear[2]),
+                        a: f64::from(clear[3]),
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if canvas.batches.is_empty() {
+            return;
+        }
+        pass.set_bind_group(0, &canvas.bind_group, &[]);
+        let mut current: Option<BlendKind> = None;
+        for batch in &canvas.batches {
+            if batch.marker != NO_MARKER {
+                break;
+            }
+            if current != Some(batch.blend) {
+                pass.set_pipeline(&self.pipelines[batch.blend as usize]);
+                current = Some(batch.blend);
+            }
+            let Some(group) = self.entry(batch.tex).and_then(|t| t.bind_group.as_ref()) else {
+                continue;
+            };
+            pass.set_bind_group(1, group, &[]);
+            pass.draw(0..4, batch.start..batch.end);
+        }
+    }
 }
 
 // ───────────────────────── Canvas ─────────────────────────
@@ -783,6 +839,15 @@ impl Scene3dPlacement {
     }
 }
 
+/// Textura offscreen que captura o fundo composto (gradiente + imagem + vídeo + cena 3D) logo
+/// abaixo do primeiro vidro óptico desta saída. Só é alocada quando a cena contém vidro.
+pub struct BackdropTarget {
+    pub size: (u32, u32),
+    pub _texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub version: u64,
+}
+
 pub struct Canvas {
     viewport: (u32, u32),
     globals: wgpu::Buffer,
@@ -800,6 +865,13 @@ pub struct Canvas {
     pub built_scale: f32,
     /// Vidros ópticos desta saída (cada um é um marcador na ordem Z; ver `core::glass`).
     pub glass: Option<GlassLayer>,
+    /// Backdrop composto capturado abaixo do primeiro vidro desta saída (sob demanda).
+    pub backdrop: Option<BackdropTarget>,
+    /// Contador do conteúdo do backdrop composto (cache do `BlurPyramid`).
+    pub backdrop_token: u64,
+    /// Último `live_token` já capturado em `backdrop`.
+    pub last_live_token: u64,
+    backdrop_version_seq: u64,
     /// Regiões tocáveis (controles de mídia) desta saída, refeitas junto com a lista.
     pub hits: super::interaction::HitMap,
     /// Camada 3D desenhada nesta saída (a primeira visível da cena), se houver.
@@ -826,6 +898,8 @@ pub struct BoundSubtree {
     pub key: std::sync::Arc<str>,
     /// `seq` dos itens da camada + descendentes.
     pub seq: std::ops::Range<u32>,
+    /// Índices dos marcadores de vidro da subárvore em `GlassLayer::gpu`.
+    pub markers: std::ops::Range<usize>,
     /// Índices das regiões tocáveis da subárvore.
     pub hits: std::ops::Range<usize>,
     /// Afim do pai (`m` coluna-maior, `t`).
@@ -868,6 +942,10 @@ impl Canvas {
             built_size: (0, 0),
             built_scale: 0.0,
             glass: None,
+            backdrop: None,
+            backdrop_token: 0,
+            last_live_token: u64::MAX,
+            backdrop_version_seq: 1,
             hits: super::interaction::HitMap::default(),
             scene3d: None,
             bound: Vec::new(),
@@ -877,6 +955,49 @@ impl Canvas {
             gpu_seq: Vec::with_capacity(INITIAL_CAPACITY),
             base_instances: Vec::with_capacity(INITIAL_CAPACITY),
         }
+    }
+
+    /// Aloca ou reutiliza a textura de backdrop composto no tamanho `(w, h)`. Devolve `true` se
+    /// a textura foi recriada (forçando nova captura).
+    pub fn ensure_backdrop(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.backdrop.as_ref().is_some_and(|b| b.size == size) {
+            return false;
+        }
+        self.backdrop = None;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_glass_composited_backdrop"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let version = self.backdrop_version_seq;
+        self.backdrop_version_seq = self.backdrop_version_seq.wrapping_add(1).max(1);
+        self.backdrop = Some(BackdropTarget {
+            size,
+            _texture: texture,
+            view,
+            version,
+        });
+        true
+    }
+
+    pub fn release_backdrop(&mut self) {
+        self.backdrop = None;
     }
 
     /// Próximo `seq` (início/fim do intervalo de uma subárvore).

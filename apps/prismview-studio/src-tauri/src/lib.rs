@@ -131,7 +131,6 @@ struct AppRuntimeState {
     gsmtc: Option<Arc<GsmtcHandle>>,
     reactive_sensors: Option<Arc<ReactiveSensorsHandle>>,
     last_worker_w: isize,
-    last_worker_is_true: bool,
     pending_recovery_at: Option<Instant>,
     force_vis_resync: bool,
     manual_paused: bool,
@@ -192,9 +191,63 @@ const ERROR_SUCCESS: i32 = 0;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_NO_MORE_ITEMS: i32 = 259;
 
+fn is_supported_outline_font(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("ttf" | "otf" | "ttc" | "otc")
+    )
+}
+
+fn system_fonts_dir() -> PathBuf {
+    std::env::var_os("SYSTEMROOT")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(|root| PathBuf::from(root).join("Fonts"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Fonts"))
+}
+
+fn user_fonts_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"))
+}
+
+fn registry_font_exists(raw_value: &str, is_hkcu: bool, sys_dir: &Path, user_dir: Option<&Path>) -> bool {
+    let trimmed = raw_value.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return false;
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return is_supported_outline_font(candidate) && candidate.is_file();
+    }
+    if is_hkcu {
+        if let Some(dir) = user_dir {
+            let p = dir.join(trimmed);
+            if is_supported_outline_font(&p) && p.is_file() {
+                return true;
+            }
+        }
+    }
+    let sys = sys_dir.join(trimmed);
+    if is_supported_outline_font(&sys) && sys.is_file() {
+        return true;
+    }
+    if !is_hkcu {
+        if let Some(dir) = user_dir {
+            let p = dir.join(trimmed);
+            if is_supported_outline_font(&p) && p.is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn normalize_registry_font_family(raw_name: &str) -> Option<String> {
     let mut name = raw_name.trim().to_string();
-    for suffix in [" (TrueType)", " (OpenType)", " (All res)"] {
+    for suffix in [" (TrueType)", " (OpenType)", " (All res)", " (VGA res)", " (Type 1)"] {
         if let Some(stripped) = name.strip_suffix(suffix) {
             name = stripped.trim().to_string();
         }
@@ -203,46 +256,55 @@ fn normalize_registry_font_family(raw_name: &str) -> Option<String> {
         name = first.trim().to_string();
     }
     let style_suffixes = [
-        " Bold Italic",
-        " SemiBold Italic",
-        " Semibold Italic",
-        " Light Italic",
-        " Medium Italic",
-        " Black Italic",
-        " Thin Italic",
-        " ExtraLight Italic",
-        " ExtraBold Italic",
-        " Bold",
-        " Italic",
-        " Oblique",
-        " Regular",
-        " Semibold",
-        " SemiBold",
-        " Semilight",
-        " SemiLight",
-        " ExtraLight",
-        " ExtraBold",
-        " Light",
-        " Medium",
-        " Black",
-        " Thin",
-        " Heavy",
-        " Book",
-        " Demibold",
-        " DemiBold",
-        " Condensed",
-        " Narrow",
-        " Normal",
+        "Bold Italic",
+        "SemiBold Italic",
+        "Semibold Italic",
+        "Light Italic",
+        "Medium Italic",
+        "Black Italic",
+        "Thin Italic",
+        "ExtraLight Italic",
+        "ExtraBold Italic",
+        "UltraLight Italic",
+        "UltraBold Italic",
+        "Bold",
+        "Italic",
+        "Oblique",
+        "Regular",
+        "Semibold",
+        "SemiBold",
+        "Semilight",
+        "SemiLight",
+        "ExtraLight",
+        "ExtraBold",
+        "UltraLight",
+        "UltraBold",
+        "Light",
+        "Medium",
+        "Black",
+        "Thin",
+        "Heavy",
+        "Book",
+        "Demibold",
+        "DemiBold",
+        "Condensed",
+        "Narrow",
+        "Normal",
     ];
     let mut changed = true;
     while changed {
         changed = false;
         for suf in &style_suffixes {
-            if let Some(stripped) = name.strip_suffix(suf) {
+            let matched = [' ', '-', '_'].into_iter().find_map(|sep| {
+                let with_sep = format!("{sep}{suf}");
+                name.strip_suffix(&with_sep)
+            });
+            if let Some(stripped) = matched {
                 let trimmed = stripped.trim();
                 if !trimmed.is_empty() {
                     name = trimmed.to_string();
                     changed = true;
+                    break;
                 }
             }
         }
@@ -264,7 +326,7 @@ fn normalize_registry_font_family(raw_name: &str) -> Option<String> {
     Some(name)
 }
 
-fn collect_fonts_from_hive(hive: isize, out: &mut HashSet<String>) {
+fn collect_fonts_from_hive(hive: isize, is_hkcu: bool, sys_dir: &Path, user_dir: Option<&Path>, out: &mut HashSet<String>) {
     let subkey = wide_null(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts");
     let mut hkey: isize = 0;
     let status = unsafe { RegOpenKeyExW(hive, subkey.as_ptr(), 0, KEY_READ, &mut hkey) };
@@ -273,9 +335,11 @@ fn collect_fonts_from_hive(hive: isize, out: &mut HashSet<String>) {
     }
     let mut index: u32 = 0;
     let mut name_buf = vec![0u16; 512];
+    let mut data_buf = vec![0u16; 512];
     loop {
         let mut name_len = name_buf.len() as u32;
         let mut val_type: u32 = 0;
+        let mut data_bytes = (data_buf.len() * std::mem::size_of::<u16>()) as u32;
         let res = unsafe {
             RegEnumValueW(
                 hkey,
@@ -284,8 +348,8 @@ fn collect_fonts_from_hive(hive: isize, out: &mut HashSet<String>) {
                 &mut name_len,
                 std::ptr::null_mut(),
                 &mut val_type,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                data_buf.as_mut_ptr() as *mut u8,
+                &mut data_bytes,
             )
         };
         if res == ERROR_NO_MORE_ITEMS {
@@ -293,8 +357,16 @@ fn collect_fonts_from_hive(hive: isize, out: &mut HashSet<String>) {
         }
         if res == ERROR_SUCCESS && (val_type == REG_SZ || val_type == REG_EXPAND_SZ) {
             let raw = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-            if let Some(clean) = normalize_registry_font_family(&raw) {
-                out.insert(clean);
+            let u16_len = (data_bytes as usize / 2).min(data_buf.len());
+            let trimmed_len = data_buf[..u16_len]
+                .iter()
+                .rposition(|&c| c != 0)
+                .map_or(0, |pos| pos + 1);
+            let raw_value = String::from_utf16_lossy(&data_buf[..trimmed_len]);
+            if registry_font_exists(&raw_value, is_hkcu, sys_dir, user_dir) {
+                if let Some(clean) = normalize_registry_font_family(&raw) {
+                    out.insert(clean);
+                }
             }
         }
         index += 1;
@@ -314,8 +386,10 @@ async fn list_system_fonts() -> Result<Vec<String>, String> {
         for base in ["Outfit", "Inter", "JetBrains Mono", "Segoe UI"] {
             set.insert(base.to_string());
         }
-        collect_fonts_from_hive(HKEY_LOCAL_MACHINE, &mut set);
-        collect_fonts_from_hive(HKEY_CURRENT_USER, &mut set);
+        let sys_dir = system_fonts_dir();
+        let user_dir = user_fonts_dir();
+        collect_fonts_from_hive(HKEY_LOCAL_MACHINE, false, &sys_dir, user_dir.as_deref(), &mut set);
+        collect_fonts_from_hive(HKEY_CURRENT_USER, true, &sys_dir, user_dir.as_deref(), &mut set);
         let mut list: Vec<String> = set.into_iter().collect();
         list.sort_by_key(|a| a.to_ascii_lowercase());
         Ok(list)
@@ -1092,5 +1166,28 @@ mod tests {
         assert!(b1 > t1 && b1 > 0.25);
         assert!(t2 > b2 && t2 > 0.25);
         assert!(l1 > 0.2 && l2 > 0.2);
+    }
+
+    #[test]
+    fn font_filter_rejects_fon_and_normalizes_hyphen_styles() {
+        assert!(!is_supported_outline_font(Path::new("SMALLE.FON")));
+        assert!(!is_supported_outline_font(Path::new("modern.fon")));
+        assert!(is_supported_outline_font(Path::new("Inter-400.ttf")));
+        assert!(is_supported_outline_font(Path::new("samsungsharpsans.otf")));
+        assert!(is_supported_outline_font(Path::new("cambria.ttc")));
+
+        assert_eq!(
+            normalize_registry_font_family("Cairo-Regular (TrueType)").as_deref(),
+            Some("Cairo")
+        );
+        assert_eq!(
+            normalize_registry_font_family("Unispace-Bold (TrueType)").as_deref(),
+            Some("Unispace")
+        );
+        assert_eq!(
+            normalize_registry_font_family("MingLiU-ExtB & PMingLiU-ExtB (TrueType)").as_deref(),
+            Some("MingLiU-ExtB")
+        );
+        assert_eq!(normalize_registry_font_family("Wingdings (TrueType)"), None);
     }
 }

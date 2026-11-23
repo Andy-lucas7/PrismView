@@ -319,13 +319,22 @@ fn collect_from_hive(
     }
 }
 
-fn stem_matches_family(stem: &str, needle: &str) -> bool {
-    if stem == needle {
+fn is_style_or_weight_suffix(rest: &str) -> bool {
+    if rest.is_empty() {
         return true;
     }
-    let Some(rest) = stem.strip_prefix(needle) else {
-        return false;
-    };
+    let trimmed = rest
+        .strip_suffix("italic")
+        .or_else(|| rest.strip_suffix("oblique"))
+        .or_else(|| rest.strip_suffix("roman"))
+        .unwrap_or(rest);
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(weight) = trimmed.parse::<u16>() {
+            if (100..=1000).contains(&weight) {
+                return true;
+            }
+        }
+    }
     matches!(
         rest,
         "regular"
@@ -352,6 +361,16 @@ fn stem_matches_family(stem: &str, needle: &str) -> bool {
             | "bolditalic"
             | "oblique"
     )
+}
+
+fn stem_matches_family(stem: &str, needle: &str) -> bool {
+    if stem == needle {
+        return true;
+    }
+    let Some(rest) = stem.strip_prefix(needle) else {
+        return false;
+    };
+    is_style_or_weight_suffix(rest)
 }
 
 fn collect_from_local_dirs(needle: &str, out: &mut Vec<PathBuf>) {
@@ -470,6 +489,11 @@ mod tests {
     fn stem_prefix_does_not_match_unrelated_names() {
         assert!(stem_matches_family("outfitbold", "outfit"));
         assert!(stem_matches_family("interregular", "inter"));
+        assert!(stem_matches_family("inter400", "inter"));
+        assert!(stem_matches_family("inter700italic", "inter"));
+        assert!(stem_matches_family("outfit800", "outfit"));
+        assert!(stem_matches_family("jetbrainsmono500", "jetbrainsmono"));
+        assert!(!stem_matches_family("inter2", "inter"));
         assert!(!stem_matches_family("winterregular", "inter"));
     }
 }

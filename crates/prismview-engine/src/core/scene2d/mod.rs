@@ -232,8 +232,12 @@ impl SceneRenderer {
             return false;
         }
         canvas.reset_to_base();
+        if let Some(glass) = canvas.glass.as_mut() {
+            glass.reset_to_base();
+        }
+        let mut glass_dirty = false;
         for i in 0..canvas.bound.len() {
-            let (seq, hits, lin, t) = {
+            let (seq, markers, hits, lin, t) = {
                 let b = &canvas.bound[i];
                 let fx1 = solver.fx(&b.key).unwrap_or_default();
                 if solver.is_layer_animating(&b.key) != b.moving0 {
@@ -266,13 +270,24 @@ impl SceneRenderer {
                     return false;
                 };
                 let delta = xf(&fx1).then_apply(&inv0);
-                (b.seq.clone(), b.hits.clone(), delta.m, delta.t)
+                (b.seq.clone(), b.markers.clone(), b.hits.clone(), delta.m, delta.t)
             };
             if !canvas.transform_range(&seq, &hits, lin, t) {
                 return false;
             }
+            if !markers.is_empty() {
+                if let Some(glass) = canvas.glass.as_mut() {
+                    glass.transform_range(markers, lin, t);
+                    glass_dirty = true;
+                }
+            }
         }
         canvas.upload_instances(queue);
+        if glass_dirty {
+            if let Some(glass) = canvas.glass.as_ref() {
+                glass.upload_instances(queue);
+            }
+        }
         true
     }
 
@@ -670,28 +685,46 @@ impl SceneRenderer {
             }
         }
 
+        let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        let mut capture_backdrop = false;
+        if has_glass {
+            let recreated = canvas.ensure_backdrop(gpu.device(), (w, h), self.compositor.format());
+            if stale || recreated || canvas.last_live_token != self.live_token {
+                canvas.backdrop_token = canvas.backdrop_token.wrapping_add(1);
+                canvas.last_live_token = self.live_token;
+                capture_backdrop = true;
+            }
+        } else {
+            canvas.release_backdrop();
+        }
+
         // Campos disjuntos: o vidro é mutado em `prepare`, o resto só é lido.
         let compositor = &self.compositor;
         let text = &self.text;
         let glass = &mut self.glass;
-        let frame_token = self.live_token;
+        let backdrop_token = canvas.backdrop_token;
 
         surface.render_with(gpu, |encoder, view| {
-            // 1) Blur em cache + mapas de glifo que faltam (fora de qualquer passe de render).
-            if let Some(layer) = canvas.glass.as_mut() {
-                if !layer.is_empty() {
-                    glass.prepare(
-                        gpu.device(),
-                        gpu.queue(),
-                        encoder,
-                        layer,
-                        frame_token,
-                        |id| {
-                            let version = compositor.texture_version(id);
-                            compositor.texture_view(id).map(|v| (v, version))
-                        },
-                        |key| text.texture_view(key),
-                    );
+            // 1) Captura o fundo composto real (gradiente + imagem + vídeo + 3D) abaixo do vidro
+            //    e roda a pirâmide Gaussiana + mapas de glifo antes do passe principal.
+            if has_glass {
+                if let Some(bd) = canvas.backdrop.as_ref() {
+                    if capture_backdrop {
+                        compositor.render_before_first_marker(encoder, &bd.view, clear, canvas);
+                    }
+                    let bd_view = &bd.view;
+                    let bd_ver = bd.version;
+                    if let Some(layer) = canvas.glass.as_mut() {
+                        glass.prepare(
+                            gpu.device(),
+                            gpu.queue(),
+                            encoder,
+                            layer,
+                            backdrop_token,
+                            |_| Some((bd_view, bd_ver)),
+                            |key| text.texture_view(key),
+                        );
+                    }
                 }
             }
             // 2) Passe do compositor; cada marcador Z desenha um vidro na posição certa.
@@ -771,3 +804,350 @@ impl SceneRenderer {
 mod frame;
 #[allow(unused_imports)]
 use frame::*;
+
+#[cfg(test)]
+mod gpu_glass_tests {
+    use super::*;
+    use prism_core::schema::OpticalCrystalParams;
+
+    fn render_offscreen(
+        gpu: &GpuContext,
+        renderer: &mut SceneRenderer,
+        canvas: &mut Canvas,
+        size: (u32, u32),
+        ctx: &EvalContext,
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let out_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_out"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let (w, h) = size;
+        let stale = canvas.built_version != renderer.version
+            || canvas.built_size != (w, h)
+            || (canvas.built_scale - 1.0).abs() > 1e-4;
+        if stale {
+            renderer.rebuild(gpu, canvas, "test", (w, h), 1.0, ctx);
+            canvas.built_fx_gen = renderer.fx_gen;
+            canvas.built_version = renderer.version;
+            canvas.built_size = (w, h);
+            canvas.built_scale = 1.0;
+            renderer.text.flush(gpu.device(), gpu.queue());
+            canvas.flush(&renderer.compositor, gpu.device(), gpu.queue());
+            if let Some(layer) = canvas.glass.as_mut() {
+                renderer.glass.flush(layer, gpu.device(), gpu.queue());
+            }
+        }
+        let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        let mut capture_backdrop = false;
+        if has_glass {
+            let recreated = canvas.ensure_backdrop(gpu.device(), (w, h), renderer.compositor.format());
+            if stale || recreated || canvas.last_live_token != renderer.live_token {
+                canvas.backdrop_token = canvas.backdrop_token.wrapping_add(1);
+                canvas.last_live_token = renderer.live_token;
+                capture_backdrop = true;
+            }
+        }
+        let clear = [0.02, 0.02, 0.03, 1.0];
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_enc") });
+        if has_glass {
+            if let Some(bd) = canvas.backdrop.as_ref() {
+                if capture_backdrop {
+                    renderer
+                        .compositor
+                        .render_before_first_marker(&mut encoder, &bd.view, clear, canvas);
+                }
+                let bd_view = &bd.view;
+                let bd_ver = bd.version;
+                let backdrop_token = canvas.backdrop_token;
+                let text = &renderer.text;
+                if let Some(layer) = canvas.glass.as_mut() {
+                    renderer.glass.prepare(
+                        gpu.device(),
+                        gpu.queue(),
+                        &mut encoder,
+                        layer,
+                        backdrop_token,
+                        |_| Some((bd_view, bd_ver)),
+                        |key| text.texture_view(key),
+                    );
+                }
+            }
+        }
+        {
+            let canvas_ref = &*canvas;
+            let glass_ref = &renderer.glass;
+            renderer
+                .compositor
+                .render_with(&mut encoder, &out_view, clear, canvas_ref, |pass, marker| {
+                    if let Some(layer) = canvas_ref.glass.as_ref() {
+                        glass_ref.draw(layer, pass, marker);
+                    }
+                });
+        }
+
+        let bpr = ((w * 4 + 255) / 256) * 256;
+        let staging = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_readback"),
+            size: u64::from(bpr) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &out_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue().submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        gpu.device().poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range();
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h as usize {
+            let src = &data[y * bpr as usize..y * bpr as usize + (w as usize * 4)];
+            let dst = &mut rgba[y * w as usize * 4..(y + 1) * w as usize * 4];
+            for x in 0..w as usize {
+                // BGRA -> RGBA
+                dst[x * 4] = src[x * 4 + 2];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4];
+                dst[x * 4 + 3] = src[x * 4 + 3];
+            }
+        }
+        drop(data);
+        staging.unmap();
+        rgba
+    }
+
+    fn make_scene_with_glass(blur_px: f32, refraction: f32, color_hex: &str) -> PrismScene {
+        let mut bg = LayerNode::default();
+        bg.id = "__studio_background__".into();
+        bg.kind = LayerKind::Shape;
+        bg.fill_parent = true;
+        bg.fill = FillMode::Gradient;
+        bg.gradient_kind = SchemaGradient::Radial;
+        bg.color = StaticOrFx::Static("#FF1A1B21".into());
+        bg.color2 = "#FF050507".into();
+
+        let mut s3d = LayerNode::default();
+        s3d.id = "l-3d".into();
+        s3d.kind = LayerKind::Scene3d;
+        s3d.fill_parent = true;
+        s3d.x = StaticOrFx::Static(0.5);
+        s3d.y = StaticOrFx::Static(0.5);
+
+        let mut txt = LayerNode::default();
+        txt.id = "l-clock".into();
+        txt.kind = LayerKind::Text;
+        txt.fill = FillMode::OpticalCrystal;
+        txt.x = StaticOrFx::Static(0.5);
+        txt.y = StaticOrFx::Static(0.5);
+        txt.color = StaticOrFx::Static(color_hex.into());
+        txt.text.text = "88".into();
+        txt.text.font_id = "Impact".into();
+        txt.text.size_px = StaticOrFx::Static(340.0);
+        txt.text.weight = 800;
+        txt.text.align = TextAlign::Center;
+        txt.crystal = OpticalCrystalParams {
+            blur_px: StaticOrFx::Static(blur_px),
+            refraction: StaticOrFx::Static(refraction),
+            bevel_width: StaticOrFx::Static(22.0),
+            frost_amount: StaticOrFx::Static(0.0),
+            fresnel_intensity: StaticOrFx::Static(0.0),
+            prismatic_rim_intensity: StaticOrFx::Static(0.0),
+            dispersion_rgb: StaticOrFx::Static(0.0),
+            grain: 0.0,
+            brightness: StaticOrFx::Static(1.02),
+            contrast: StaticOrFx::Static(1.04),
+            saturation: StaticOrFx::Static(1.0),
+            tint_rgba: StaticOrFx::Static("#00FFFFFF".into()),
+            ..OpticalCrystalParams::default()
+        };
+
+        PrismScene {
+            id: "test".into(),
+            layers: vec![bg, s3d, txt],
+            ..PrismScene::default()
+        }
+    }
+
+    #[test]
+    fn real_gpu_glass_blurs_and_refracts_composited_3d_backdrop() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let (w, h) = (640u32, 360u32);
+        let mut renderer = SceneRenderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
+        let impact = Path::new(r"C:\Windows\Fonts\impact.ttf");
+        if impact.is_file() {
+            renderer.register_font_file(impact);
+        }
+        // Synthetic transparent 3D layer with a bright white 4px horizontal stripe at y=180
+        // and a bright cyan vertical stripe at x=320.
+        let mut s3d_pixels = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                if (y as i32 - 180).abs() <= 2 {
+                    s3d_pixels[idx] = 255;
+                    s3d_pixels[idx + 1] = 255;
+                    s3d_pixels[idx + 2] = 255;
+                    s3d_pixels[idx + 3] = 255;
+                } else if (x as i32 - 320).abs() <= 3 && y > 60 && y < 300 {
+                    s3d_pixels[idx] = 0;
+                    s3d_pixels[idx + 1] = 220;
+                    s3d_pixels[idx + 2] = 255;
+                    s3d_pixels[idx + 3] = 255;
+                }
+            }
+        }
+        let s3d_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("test_3d"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue().write_texture(
+            s3d_tex.as_image_copy(),
+            &s3d_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        renderer.set_scene3d_output(
+            &gpu,
+            s3d_tex.create_view(&wgpu::TextureViewDescriptor::default()),
+            (w, h),
+        );
+
+        let ctx = EvalContext::default();
+        let mut canvas = renderer.create_canvas(&gpu);
+
+        let px_at = |img: &[u8], x: u32, y: u32| -> (u8, u8, u8) {
+            let i = ((y * w + x) * 4) as usize;
+            (img[i], img[i + 1], img[i + 2])
+        };
+
+        // 1) Blur monotonic all the way from 0 -> 80px (no plateau halfway through!)
+        let mut center_lumas = Vec::new();
+        for &blur_px in &[0.0f32, 10.0, 20.0, 40.0, 60.0, 80.0] {
+            renderer.set_scene(make_scene_with_glass(blur_px, 0.0, "#0FFAFAFA"), &ctx);
+            renderer.scene3d_frame_rendered();
+            let img = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+            let center = px_at(&img, 255, 180);
+            center_lumas.push((blur_px, center.0));
+            if blur_px >= 40.0 {
+                assert!(
+                    center.0 < 120,
+                    "blur={blur_px} did NOT blur white 3D stripe inside glyph! got {center:?}"
+                );
+            }
+        }
+        // Blur at 80px must spread further than at 40px (no halfway clamp!)
+        let luma_40 = center_lumas.iter().find(|(b, _)| (*b - 40.0).abs() < 0.1).unwrap().1;
+        let luma_80 = center_lumas.iter().find(|(b, _)| (*b - 80.0).abs() < 0.1).unwrap().1;
+        assert!(
+            luma_80 < luma_40,
+            "blur plateaued between 40px ({luma_40}) and 80px ({luma_80}): {center_lumas:?}"
+        );
+
+        // 2) Refraction visibly bends the 3D stripes across the glyph region
+        renderer.set_scene(make_scene_with_glass(6.0, 0.0, "#00FAFAFA"), &ctx);
+        renderer.scene3d_frame_rendered();
+        let img_no_refr = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+
+        renderer.set_scene(make_scene_with_glass(6.0, 60.0, "#00FAFAFA"), &ctx);
+        renderer.scene3d_frame_rendered();
+        let img_refr = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+
+        let mut refr_diff_pixels = 0u32;
+        for y in 60..300 {
+            for x in 150..490 {
+                let a = px_at(&img_no_refr, x, y);
+                let b = px_at(&img_refr, x, y);
+                let d = a.0.abs_diff(b.0) as u32 + a.1.abs_diff(b.1) as u32 + a.2.abs_diff(b.2) as u32;
+                if d >= 24 {
+                    refr_diff_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            refr_diff_pixels >= 500,
+            "refraction barely moved pixels ({refr_diff_pixels} changed)"
+        );
+
+        // 3) colorAlpha: 0% = pure crystal (not black!), 50% = tinted, 100% = solid white
+        renderer.set_scene(make_scene_with_glass(20.0, 0.0, "#00FAFAFA"), &ctx);
+        renderer.scene3d_frame_rendered();
+        let img_a0 = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+        renderer.set_scene(make_scene_with_glass(20.0, 0.0, "#80FAFAFA"), &ctx);
+        renderer.scene3d_frame_rendered();
+        let img_a50 = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+        renderer.set_scene(make_scene_with_glass(20.0, 0.0, "#FFFAFAFA"), &ctx);
+        renderer.scene3d_frame_rendered();
+        let img_a100 = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+
+        let p0 = px_at(&img_a0, 255, 180).0;
+        let p50 = px_at(&img_a50, 255, 180).0;
+        let p100 = px_at(&img_a100, 255, 180).0;
+        assert!(p0 > 40 && p0 < 120, "0% alpha should show blurred 3D backdrop, got {p0}");
+        assert!(p50 > p0 + 60 && p50 < p100 - 40, "50% alpha should blend cleanly: {p0} < {p50} < {p100}");
+        assert!(p100 >= 245, "100% alpha should be solid #FAFAFA, got {p100}");
+
+        let err = pollster::block_on(gpu.device().pop_error_scope());
+        assert!(err.is_none(), "wgpu validation error: {err:?}");
+    }
+}

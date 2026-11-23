@@ -330,6 +330,12 @@ impl SignalBus {
         SignalKind(self.dirty.swap(0, Ordering::AcqRel))
     }
 
+    /// Renderer: consulta sem zerar se algum bit de `kind` já está pendente.
+    #[inline]
+    pub fn has_pending(&self, kind: SignalKind) -> bool {
+        SignalKind(self.dirty.load(Ordering::Acquire)).intersects(kind)
+    }
+
     /// Produtor: marca `kind` como alterado e acorda o loop se for a 1ª marca desde o último
     /// `take_dirty` (coalescência: no máximo 1 wake por frame consumido).
     #[inline]

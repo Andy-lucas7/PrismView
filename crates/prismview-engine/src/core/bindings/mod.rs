@@ -23,6 +23,7 @@ use glam::Vec3;
 
 use super::signals::{SignalKind, SignalSnapshot, SignalSource};
 
+#[allow(unused_imports)]
 pub use layers::{GlassFx, LayerBindingSolver, LayerFx};
 pub use scene3d::{BindingSolver3d, InstanceAccess, PickHit};
 

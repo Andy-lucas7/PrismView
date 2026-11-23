@@ -542,9 +542,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         if (coversScene && el && el.width > 1 && el.height > 1) {
           const boxLeft = full ? 0 : candidate.x * size.w - bw * 0.5;
           const boxTop = full ? 0 : candidate.y * size.h - bh * 0.5;
+          const bgMode = candidate.scene3d?.backgroundMode ?? "TRANSPARENT";
+          const underlay =
+            bgMode === "TRANSPARENT" ? computeBackdropForTopIndex(i).backdrop ?? undefined : undefined;
           return {
             backdrop: {
-              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}`,
+              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}|${bgMode}`,
               kind: "canvas",
               live: true,
               element: el,
@@ -555,6 +558,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               drawW: Math.max(1, bw),
               drawH: Math.max(1, bh),
               frameToken: videoFrameTokenRef.current,
+              underlay,
             },
             hasIntermediateHtml,
           };
@@ -1201,10 +1205,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             whiteSpace: "pre-wrap",
             fontVariantNumeric: "tabular-nums",
             textShadow:
-              g.enabled && hasChroma
-                ? `-${chromaPx}px 0 8px rgba(255,30,66,0.42), ${chromaPx}px 0 8px rgba(0,210,255,0.46), 0 2px ${layer.text.shadowBlur}px rgba(0,0,0,0.55)`
+              glyphAlpha <= 0.002
+                ? undefined
+                : g.enabled && hasChroma
+                ? `-${chromaPx}px 0 8px rgba(255,30,66,${(0.42 * glyphAlpha).toFixed(3)}), ${chromaPx}px 0 8px rgba(0,210,255,${(0.46 * glyphAlpha).toFixed(3)}), 0 2px ${layer.text.shadowBlur}px rgba(0,0,0,${(0.55 * glyphAlpha).toFixed(3)})`
                 : layer.text.shadowBlur > 0
-                ? `0 2px ${layer.text.shadowBlur}px rgba(0,0,0,0.65)`
+                ? `0 2px ${layer.text.shadowBlur}px rgba(0,0,0,${(0.65 * glyphAlpha).toFixed(3)})`
                 : undefined,
           };
 

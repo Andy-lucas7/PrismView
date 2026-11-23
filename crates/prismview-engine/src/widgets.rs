@@ -321,6 +321,7 @@ impl WidgetRuntime {
         self.dirty = true;
     }
 
+    #[allow(dead_code)]
     pub fn has_scene3d(&self) -> bool {
         self.scene3d.is_some()
     }
@@ -601,10 +602,12 @@ impl WidgetRuntime {
         true
     }
 
+    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.window.is_alive()
     }
 
+    #[allow(dead_code)]
     pub fn hide(&self) {
         self.window.hide();
     }

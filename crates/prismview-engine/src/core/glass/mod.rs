@@ -43,26 +43,19 @@ pub const PYRAMID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Formato do mapa de normais empacotado e dos alvos intermediários de glifo.
 const GLYPH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Níveis da pirâmide: 1/4, 1/8, 1/16, 1/32, 1/64 da fonte.
+/// Níveis da pirâmide: base ≤ 1080p, 1/2, 1/4, 1/8, 1/16 (paridade 1:1 com `opticalGlassWebGL.ts`).
 pub const MAX_LEVELS: usize = 5;
-/// Slots de resultado em cache (alvos de nível 0 prontos para amostrar).
+/// Slots de resultado em cache (alvos de saída prontos para amostrar).
 const RESULT_SLOTS: usize = 4;
 /// Passes (slots de uniform) por frame; reiniciado em `GlassRenderer::prepare`.
 const MAX_PASS_SLOTS: usize = 64;
-const MIN_LEVEL_DIM: u32 = 2;
 
 /// Abaixo disto o blur é dispensado (o shader só mistura nítido/borrado).
 const MIN_BLUR_PX: f32 = 0.1;
 /// `sigma = blur_px * 0.52`, a mesma conversão do WebGL2 do Estúdio.
 const SIGMA_PER_BLUR_PX: f32 = 0.52;
-/// Sigma (em texels da fonte) obtido por unidade de `offset` no nível mais profundo. Aproximação
-/// analítica do Dual Kawase; calibrar visualmente contra o Estúdio se necessário.
-const SIGMA_K: f32 = 0.55;
-const MIN_OFFSET: f32 = 0.25;
-/// Acima disto o Dual Kawase começa a mostrar padrão de caixa: sobe-se de nível em vez disso.
-const MAX_OFFSET: f32 = 1.75;
-/// Maior blur (px de fonte) alcançável com `MAX_LEVELS` níveis e `MAX_OFFSET`.
-const MAX_BLUR_SRC_PX: f32 = 118.0;
+/// Maior blur (px de fonte) quantizado na pirâmide (cobre 80 px em 4K).
+const MAX_BLUR_SRC_PX: f32 = 240.0;
 
 const GROUP_CACHE_LIMIT: usize = 96;
 const SRC_GROUP_CACHE_LIMIT: usize = 16;
@@ -524,6 +517,7 @@ impl GlassRenderer {
             draws: Vec::with_capacity(INITIAL_CAPACITY),
             groups: Vec::with_capacity(INITIAL_CAPACITY),
             gpu: Vec::with_capacity(INITIAL_CAPACITY),
+            base_gpu: Vec::with_capacity(INITIAL_CAPACITY),
         }
     }
 
@@ -538,6 +532,8 @@ impl GlassRenderer {
         for draw in &layer.draws {
             layer.gpu.push(GlassInstance::from_draw(draw));
         }
+        layer.base_gpu.clear();
+        layer.base_gpu.extend_from_slice(&layer.gpu);
         if layer.gpu.len() > layer.capacity {
             let capacity = layer.gpu.len().next_power_of_two();
             let (buffer, bind_group) = self.alloc_instances(device, &layer.globals, capacity);
@@ -612,7 +608,8 @@ impl GlassRenderer {
                     BlurRequest {
                         content_hash: draw.backdrop.content_hash,
                         frame_token: token,
-                        blur_px: draw.params.blur_px * draw.backdrop.src_per_screen_px,
+                        blur_px: (draw.params.blur_px * draw.backdrop.src_per_screen_px).max(0.5),
+                        opaque: draw.backdrop.opaque,
                     },
                 );
             }
@@ -719,19 +716,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_sizes_halve_and_clamp() {
-        assert_eq!(level_size((3840, 2160), 0), (960, 540));
-        assert_eq!(level_size((3840, 2160), 1), (480, 270));
-        assert_eq!(level_size((8, 8), 4), (MIN_LEVEL_DIM, MIN_LEVEL_DIM));
+    fn mip_sizes_cap_base_and_halve() {
+        let sizes = mip_sizes((3840, 2160));
+        assert_eq!(sizes[0], (1080, 608));
+        assert_eq!(sizes[1], (540, 304));
+        assert_eq!(sizes[2], (270, 152));
+        assert_eq!(sizes[3], (135, 76));
+        assert_eq!(sizes[4], (68, 38));
+
+        let tiny = mip_sizes((16, 16));
+        assert_eq!(tiny[0], (16, 16));
     }
 
     #[test]
     fn plan_is_monotonic_in_blur() {
         let mut last_level = 0;
-        for px in [1.0f32, 4.0, 10.0, 26.0, 60.0, 118.0] {
-            let (level, offset) = plan_blur(quantize_blur(px));
+        for px in [1.0f32, 4.0, 10.0, 26.0, 60.0, 160.0] {
+            let (level, sigma) = plan_blur(quantize_blur(px), 1920, 1080);
             assert!(level >= last_level);
-            assert!((MIN_OFFSET..=MAX_OFFSET).contains(&offset));
+            assert!((0.45..=4.2).contains(&sigma));
             last_level = level;
         }
     }

@@ -1,9 +1,16 @@
-//! Pirâmide de blur Dual Kawase do backdrop do vidro (alvos só no resize, cache LRU).
+//! Pirâmide de blur do backdrop do vidro: downsample 2× anti-aliased (base ≤ 1080px, 4 níveis)
+//! + Gaussiana separável densa de 15 taps (passo 1,0 texel), em paridade 1:1 com
+//! `opticalGlassWebGL.ts` (zero ghosting, zero artefatos de caixa, cache LRU).
 
 #[allow(unused_imports)]
 use super::*;
 
 // ───────────────────────── Pirâmide de blur ─────────────────────────
+
+/// Largura máxima do mip 0 (FHD budget): mantém 4K ultra-rápido e nítido em blurs baixos.
+const MIP0_MAX_W: u32 = 1080;
+const MIN_MIP0_DIM: u32 = 64;
+const MIN_MIP_DIM: u32 = 16;
 
 /// Fonte do blur: view do backdrop + identidade estável do par (textura, versão) para cache de
 /// bind group.
@@ -23,6 +30,8 @@ pub struct BlurRequest {
     pub frame_token: u64,
     /// Blur em **px da fonte** (texels do backdrop). Converter de px de tela antes.
     pub blur_px: f32,
+    /// `true` para imagem/vídeo opacos; `false` para preservar alpha pré-multiplicado (3D).
+    pub opaque: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +49,7 @@ pub(super) struct CacheKey {
 
 pub(super) struct ResultSlot {
     pub(super) tex: Tex,
+    pub(super) size: (u32, u32),
     pub(super) key: Option<CacheKey>,
     pub(super) stamp: u64,
 }
@@ -47,13 +57,13 @@ pub(super) struct ResultSlot {
 pub(super) struct Targets {
     pub(super) src_size: (u32, u32),
     pub(super) sizes: [(u32, u32); MAX_LEVELS],
-    /// D0..D4: cadeia de descida.
+    /// Mips de downsample (níveis 0..MAX_LEVELS).
     pub(super) down: Vec<Tex>,
-    /// U1..U4 (índice `i - 1`): cadeia de subida intermediária. U0 é o slot de resultado.
-    pub(super) up: Vec<Tex>,
-    /// Bind groups que LEEM D_i / U_i (reaproveitados por descida e subida).
+    /// Alvos temporários do passe horizontal da Gaussiana (1 por nível).
+    pub(super) horiz: Vec<Tex>,
+    /// Bind groups que LEEM `down[i]` / `horiz[i]`.
     pub(super) read_down: Vec<wgpu::BindGroup>,
-    pub(super) read_up: Vec<wgpu::BindGroup>,
+    pub(super) read_horiz: Vec<wgpu::BindGroup>,
     /// Bind groups da fonte externa, por `BlurSource::id`.
     pub(super) src_groups: HashMap<u64, wgpu::BindGroup>,
     pub(super) slots: Vec<ResultSlot>,
@@ -62,16 +72,23 @@ pub(super) struct Targets {
     pub(super) down_depth: usize,
 }
 
-pub(super) fn level_divisor(level: usize) -> u32 {
-    1u32 << (level + 2)
-}
-
-pub(super) fn level_size(src: (u32, u32), level: usize) -> (u32, u32) {
-    let d = level_divisor(level);
-    (
-        src.0.div_ceil(d).max(MIN_LEVEL_DIM),
-        src.1.div_ceil(d).max(MIN_LEVEL_DIM),
-    )
+pub(super) fn mip_sizes(src: (u32, u32)) -> [(u32, u32); MAX_LEVELS] {
+    let sw = src.0.max(1);
+    let sh = src.1.max(1);
+    let scale = if sw > MIP0_MAX_W {
+        MIP0_MAX_W as f32 / sw as f32
+    } else {
+        1.0
+    };
+    let mut w = ((sw as f32 * scale).round() as u32).max(MIN_MIP0_DIM.min(sw));
+    let mut h = ((sh as f32 * scale).round() as u32).max(MIN_MIP0_DIM.min(sh));
+    let mut sizes = [(1, 1); MAX_LEVELS];
+    for size in &mut sizes {
+        *size = (w.max(1), h.max(1));
+        w = ((w as f32 * 0.5).round() as u32).max(MIN_MIP_DIM.min(sw));
+        h = ((h as f32 * 0.5).round() as u32).max(MIN_MIP_DIM.min(sh));
+    }
+    sizes
 }
 
 pub(super) fn quantize_blur(src_px: f32) -> u16 {
@@ -83,25 +100,24 @@ pub(super) fn quantize_blur(src_px: f32) -> u16 {
     }
 }
 
-/// Converte o blur quantizado em (nível mais profundo, offset da subida). Escolhe o menor nível
-/// capaz de atingir o sigma com `offset <= MAX_OFFSET` (menos pixels processados).
-pub(super) fn plan_blur(blur_q: u16) -> (usize, f32) {
+/// Converte o blur quantizado (em texels da fonte) em `(nível, sigma_no_mip)`.
+/// Escolhe o menor nível onde `sigma <= 3.2` (kernel de 15 taps cobre >98,5% da Gaussiana com
+/// passo exato de 1,0 texel — zero ghosting!).
+pub(super) fn plan_blur(blur_q: u16, src_w: u32, mip0_w: u32) -> (usize, f32) {
     let blur_src_px = f32::from(blur_q) * 0.5;
-    let sigma = blur_src_px * SIGMA_PER_BLUR_PX;
-    for level in 0..MAX_LEVELS {
-        let per_offset = SIGMA_K * level_divisor(level) as f32;
-        let offset = sigma / per_offset;
-        if offset <= MAX_OFFSET || level == MAX_LEVELS - 1 {
-            return (level, offset.clamp(MIN_OFFSET, MAX_OFFSET));
-        }
+    let mip0_scale = mip0_w.max(1) as f32 / src_w.max(1) as f32;
+    let mut sigma = (blur_src_px * SIGMA_PER_BLUR_PX * mip0_scale).max(0.4);
+    let mut level = 0usize;
+    while level + 1 < MAX_LEVELS && sigma > 3.2 {
+        level += 1;
+        sigma *= 0.5;
     }
-    (MAX_LEVELS - 1, MAX_OFFSET)
+    (level, sigma.clamp(0.45, 4.2))
 }
 
 pub(super) struct BlurPyramid {
-    pub(super) down_first: wgpu::RenderPipeline,
     pub(super) down: wgpu::RenderPipeline,
-    pub(super) up: wgpu::RenderPipeline,
+    pub(super) gauss: wgpu::RenderPipeline,
     pub(super) layout: wgpu::BindGroupLayout,
     pub(super) sampler: wgpu::Sampler,
     pub(super) targets: Option<Targets>,
@@ -148,9 +164,8 @@ impl BlurPyramid {
             )
         };
         Self {
-            down_first: make("prismview_glass_down_first", "fs_down_first"),
             down: make("prismview_glass_down", "fs_down"),
-            up: make("prismview_glass_up", "fs_up"),
+            gauss: make("prismview_glass_gauss", "fs_gauss"),
             layout,
             sampler: linear_clamp_sampler(device),
             targets: None,
@@ -195,33 +210,28 @@ impl BlurPyramid {
         if self.targets.as_ref().is_some_and(|t| t.src_size == src) {
             return;
         }
-        let mut sizes = [(0, 0); MAX_LEVELS];
-        for (level, size) in sizes.iter_mut().enumerate() {
-            *size = level_size(src, level);
-        }
+        let sizes = mip_sizes(src);
         let down: Vec<Tex> = sizes
             .iter()
             .map(|&s| make_target(device, "prismview_glass_down", s, PYRAMID_FORMAT))
             .collect();
-        let up: Vec<Tex> = sizes
+        let horiz: Vec<Tex> = sizes
             .iter()
-            .skip(1)
-            .map(|&s| make_target(device, "prismview_glass_up", s, PYRAMID_FORMAT))
+            .map(|&s| make_target(device, "prismview_glass_horiz", s, PYRAMID_FORMAT))
             .collect();
         let read_down: Vec<wgpu::BindGroup> =
             down.iter().map(|t| self.group(device, ring, &t.view)).collect();
-        let read_up: Vec<wgpu::BindGroup> =
-            up.iter().map(|t| self.group(device, ring, &t.view)).collect();
-        // Slots de resultado são alocados sob demanda até `RESULT_SLOTS` (cena com 1 vidro = 1 alvo).
+        let read_horiz: Vec<wgpu::BindGroup> =
+            horiz.iter().map(|t| self.group(device, ring, &t.view)).collect();
         let slots = Vec::with_capacity(RESULT_SLOTS);
         self.epoch = self.epoch.wrapping_add(1);
         self.targets = Some(Targets {
             src_size: src,
             sizes,
             down,
-            up,
+            horiz,
             read_down,
-            read_up,
+            read_horiz,
             src_groups: HashMap::new(),
             slots,
             down_key: None,
@@ -257,8 +267,7 @@ impl BlurPyramid {
     }
 
     /// Garante o blur de `req` para `src` e devolve o slot. Grava os passes em `encoder`.
-    /// `None`: sem blur necessário, fonte inválida ou recursos do frame esgotados (o chamador
-    /// amostra o backdrop nítido).
+    /// `None`: sem blur necessário, fonte inválida ou recursos do frame esgotados.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn blur(
         &mut self,
@@ -291,7 +300,7 @@ impl BlurPyramid {
         let now = self.clock;
         let floor = self.frame_floor;
 
-        // Bind group da fonte externa (criado só se faltar; precisa de `self.layout`).
+        // Bind group da fonte externa (criado só se faltar).
         let need_ext = {
             let t = self.targets.as_ref()?;
             !t.src_groups.contains_key(&src.id)
@@ -302,6 +311,7 @@ impl BlurPyramid {
             None
         };
 
+        let mut bumped_epoch = false;
         let t = self.targets.as_mut()?;
 
         // Acerto de cache.
@@ -311,24 +321,38 @@ impl BlurPyramid {
             return Some(BlurHandle { slot: i });
         }
 
-        // Vítima: reaproveita slot ainda não usado neste frame (LRU); se todos estiverem em uso
-        // neste frame (múltiplos blurs distintos), aloca mais um sob demanda até `RESULT_SLOTS`.
+        let (level, sigma) = plan_blur(blur_q, src.width, t.sizes[0].0);
+        let mip_size = t.sizes[level];
+        let needs_mip0_down = src.width as f32 > t.sizes[0].0 as f32 * 1.15
+            || src.height as f32 > t.sizes[0].1 as f32 * 1.15;
+
+        // Vítima LRU para o resultado do nível `level`.
         let victim = match t
             .slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.stamp < floor)
-            .min_by_key(|(_, s)| s.stamp)
+            .min_by_key(|(_, s)| (u8::from(s.size != mip_size), s.stamp))
             .map(|(i, _)| i)
         {
-            Some(i) => i,
+            Some(i) => {
+                if t.slots[i].size != mip_size {
+                    t.slots[i].tex = make_target(device, "prismview_glass_result", mip_size, PYRAMID_FORMAT);
+                    t.slots[i].size = mip_size;
+                    t.slots[i].key = None;
+                    bumped_epoch = true;
+                }
+                i
+            }
             None if t.slots.len() < RESULT_SLOTS => {
                 let idx = t.slots.len();
                 t.slots.push(ResultSlot {
-                    tex: make_target(device, "prismview_glass_result", t.sizes[0], PYRAMID_FORMAT),
+                    tex: make_target(device, "prismview_glass_result", mip_size, PYRAMID_FORMAT),
+                    size: mip_size,
                     key: None,
                     stamp: 0,
                 });
+                bumped_epoch = true;
                 idx
             }
             None => return None,
@@ -340,83 +364,105 @@ impl BlurPyramid {
             t.down_key = Some(chain);
             t.down_depth = 0;
         }
-        let (level, offset) = plan_blur(blur_q);
-        let first = t.down_depth;
-        let down_passes = (level + 1).saturating_sub(first);
-        if ring.remaining() < down_passes + level + 1 {
+        let start_lvl = if needs_mip0_down { 0 } else { 1 };
+        let need_down = needs_mip0_down || level > 0;
+        let first_down = t.down_depth.max(start_lvl);
+        let down_passes = if need_down && level >= first_down {
+            level - first_down + 1
+        } else {
+            0
+        };
+        if ring.remaining() < down_passes + 2 {
             return None;
         }
 
-        if first == 0 {
-            if let Some(group) = ext_group {
-                if t.src_groups.len() >= SRC_GROUP_CACHE_LIMIT {
-                    t.src_groups.clear();
-                }
-                t.src_groups.insert(src.id, group);
+        if let Some(group) = ext_group {
+            if t.src_groups.len() >= SRC_GROUP_CACHE_LIMIT {
+                t.src_groups.clear();
             }
+            t.src_groups.insert(src.id, group);
         }
 
-        // Descida: fonte → D0 (1/4, caixa 4×4) → D1 → ... → D_level (Kawase 5 taps, offset 1).
-        for i in first..=level {
-            let (group, tex_size, pipeline) = if i == 0 {
-                (t.src_groups.get(&src.id)?, (src.width, src.height), &self.down_first)
-            } else {
-                (&t.read_down[i - 1], t.sizes[i - 1], &self.down)
-            };
-            let params = PassParams {
-                a: [1.0 / tex_size.0 as f32, 1.0 / tex_size.1 as f32, 1.0, 0.0],
-                b: [0.0; 4],
-            };
-            let dyn_off = ring.push(queue, &params)?;
-            record_fullscreen(
-                encoder,
-                "prismview_glass_down_pass",
-                pipeline,
-                group,
-                dyn_off,
-                &t.down[i].view,
-            );
-            stats.blur_passes += 1;
+        // Passo 1: Downsample 2× progressivo (anti-aliased, 4 taps bilineares).
+        let force_opaque = if req.opaque { 1.0 } else { 0.0 };
+        if need_down && level >= first_down {
+            for lvl in first_down..=level {
+                let (group, src_sz) = if lvl == start_lvl {
+                    (t.src_groups.get(&src.id)?, (src.width, src.height))
+                } else {
+                    (&t.read_down[lvl - 1], t.sizes[lvl - 1])
+                };
+                let params = PassParams {
+                    a: [
+                        0.5 / src_sz.0.max(1) as f32,
+                        0.5 / src_sz.1.max(1) as f32,
+                        0.0,
+                        if lvl == start_lvl { force_opaque } else { 0.0 },
+                    ],
+                    b: [0.0; 4],
+                };
+                let dyn_off = ring.push(queue, &params)?;
+                record_fullscreen(
+                    encoder,
+                    "prismview_glass_down_pass",
+                    &self.down,
+                    group,
+                    dyn_off,
+                    &t.down[lvl].view,
+                );
+                stats.blur_passes += 1;
+            }
+            t.down_depth = t.down_depth.max(level + 1);
         }
-        t.down_depth = t.down_depth.max(level + 1);
 
-        // Subida: D_level → U_level → ... → U1 → slot de resultado (U0), Kawase 8 taps.
-        for i in (0..=level).rev() {
-            let (group, tex_size) = if i == level {
-                (&t.read_down[level], t.sizes[level])
-            } else {
-                (&t.read_up[i], t.sizes[i + 1])
-            };
-            let params = PassParams {
-                a: [
-                    1.0 / tex_size.0 as f32,
-                    1.0 / tex_size.1 as f32,
-                    offset,
-                    0.0,
-                ],
-                b: [0.0; 4],
-            };
-            let dyn_off = ring.push(queue, &params)?;
-            let target = if i == 0 {
-                &t.slots[victim].tex.view
-            } else {
-                &t.up[i - 1].view
-            };
-            record_fullscreen(
-                encoder,
-                "prismview_glass_up_pass",
-                &self.up,
-                group,
-                dyn_off,
-                target,
-            );
-            stats.blur_passes += 1;
-        }
+        // Passo 2: Gaussiana separável densa de 15 taps (H → horiz[level], V → slots[victim]).
+        let gauss_in = if need_down {
+            &t.read_down[level]
+        } else {
+            t.src_groups.get(&src.id)?
+        };
+        let params_h = PassParams {
+            a: [
+                1.0 / mip_size.0.max(1) as f32,
+                0.0,
+                sigma,
+                if need_down { 0.0 } else { force_opaque },
+            ],
+            b: [0.0; 4],
+        };
+        let off_h = ring.push(queue, &params_h)?;
+        record_fullscreen(
+            encoder,
+            "prismview_glass_gauss_h",
+            &self.gauss,
+            gauss_in,
+            off_h,
+            &t.horiz[level].view,
+        );
+        stats.blur_passes += 1;
+
+        let params_v = PassParams {
+            a: [0.0, 1.0 / mip_size.1.max(1) as f32, sigma, 0.0],
+            b: [0.0; 4],
+        };
+        let off_v = ring.push(queue, &params_v)?;
+        record_fullscreen(
+            encoder,
+            "prismview_glass_gauss_v",
+            &self.gauss,
+            &t.read_horiz[level],
+            off_v,
+            &t.slots[victim].tex.view,
+        );
+        stats.blur_passes += 1;
 
         let slot = &mut t.slots[victim];
         slot.key = Some(key);
         slot.stamp = now;
         stats.blur_misses += 1;
+        if bumped_epoch {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
         Some(BlurHandle { slot: victim })
     }
 }

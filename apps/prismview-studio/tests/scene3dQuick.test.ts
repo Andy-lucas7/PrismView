@@ -15,6 +15,7 @@ import {
   findQuickBindings,
   quickBindingId,
   suggestedQuickTarget,
+  toggleSuggestionBinding,
 } from "../src/engine/scene3d/quickActions.ts";
 
 const bone = (name: string) => ({ name, isBone: true, isMesh: false });
@@ -119,50 +120,50 @@ test("preserva olhos/mandíbula e não duplica papéis", () => {
 });
 
 test("quick binding: ligar 2× não duplica, desligar remove, retarget atualiza", () => {
-  const req = { kind: "HEAD" as const, objectId: "obj-a", primaryObjectId: "obj-a", targetName: "Head", enabled: true };
+  const req = { kind: "LOOK" as const, objectId: "obj-a", primaryObjectId: "obj-a", targetName: "__ROOT__", enabled: true };
   const once = applyQuickBinding([], req);
   const twice = applyQuickBinding(once, req);
   assert.equal(once.length, 1);
   assert.equal(twice, once, "sem mudança → mesma referência");
-  assert.equal(once[0].id, quickBindingId("HEAD", "obj-a"));
+  assert.equal(once[0].id, quickBindingId("LOOK", "obj-a"));
   assert.equal(once[0].targetType, "NODE_LOOK_AT");
 
-  const body = applyQuickBinding(twice, { ...req, kind: "BODY", targetName: "Spine" });
-  assert.equal(body.length, 2);
+  const withClick = applyQuickBinding(twice, { ...req, kind: "CLICK", targetName: "__ROOT__" });
+  assert.equal(withClick.length, 2);
 
-  const tuned = applyQuickBinding(body, { ...req, strength: 30 });
-  assert.equal(tuned.find((b) => b.id === quickBindingId("HEAD", "obj-a"))?.strength, 30);
+  const tuned = applyQuickBinding(withClick, { ...req, strength: 30 });
+  assert.equal(tuned.find((b) => b.id === quickBindingId("LOOK", "obj-a"))?.strength, 30);
   const retarget = applyQuickBinding(tuned, { ...req, targetName: "Neck" });
   assert.equal(retarget.length, 2);
-  assert.equal(retarget.find((b) => b.id === quickBindingId("HEAD", "obj-a"))?.targetName, "Neck");
-  assert.equal(retarget.find((b) => b.id === quickBindingId("HEAD", "obj-a"))?.strength, 30);
+  assert.equal(retarget.find((b) => b.id === quickBindingId("LOOK", "obj-a"))?.targetName, "Neck");
+  assert.equal(retarget.find((b) => b.id === quickBindingId("LOOK", "obj-a"))?.strength, 30);
 
   const off = applyQuickBinding(retarget, { ...req, targetName: "Neck", enabled: false });
   assert.equal(off.length, 1);
-  assert.equal(off[0].targetName, "Spine");
+  assert.equal(off[0].source, "CLICK_MESH");
   assert.equal(applyQuickBinding(off, { ...req, enabled: false }), off);
 });
 
-test("quick binding: adota binding equivalente criado à mão (sem duplicar)", () => {
+test("quick binding: adota binding equivalente criado à mão ou preset (sem duplicar)", () => {
   const manual = {
-    id: "b3d-xyz",
+    id: "b3d-default-look",
     enabled: false,
     source: "CURSOR_LOOK" as const,
     sourceNode: "*",
     targetType: "NODE_LOOK_AT" as const,
-    targetName: "Head",
+    targetName: "__ROOT__",
     strength: 18,
-    smoothing: 0.2,
+    smoothing: 0.1,
   };
-  const req = { kind: "HEAD" as const, objectId: "obj-a", primaryObjectId: "obj-a", targetName: "Head", enabled: true };
-  assert.equal(findQuickBindings([manual], "HEAD", "obj-a", "obj-a", "Head").length, 1);
+  const req = { kind: "LOOK" as const, objectId: "obj-a", primaryObjectId: "obj-a", targetName: "__ROOT__", enabled: true };
+  assert.equal(findQuickBindings([manual], "LOOK", "obj-a", "obj-a", "__ROOT__").length, 1);
   const on = applyQuickBinding([manual], req);
   assert.equal(on.length, 1);
-  assert.equal(on[0].id, "b3d-xyz");
+  assert.equal(on[0].id, "b3d-default-look");
   assert.equal(on[0].enabled, true);
   assert.equal(on[0].strength, 18, "mantém ajuste Pro");
   // outro objeto não é afetado
-  assert.equal(findQuickBindings([manual], "HEAD", "obj-b", "obj-a", "Head").length, 0);
+  assert.equal(findQuickBindings([manual], "LOOK", "obj-b", "obj-a", "__ROOT__").length, 0);
   assert.equal(applyQuickBinding(on, { ...req, enabled: false }).length, 0);
 });
 
@@ -181,8 +182,14 @@ test("quick cover: idempotente + emissive/material/imagem", () => {
   assert.equal(applyQuickCover(img, { objectId: "o", enabled: false }).length, 0);
 });
 
-test("alvo sugerido: cabeça cai p/ pescoço", () => {
+test("alvo sugerido e chip contextual: só atua quando o modelo tem partes nomeadas", () => {
   const sugs = detectPartSuggestions({ ...chibi(), nodes: [bone("Neck"), bone("Spine")] });
-  assert.equal(suggestedQuickTarget(sugs, "HEAD"), "Neck");
-  assert.equal(suggestedQuickTarget(sugs, "BODY"), "Spine");
+  assert.equal(suggestedQuickTarget(sugs, "LOOK"), "Neck");
+  assert.equal(suggestedQuickTarget(sugs, "CLICK"), null);
+  const spineSug = sugs.find((s) => s.role === "BODY")!;
+  const added = toggleSuggestionBinding([], spineSug, "obj-a", "obj-a");
+  assert.equal(added.length, 1);
+  assert.equal(added[0].targetName, "Spine");
+  const removed = toggleSuggestionBinding(added, spineSug, "obj-a", "obj-a");
+  assert.equal(removed.length, 0);
 });

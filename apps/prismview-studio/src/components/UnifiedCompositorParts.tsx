@@ -195,8 +195,16 @@ export function ensureCustomFontLoaded(fontFamily: string, fontPath: string): Pr
 }
 
 export function hexToRgbTuple(hex: string): [number, number, number] {
-  const clean = (hex || "#FFFFFF").replace("#", "").trim();
-  if (clean.length === 3) {
+  const raw = (hex || "#FFFFFF").trim();
+  const rgbMatch = raw.match(/^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)/i);
+  if (rgbMatch) {
+    const r = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[1]))));
+    const g = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[2]))));
+    const b = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[3]))));
+    if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) return [r, g, b];
+  }
+  const clean = raw.replace("#", "").trim();
+  if (clean.length === 3 || clean.length === 4) {
     const r = parseInt(clean[0] + clean[0], 16);
     const g = parseInt(clean[1] + clean[1], 16);
     const b = parseInt(clean[2] + clean[2], 16);
@@ -213,10 +221,29 @@ export function hexToRgbTuple(hex: string): [number, number, number] {
 export function colorWithAlpha(color: string, alpha?: number): string {
   const a = alpha === undefined ? 1 : Math.max(0, Math.min(1, alpha));
   const raw = (color || "#FFFFFF").trim();
-  if (a >= 0.999 && !raw.startsWith("#")) return raw;
+  if (raw.toLowerCase() === "transparent") return "rgba(0, 0, 0, 0)";
+  const rgbMatch = raw.match(
+    /^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)(?:\s*[,/]\s*([\d.]+))?\s*\)$/i
+  );
+  if (rgbMatch) {
+    const r = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[1]))));
+    const g = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[2]))));
+    const b = Math.max(0, Math.min(255, Math.round(Number(rgbMatch[3]))));
+    const baseA = rgbMatch[4] !== undefined ? Math.max(0, Math.min(1, Number(rgbMatch[4]))) : 1;
+    return `rgba(${r}, ${g}, ${b}, ${(baseA * a).toFixed(3)})`;
+  }
   if (raw.startsWith("#")) {
+    const clean = raw.slice(1);
     const [r, g, b] = hexToRgbTuple(raw);
-    return `rgba(${r}, ${g}, ${b}, ${a.toFixed(3)})`;
+    let baseA = 1;
+    if (clean.length === 4) {
+      const nib = parseInt(clean[3] + clean[3], 16);
+      if (Number.isFinite(nib)) baseA = nib / 255;
+    } else if (clean.length === 8) {
+      const byte = parseInt(clean.slice(6, 8), 16);
+      if (Number.isFinite(byte)) baseA = byte / 255;
+    }
+    return `rgba(${r}, ${g}, ${b}, ${(baseA * a).toFixed(3)})`;
   }
   return raw;
 }

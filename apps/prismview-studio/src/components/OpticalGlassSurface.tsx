@@ -120,8 +120,9 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
   const effW = width > 1 ? width : measured.w;
   const effH = height > 1 ? height : measured.h;
 
-  const blurPx = Math.max(0, Math.min(80, glass.blurPx));
-  const refrScalePx = Math.max(0, Math.min(60, glass.refractionScale)) * Math.max(0.5, containerScale);
+  const rawBlurPx = Math.max(0, Math.min(80, glass.blurPx));
+  const blurPx = rawBlurPx <= 0.1 ? 0 : Math.max(0.15, rawBlurPx * containerScale);
+  const refrScalePx = Math.max(0, Math.min(60, glass.refractionScale)) * containerScale;
   const bevelPx = Math.max(4, Math.min(80, glass.bevelWidth ?? 22)) * containerScale;
   const chromaPx = Math.max(0, Math.min(6, glass.chromaticAberration));
   const frostOpacity = Math.max(0, Math.min(0.85, glass.frostOpacity));
@@ -144,6 +145,7 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
     rotationDeg,
     scaleY,
     blurPx,
+    rawBlurPx,
     refractionScale: refrScalePx,
     bevelPx,
     radiusPx,
@@ -159,6 +161,8 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
     opacity,
     glyphCanvas: glyphMaps?.webglCanvas ?? null,
     glyphHeightCanvas: glyphMaps?.heightCanvas ?? null,
+    glyphHeightSigmaPx: glyphMaps?.heightSigmaPx ?? 6,
+    glyphPadPx: glyphMaps?.padPx ?? 0,
     glyphKey: glyphMaps?.key,
     pigmentRgba,
   };
@@ -249,6 +253,7 @@ export const OpticalGlassSurface: React.FC<OpticalGlassSurfaceProps> = ({
     forceCssFallback,
     scheduleDraw,
     backdrop?.key,
+    backdrop?.underlay?.key,
     backdrop?.drawLeft,
     backdrop?.drawTop,
     backdrop?.drawW,
