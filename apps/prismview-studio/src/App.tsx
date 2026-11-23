@@ -60,6 +60,7 @@ const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
 import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
+import { HubLayout, readHubView, writeHubView, type HubView } from "./components/hub/HubLayout";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -460,6 +461,12 @@ function classifyWallpaperKind(project: PrismProject): "3D" | "VIDEO" | "2D" {
   return "2D";
 }
 
+/** Cor do brilho ambiente atrás do card no carrossel (fundo da View; neutro se for preto). */
+function hubAmbient(p: PrismProject): string {
+  const c = p.backgroundColor;
+  return c && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c) && c.toLowerCase() !== "#000000" && c.toLowerCase() !== "#000" ? c : "#5b6178";
+}
+
 const StudioHubApp: React.FC = () => {
   const telemetry = useLiveTelemetry();
   const power = usePowerState(telemetry);
@@ -487,6 +494,11 @@ const StudioHubApp: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const [hubTab, setHubTab] = useState<HubTab>("WALLPAPERS");
+  const [hubView, setHubView] = useState<HubView>(readHubView);
+  const changeHubView = useCallback((v: HubView) => {
+    setHubView(v);
+    writeHubView(v);
+  }, []);
   const [wallpaperFilter, setWallpaperFilter] = useState<WallpaperKindFilter>("ALL");
   const [templateFilter, setTemplateFilter] = useState<TemplateCategoryFilter>("ALL");
   const [hubQuery, setHubQuery] = useState("");
@@ -2180,8 +2192,16 @@ const StudioHubApp: React.FC = () => {
                 />
               )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {filteredWallpapers.map((wp) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                items={filteredWallpapers}
+                getKey={(x) => x.id}
+                getAmbient={(x) => hubAmbient(x)}
+                onActivate={(x) => setEditing(x)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Wallpapers"
+                renderItem={(wp) => {
                   const isActive = runtime.active_wallpaper_id === wp.id;
                   const wpKind = classifyWallpaperKind(wp);
                   return (
@@ -2281,8 +2301,8 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
+                }}
+              />
             </div>
           )}
 
@@ -2313,8 +2333,16 @@ const StudioHubApp: React.FC = () => {
                 />
               )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {filteredWidgets.map((w) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                items={filteredWidgets}
+                getKey={(x) => x.id}
+                getAmbient={(x) => hubAmbient(x)}
+                onActivate={(x) => setEditing(x)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Widgets"
+                renderItem={(w) => {
                   const pinned = runtime.pinned_widget_ids.includes(w.id);
                   const isLocked = runtime.locked_widget_ids.includes(w.id);
                   return (
@@ -2442,8 +2470,8 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
+                }}
+              />
             </div>
           )}
 
@@ -2485,8 +2513,15 @@ const StudioHubApp: React.FC = () => {
               </div>
 
               {/* Unified Templates Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {unifiedTemplates.map(({ project: tpl, category, subtitle, badges }) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                items={unifiedTemplates}
+                getKey={(x) => x.project.id}
+                getAmbient={(x) => hubAmbient(x.project)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Modelos"
+                renderItem={({ project: tpl, category, subtitle, badges }) => {
                   const isWidgetTpl = tpl.packageType === "WIDGET";
                   const openOrCloneTemplate = async (applyDirectly: boolean) => {
                     const existing = projects.find((p) => p.id === tpl.id);
@@ -2570,8 +2605,8 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
+                }}
+              />
 
               {/* Collapsible Blender Optimization Guide (Out of the way unless needed) */}
               <div className="frosted-chrome frosted-chrome-panel rounded-2xl overflow-hidden">

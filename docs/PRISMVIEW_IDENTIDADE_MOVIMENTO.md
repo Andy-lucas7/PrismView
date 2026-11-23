@@ -158,11 +158,11 @@ Handoff: assim que o Studio entrega o 1º quadro, cross-fade snapshot → Studio
 | Toast/diálogos com `SPRING_TACTILE` + `AnimatePresence`, `useDialogFocus` | Feito |
 | Módulos separados (`UnifiedCompositorParts`, `InspectorControls`, `Scene3DLayerParts`, `types/prism*`) | Feito: componentes de movimento vão em `src/components/motion/`, sem inflar o `App.tsx` |
 | `motion.ts`, tokens, paleta única | Pendente (Etapa 7) |
-| Snapshots de miniaturas | Pendente (2a) |
-| Carrossel | Pendente (2); o Hub é grid de 3 colunas nas abas `WALLPAPERS`, `WIDGETS`, `TEMPLATES` |
+| Snapshots de miniaturas | Feito (2a): 3 `full` + `still` em cache + `HubStillWarmer` |
+| Carrossel | **Feito (2)**: `components/hub/ViewCarousel.tsx` + `HubLayout.tsx` nas 3 abas |
 | Expandir View → Studio | Pendente (1); `if (editing)` é corte seco |
 | Transição de abas | Pendente (4); `hubTab ===` é render condicional |
-| Grid como modo alternativo | Pendente (5); não há modo de visualização |
+| Grid como modo alternativo | Parcial (5): botão no canto + fade/blur; falta o morph por `layoutId` entre card e grid |
 | Intro | Pendente (3) |
 
 **Aplicar já é instantâneo no PrismView** (commit `2363599`): o fade + blur da Etapa 1 roda **em paralelo** ao aplicar, sem atrasar o motor nativo.

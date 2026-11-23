@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { PrismProject } from "../types/prism";
 import { HUB_MOCK_TELEMETRY } from "../engine/hubMock";
 import { HubLiveBudget } from "../engine/hubLiveBudget";
 import { StillCache } from "../engine/hubStillCache";
 import { captureStill, hubStills, stillLayerIds, stillSignature } from "../engine/hubStillCapture";
 import { UnifiedCompositor } from "./UnifiedCompositor";
+import { HubCardContext } from "./hub/HubCardContext";
 
 /** Miniaturas `full` (vidro/3D/vídeo vivos): só 3 por vez (centro + 2 laterais). Teto Chromium ~16 WebGL. */
 const hubBudget = new HubLiveBudget(3);
@@ -80,20 +81,22 @@ export const HubThumbnail = React.memo(function HubThumbnail({
 }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const [visRank, setVisRank] = useState<number | null>(null);
-  const full = useIsFull(project.id);
-  const effective = rank ?? visRank;
+  const ctx = useContext(HubCardContext);
+  const fixedRank = rank ?? ctx.rank;
+  const full = useIsFull(project.id) && ctx.effects;
+  const effective = fixedRank ?? visRank;
   const { stills, onThumbFrame } = useProjectStills(project);
 
   useEffect(() => {
     const el = hostRef.current;
-    if (!el || rank !== undefined || typeof IntersectionObserver === "undefined") return;
+    if (!el || fixedRank !== undefined || typeof IntersectionObserver === "undefined") return;
     const io = new IntersectionObserver(
       ([e]) => setVisRank(e.isIntersecting ? 1 - Math.min(1, Math.max(0, e.intersectionRatio)) : null),
       { rootMargin: "160px", threshold: [0, 0.25, 0.5, 0.75, 1] }
     );
     io.observe(el);
     return () => io.disconnect();
-  }, [rank]);
+  }, [fixedRank]);
 
   useEffect(() => {
     hubBudget.request(project.id, effective);
