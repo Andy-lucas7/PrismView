@@ -314,7 +314,16 @@ unsafe extern "system" fn controller_wndproc(
                 return LRESULT(0);
             }
         }
-        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            signals::schedule(TIMER_MONITORS);
+            return LRESULT(0);
+        }
+        WM_SETTINGCHANGE => {
+            if wparam.0 as u32 == SPI_SETDESKWALLPAPER.0 {
+                // Troca do wallpaper estático do Windows faz o Explorer reordenar/recriar o WorkerW:
+                // agenda reanexação da nossa camada viva acima do WorkerW (abaixo do DefView).
+                signals::schedule_ms(TIMER_SHELL, 250);
+            }
             signals::schedule(TIMER_MONITORS);
             return LRESULT(0);
         }

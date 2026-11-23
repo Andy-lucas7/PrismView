@@ -2,12 +2,16 @@
 //! (`ShellExecuteW`, verbo `open`). Chamado só a partir do loop, em resposta a um toque do
 //! usuário sobre uma camada com `TouchAction::OpenUrl/OpenApp`.
 
+use std::ffi::c_void;
+use std::path::Path;
+
 use ::windows::core::{w, PCWSTR};
 use ::windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND};
 use ::windows::Win32::System::Threading::CreateMutexW;
 use ::windows::Win32::UI::Shell::ShellExecuteW;
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOWNORMAL,
+    FindWindowW, SetForegroundWindow, ShowWindow, SystemParametersInfoW, SPIF_SENDCHANGE,
+    SPIF_UPDATEINIFILE, SPI_SETDESKWALLPAPER, SW_RESTORE, SW_SHOWNORMAL,
 };
 
 use crate::platform::{PlatformError, PlatformResult};
@@ -116,6 +120,30 @@ pub fn shell_open(target: &str, is_url: bool) -> PlatformResult<()> {
     } else {
         Err(PlatformError::Os(format!("ShellExecuteW falhou ({})", result.0 as isize)))
     }
+}
+
+/// Aplica `path` (PNG/JPG/BMP absoluto) como papel de parede real do Windows
+/// (`SPI_SETDESKWALLPAPER`), atualizando Mica/Acrylic, cor de destaque e fallback de área de trabalho.
+pub fn set_windows_desktop_wallpaper(path: &Path) -> PlatformResult<()> {
+    if !path.is_file() {
+        return Err(PlatformError::Os(format!(
+            "set_windows_desktop_wallpaper: arquivo ausente ({})",
+            path.display()
+        )));
+    }
+    let normalized = path.to_string_lossy().replace('/', "\\");
+    let wide: Vec<u16> = normalized.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` termina em NUL e vive até o fim da chamada; `SPI_SETDESKWALLPAPER` lê
+    // `pvParam` como PCWSTR.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_SETDESKWALLPAPER,
+            0,
+            Some(wide.as_ptr() as *mut c_void),
+            SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+        )
+    }
+    .map_err(|e| PlatformError::Os(format!("SPI_SETDESKWALLPAPER: {e}")))
 }
 
 #[cfg(test)]

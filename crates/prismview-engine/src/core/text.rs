@@ -68,6 +68,8 @@ pub struct TextSpec<'a> {
     /// Espaçamento entre letras em `em` (paridade 1:1 com CSS `letter-spacing`).
     pub letter_spacing_em: f32,
     pub align: TextAlignment,
+    /// Largura máxima em px físicos (0 = largura automática sem quebra de linha).
+    pub max_width_px: f32,
 }
 
 /// Resultado do layout de um slot.
@@ -111,6 +113,7 @@ struct TextKey {
     spacing_bits: u32,
     letter_spacing_bits: u32,
     align: TextAlignment,
+    max_width_bits: u32,
 }
 
 impl TextKey {
@@ -120,6 +123,7 @@ impl TextKey {
             && self.spacing_bits == spec.line_spacing.to_bits()
             && self.letter_spacing_bits == spec.letter_spacing_em.to_bits()
             && self.align == spec.align
+            && self.max_width_bits == spec.max_width_px.to_bits()
             && self.text == spec.text
             && self.font_id == spec.font_id
     }
@@ -134,6 +138,7 @@ impl TextKey {
         self.spacing_bits = spec.line_spacing.to_bits();
         self.letter_spacing_bits = spec.letter_spacing_em.to_bits();
         self.align = spec.align;
+        self.max_width_bits = spec.max_width_px.to_bits();
     }
 }
 
@@ -505,13 +510,101 @@ impl TextSystem {
             .style(matched_style)
             .color(Color::rgb(255, 255, 255));
 
+        let wrap_width = if spec.max_width_px.is_finite() && spec.max_width_px >= 1.0 {
+            Some(spec.max_width_px.min(max_dim as f32))
+        } else {
+            None
+        };
+
         slot.spaced_glyphs.clear();
         let (width, height) = if use_letter_spacing {
             let metrics = Metrics::new(size, line_height);
             let mut per_line: Vec<(f32, Vec<(Buffer, f32)>)> = Vec::new();
-            let mut max_w = 0.0f32;
+            let mut max_w = wrap_width.unwrap_or(0.0);
             let mut char_buf = [0u8; 4];
-            for line in spec.text.split('\n') {
+
+            let measure_str = |fs: &mut FontSystem, text: &str| -> f32 {
+                let mut cursor = 0.0f32;
+                let mut w = 0.0f32;
+                let mut cb = [0u8; 4];
+                for ch in text.chars() {
+                    let s = ch.encode_utf8(&mut cb);
+                    let mut b = Buffer::new(fs, metrics);
+                    b.set_wrap(fs, Wrap::None);
+                    b.set_size(fs, None, None);
+                    b.set_text(fs, s, attrs, Shaping::Advanced);
+                    b.shape_until_scroll(fs, false);
+                    let (mut cw, _, _) = measure(&b);
+                    if cw <= 0.0 && ch.is_whitespace() {
+                        cw = size * 0.28;
+                    }
+                    let x = cursor.max(0.0);
+                    w = w.max(x + cw);
+                    cursor = x + cw + letter_spacing_px;
+                }
+                w
+            };
+
+            let mut wrapped_lines: Vec<String> = Vec::new();
+            if let Some(limit) = wrap_width {
+                for para in spec.text.split('\n') {
+                    if para.is_empty() {
+                        wrapped_lines.push(String::new());
+                        continue;
+                    }
+                    let mut current = String::new();
+                    for word in para.split_inclusive(|c: char| c.is_whitespace()) {
+                        let word_trimmed = word.trim_end();
+                        if current.is_empty() {
+                            if measure_str(fs, word_trimmed) <= limit {
+                                current.push_str(word);
+                            } else {
+                                // Palavra mais larga que a caixa: quebra por caractere.
+                                for ch in word.chars() {
+                                    let mut cand = current.clone();
+                                    cand.push(ch);
+                                    if !current.is_empty() && measure_str(fs, &cand) > limit {
+                                        wrapped_lines.push(current.trim_end().to_string());
+                                        current.clear();
+                                    }
+                                    current.push(ch);
+                                }
+                            }
+                        } else {
+                            let mut cand = current.clone();
+                            cand.push_str(word_trimmed);
+                            if measure_str(fs, &cand) <= limit {
+                                current.push_str(word);
+                            } else {
+                                wrapped_lines.push(current.trim_end().to_string());
+                                current.clear();
+                                if measure_str(fs, word_trimmed) <= limit {
+                                    current.push_str(word);
+                                } else {
+                                    for ch in word.chars() {
+                                        let mut cand2 = current.clone();
+                                        cand2.push(ch);
+                                        if !current.is_empty() && measure_str(fs, &cand2) > limit {
+                                            wrapped_lines.push(current.trim_end().to_string());
+                                            current.clear();
+                                        }
+                                        current.push(ch);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !current.is_empty() {
+                        wrapped_lines.push(current.trim_end().to_string());
+                    }
+                }
+            } else {
+                for line in spec.text.split('\n') {
+                    wrapped_lines.push(line.to_string());
+                }
+            }
+
+            for line in &wrapped_lines {
                 let mut cursor = 0.0f32;
                 let mut line_w = 0.0f32;
                 let mut items = Vec::new();
@@ -551,29 +644,44 @@ impl TextSystem {
             (max_w, total_h)
         } else {
             slot.buffer.set_metrics(fs, Metrics::new(size, line_height));
-            slot.buffer.set_wrap(fs, Wrap::None);
-            slot.buffer.set_size(fs, None, None);
-            slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
-            slot.buffer.shape_until_scroll(fs, false);
-
-            let (w, mut h, lines) = measure(&slot.buffer);
-            if lines == 0 {
-                h = line_height;
-            }
-            if lines > 1 && spec.align != TextAlignment::Start {
-                // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
-                let align = match spec.align {
-                    TextAlignment::Start => Align::Left,
-                    TextAlignment::Center => Align::Center,
-                    TextAlignment::End => Align::Right,
-                };
-                slot.buffer.set_size(fs, Some(w.ceil()), None);
+            let align = match spec.align {
+                TextAlignment::Start => Align::Left,
+                TextAlignment::Center => Align::Center,
+                TextAlignment::End => Align::Right,
+            };
+            if let Some(limit) = wrap_width {
+                slot.buffer.set_wrap(fs, Wrap::WordOrGlyph);
+                slot.buffer.set_size(fs, Some(limit), None);
+                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
                 for line in slot.buffer.lines.iter_mut() {
                     line.set_align(Some(align));
                 }
                 slot.buffer.shape_until_scroll(fs, false);
+                let (w, mut h, lines) = measure(&slot.buffer);
+                if lines == 0 {
+                    h = line_height;
+                }
+                (limit.max(w), h)
+            } else {
+                slot.buffer.set_wrap(fs, Wrap::None);
+                slot.buffer.set_size(fs, None, None);
+                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
+                slot.buffer.shape_until_scroll(fs, false);
+
+                let (w, mut h, lines) = measure(&slot.buffer);
+                if lines == 0 {
+                    h = line_height;
+                }
+                if lines > 1 && spec.align != TextAlignment::Start {
+                    // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
+                    slot.buffer.set_size(fs, Some(w.ceil()), None);
+                    for line in slot.buffer.lines.iter_mut() {
+                        line.set_align(Some(align));
+                    }
+                    slot.buffer.shape_until_scroll(fs, false);
+                }
+                (w, h)
             }
-            (w, h)
         };
 
         slot.key.store(spec);

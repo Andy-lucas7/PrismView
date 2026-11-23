@@ -59,10 +59,10 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, log_file, open_studio, wallpaper_presenter, parse_tray_enabled, resolve_font_files,
-    run as run_loop,
-    trim_working_set, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
-    SensorsConfig, TrayAction, Win32DesktopHost, Win32SystemSensors,
+    acquire_single_instance, log_file, open_studio, parse_tray_enabled, resolve_font_files,
+    run as run_loop, set_windows_desktop_wallpaper, trim_working_set, wallpaper_presenter,
+    ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder, SensorsConfig, TrayAction,
+    Win32DesktopHost, Win32SystemSensors,
 };
 use crate::platform::{
     DesktopEvent, DesktopHost, DesktopVisibility, HardwareVideoDecoder, NativeWindowId,
@@ -85,19 +85,16 @@ const MAX_RETRY_STREAK: u32 = 60;
 const REBUILD_DELAY: Duration = Duration::from_millis(250);
 /// Rebuilds automáticos seguidos sem sucesso; depois espera um evento do sistema.
 const MAX_REBUILD_ATTEMPTS: u32 = 20;
-/// Fallback de cadência caso o driver não bloqueie em `PresentMode::Fifo` (evita spin 100% CPU).
-const FAST_PRESENT_FALLBACK: Duration = Duration::from_millis(4);
-/// Limiar mínimo de duração de um present para considerá-lo sincronizado por VSync.
-const VSYNC_PRESENT_MIN: Duration = Duration::from_millis(2);
-/// Quantos presents sub-2ms seguidos tolerar (ex.: 1º quadro após acordar do repouso) antes de
-/// aplicar `FAST_PRESENT_FALLBACK`.
-const MAX_FAST_PRESENT_STREAK: u8 = 2;
 /// Cena persistida pelo Studio (`LoadSceneFile`); relida ao iniciar sem o Studio.
 const ACTIVE_SCENE_FILE: &str = "active_scene.json";
 /// Preferência de energia persistida pelo motor (`SetPowerPreference`).
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
 /// Preferência de exibição da engine na bandeja do sistema (`SetTrayVisible`).
 const TRAY_ENABLED_FILE: &str = "tray_enabled.txt";
+/// Sincronizar o papel de parede real do Windows (imagem limpa sem HUD) ao aplicar cena.
+const SYNC_WINDOWS_WALLPAPER_FILE: &str = "sync_windows_wallpaper.txt";
+/// Tempo máximo aguardando mídia (vídeo/imagens/3D) carregar antes de capturar o snapshot limpo.
+const WIN_WALLPAPER_SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 /// Limite defensivo do JSON da cena.
 const MAX_SCENE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// `output_generation` ainda não registrada no compositor.
@@ -195,12 +192,20 @@ struct NativeApp {
     ram_total_gb: f32,
     /// `true` após carga de cena: reduz working set uma vez depois de apresentar o 1º quadro.
     needs_mem_trim: bool,
-    /// Presents seguidos abaixo de `VSYNC_PRESENT_MIN` (proteção anti-spin sem VSync).
-    fast_present_streak: u8,
     /// Exibe o ícone da engine na bandeja do sistema enquanto executa (padrão: `true`).
     tray_visible: bool,
     /// Marca que a visibilidade ou o tooltip da bandeja precisa ser sincronizado no `host`.
     tray_sync_needed: bool,
+    /// Atualiza o papel de parede real do Windows (`SPI_SETDESKWALLPAPER`) ao aplicar wallpaper.
+    sync_windows_wallpaper: bool,
+    /// Captura limpa pendente (deadline até onde aguardar vídeo/imagens/3D carregarem).
+    pending_win_wallpaper: Option<Instant>,
+    /// Alterna A/B no nome do arquivo para garantir que o Windows 11 sempre recarregue a imagem.
+    win_wallpaper_slot: bool,
+    /// Sinalizado pela thread de `SPI_SETDESKWALLPAPER` ao terminar: reanexa nossa janela acima do WorkerW.
+    win_wallpaper_applied: Arc<std::sync::atomic::AtomicBool>,
+    /// Segunda passada de reanexação após o crossfade assíncrono do Windows 11 (~650 ms).
+    win_wallpaper_reattach_at: Option<Instant>,
     /// Entrega 3: widgets nativos (mesmo device/3D/sensores do wallpaper).
     widgets: Vec<WidgetRuntime>,
     /// O wallpaper (janelas WorkerW) deve existir: há cena aplicada ou `ClearDesktop` explícito.
@@ -340,9 +345,13 @@ impl NativeApp {
             media_version_seen: u64::MAX,
             ram_total_gb: SystemTelemetry::sample_live().ram_total_gb,
             needs_mem_trim: false,
-            fast_present_streak: 0,
             tray_visible: true,
             tray_sync_needed: false,
+            sync_windows_wallpaper: false,
+            pending_win_wallpaper: None,
+            win_wallpaper_slot: false,
+            win_wallpaper_applied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            win_wallpaper_reattach_at: None,
             widgets: Vec::new(),
             wallpaper_wanted: false,
             formulas_sec: i64::MIN,
@@ -614,6 +623,11 @@ impl NativeApp {
         if let Ok(raw) = std::fs::read_to_string(dir.join(TRAY_ENABLED_FILE)) {
             self.tray_visible = parse_tray_enabled(&raw);
         }
+        if let Ok(raw) = std::fs::read_to_string(dir.join(SYNC_WINDOWS_WALLPAPER_FILE)) {
+            let t = raw.trim();
+            self.sync_windows_wallpaper =
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on");
+        }
         let scene_path = dir.join(ACTIVE_SCENE_FILE);
         if scene_path.is_file() {
             match Self::read_scene_file(&scene_path) {
@@ -624,6 +638,109 @@ impl NativeApp {
                 Err(err) => push_issue(&mut self.issues, None, format!("cena persistida: {err}")),
             }
         }
+    }
+
+    /// Agenda a atualização do papel de parede real do Windows assim que vídeo/imagens/3D
+    /// estiverem prontos (com timeout defensivo).
+    fn schedule_windows_wallpaper_sync(&mut self) {
+        if self.sync_windows_wallpaper && self.scene.is_some() {
+            self.pending_win_wallpaper = Some(Instant::now() + WIN_WALLPAPER_SYNC_TIMEOUT);
+            self.dirty = true;
+        }
+    }
+
+    /// Captura a versão limpa da cena atual (sem texto/relógio/telemetria/mídia) e grava em
+    /// segundo plano como papel de parede real do Windows quando todos os assets visuais já
+    /// subiram para a GPU (ou no timeout).
+    fn maybe_sync_windows_wallpaper(&mut self, now: Instant) -> Option<Instant> {
+        let deadline = self.pending_win_wallpaper?;
+        if self.scene.is_none() || !self.sync_windows_wallpaper {
+            self.pending_win_wallpaper = None;
+            return None;
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Some(now + Duration::from_millis(200));
+        };
+        let Some(output) = self.outputs.first() else {
+            return Some(now + Duration::from_millis(200));
+        };
+        // Aguarda pelo menos 1 build da cena para enfileirar imagens e medir a caixa 3D.
+        if output.canvas.built_size == (0, 0) {
+            return Some(now + Duration::from_millis(50));
+        }
+        let renderer_ready = self
+            .renderer
+            .as_ref()
+            .is_some_and(|r| !r.has_pending_visual_assets());
+        let scene3d_ready = self.scene3d.as_ref().map_or(true, |s| {
+            !s.is_loading() && self.scene3d_bound_gen != SCENE3D_UNBOUND
+        });
+        if (!renderer_ready || !scene3d_ready) && now < deadline {
+            return Some((now + Duration::from_millis(100)).min(deadline));
+        }
+
+        self.pending_win_wallpaper = None;
+        let (w, h) = output.surface.size();
+        let logical = self.scene.as_ref().and_then(|s| s.logical_size);
+        let ui_scale = match logical {
+            Some([lw, lh]) if lw > 0.0 && lh > 0.0 => (w as f32 / lw).min(h as f32 / lh),
+            _ => output.scale,
+        };
+        let clear = self.clear_color;
+        let Some((sw, sh, rgb)) = self
+            .renderer
+            .as_mut()
+            .and_then(|r| r.render_clean_snapshot(gpu, (w, h), ui_scale, &self.ctx, clear))
+        else {
+            return None;
+        };
+        let Some(dir) = Self::state_dir() else {
+            return None;
+        };
+        self.win_wallpaper_slot = !self.win_wallpaper_slot;
+        let (cur_name, old_name) = if self.win_wallpaper_slot {
+            ("windows_wallpaper_a.png", "windows_wallpaper_b.png")
+        } else {
+            ("windows_wallpaper_b.png", "windows_wallpaper_a.png")
+        };
+        let target = dir.join(cur_name);
+        let old = dir.join(old_name);
+        let tmp = dir.join("windows_wallpaper.tmp.png");
+        let applied_flag = Arc::clone(&self.win_wallpaper_applied);
+        let proxy = self.proxy;
+        let _ = std::thread::Builder::new()
+            .name("prism-win-wallpaper".into())
+            .spawn(move || {
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(err) = image::save_buffer_with_format(
+                    &tmp,
+                    &rgb,
+                    sw,
+                    sh,
+                    image::ColorType::Rgb8,
+                    image::ImageFormat::Png,
+                ) {
+                    eprintln!("[prismview-engine] windows_wallpaper png: {err}");
+                    return;
+                }
+                let _ = std::fs::remove_file(&target);
+                if let Err(err) = std::fs::rename(&tmp, &target) {
+                    eprintln!("[prismview-engine] windows_wallpaper rename: {err}");
+                    let _ = std::fs::remove_file(&tmp);
+                    return;
+                }
+                match set_windows_desktop_wallpaper(&target) {
+                    Ok(()) => {
+                        applied_flag.store(true, std::sync::atomic::Ordering::Release);
+                        if let Some(p) = proxy {
+                            p.wake();
+                        }
+                    }
+                    Err(err) => eprintln!("[prismview-engine] {err}"),
+                }
+                let _ = std::fs::remove_file(&old);
+            });
+        None
     }
 
     /// Troca a cena ativa (IPC `LoadScene`/`LoadSceneFile`). Recarga imediata: o `SceneRenderer`
@@ -887,6 +1004,7 @@ impl NativeApp {
             renderer.clear_scene();
         }
         self.scene = None;
+        self.pending_win_wallpaper = None;
         self.wallpaper_wanted = false;
         self.outputs.clear();
         host.detach_all_wallpapers();
@@ -1410,8 +1528,11 @@ impl NativeApp {
 
     /// Solta superfícies (antes das janelas) e, se `with_gpu`, o device.
     fn release_gpu_resources(&mut self, with_gpu: bool) {
-        // Ordem: superfícies/canvases → renderer → device.
+        // Ordem: superfícies/canvases → caches de bind groups do vidro → renderer → device.
         self.outputs.clear();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.release_glass_gpu();
+        }
         if with_gpu {
             // Widgets (superfícies DComp + 3D próprio) caem antes do device; voltam de
             // `active_widgets.json` no próximo `rebuild_outputs`.
@@ -1717,9 +1838,19 @@ impl NativeApp {
                     power_state: self.governor.state().as_str().to_string(),
                 },
             },
-            IpcRequest::LoadScene { scene, .. } => self.load_scene(host, *scene),
-            IpcRequest::LoadSceneFile { path } => match Self::read_allowed_scene_file(&path) {
-                Ok(scene) => self.load_scene(host, scene),
+            IpcRequest::LoadScene { scene, .. } => {
+                let res = self.load_scene(host, *scene);
+                self.schedule_windows_wallpaper_sync();
+                res
+            }
+            IpcRequest::LoadSceneFile { path, sync_windows } => match Self::read_allowed_scene_file(&path) {
+                Ok(scene) => {
+                    let res = self.load_scene(host, scene);
+                    if sync_windows {
+                        self.schedule_windows_wallpaper_sync();
+                    }
+                    res
+                }
                 Err(message) => IpcResponse::Error { message },
             },
             IpcRequest::ClearDesktop { color } => {
@@ -1754,6 +1885,22 @@ impl NativeApp {
                 if let Some(dir) = Self::state_dir() {
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::fs::write(dir.join(TRAY_ENABLED_FILE), if visible { "1" } else { "0" });
+                }
+                IpcResponse::Ok
+            }
+            IpcRequest::SetSyncWindowsWallpaper { enabled } => {
+                self.sync_windows_wallpaper = enabled;
+                if let Some(dir) = Self::state_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(
+                        dir.join(SYNC_WINDOWS_WALLPAPER_FILE),
+                        if enabled { "1" } else { "0" },
+                    );
+                }
+                if enabled {
+                    self.schedule_windows_wallpaper_sync();
+                } else {
+                    self.pending_win_wallpaper = None;
                 }
                 IpcResponse::Ok
             }
@@ -1881,10 +2028,13 @@ impl LoopHandler for NativeApp {
             match req {
                 // Responde logo após validar/parsear: vídeo, imagens e 3D carregam depois sem
                 // segurar o Studio (antes: `engine_timeout` com a cena aparecendo segundos depois).
-                IpcRequest::LoadSceneFile { path } => match Self::read_allowed_scene_file(&path) {
+                IpcRequest::LoadSceneFile { path, sync_windows } => match Self::read_allowed_scene_file(&path) {
                     Ok(scene) => {
                         let _ = reply.send(IpcResponse::Ok);
                         self.load_scene(host, scene);
+                        if sync_windows {
+                            self.schedule_windows_wallpaper_sync();
+                        }
                     }
                     Err(message) => {
                         eprintln!("[prismview-engine] LOAD_SCENE_FILE: {message}");
@@ -1971,6 +2121,30 @@ impl LoopHandler for NativeApp {
         }
 
         let now = Instant::now();
+        if self
+            .win_wallpaper_applied
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if self.wallpaper_wanted {
+                // `SPI_SETDESKWALLPAPER` faz o Explorer reordenar/recriar o WorkerW acima da nossa
+                // janela viva: redescobre a camada, reanexa e reconstrói o alvo DirectComposition
+                // (GPU, 3D e vídeos permanecem vivos; sem flash preto pois o fundo já é a cena limpa).
+                let _ = host.reattach_wallpapers();
+                self.rebuild_outputs(host);
+                self.win_wallpaper_reattach_at = Some(now + Duration::from_millis(650));
+            }
+        }
+        if self.win_wallpaper_reattach_at.is_some_and(|at| now >= at) {
+            self.win_wallpaper_reattach_at = None;
+            if self.wallpaper_wanted {
+                if host.reattach_wallpapers() {
+                    self.rebuild_outputs(host);
+                } else {
+                    self.dirty = true;
+                    self.governor.invalidate_frozen();
+                }
+            }
+        }
         if self.rebuild_at.is_some_and(|at| now >= at) {
             self.rebuild_outputs(host);
         }
@@ -2032,7 +2206,6 @@ impl LoopHandler for NativeApp {
 
         // Teto de FPS / pausa / quadro congelado.
         let mut throttle_at = None;
-        let mut presented = false;
         let due = self.retry_at.map_or(true, |at| now >= at);
         let widgets_dirty = self.widgets.iter().any(|w| w.dirty);
         if (self.dirty && due) || widgets_dirty {
@@ -2048,7 +2221,6 @@ impl LoopHandler for NativeApp {
                         drew |= self.render_widgets(host, now);
                     }
                     if drew {
-                        presented = true;
                         // Ancora o FrameGate ao início do quadro (`now`), não após o bloqueio do
                         // VSync, garantindo 30 FPS reais em Eco e 15 FPS reais em Ultra.
                         self.governor.frame_presented(now);
@@ -2064,6 +2236,10 @@ impl LoopHandler for NativeApp {
             }
         }
 
+        // Se a opção "Atualizar wallpaper do Windows" estiver ligada, grava a versão limpa
+        // assim que os assets visuais (vídeo/imagens/3D) estiverem prontos na GPU.
+        let win_wp_at = self.maybe_sync_windows_wallpaper(now);
+
         let any_visible = self
             .outputs
             .iter()
@@ -2078,9 +2254,9 @@ impl LoopHandler for NativeApp {
         } else {
             None
         };
-        // Molas dos bindings ainda se movendo: no modo Normal (sem cap), usa `ControlFlow::Poll`
-        // ritmado nativamente pelo VSync (`PresentMode::Fifo`) sem dormir +16ms extras após o
-        // present (60/120/144/240 Hz lisos); quando assenta, volta a `ControlFlow::Wait` (0% CPU).
+        // Molas dos bindings ainda se movendo: usa `WaitUntil` na cadência alvo (nunca `Poll`,
+        // pois em swapchain DWM/flip-model o `present()` pode voltar em ~2 ms e girar a 300+ FPS).
+        // Se há 3D ativo, alinha à cadência do 3D (ex.: 60 FPS); em cenas puramente 2D, 16 ms (~60 FPS).
         let bindings_moving = animate
             && any_visible
             && self
@@ -2088,36 +2264,14 @@ impl LoopHandler for NativeApp {
                 .as_ref()
                 .is_some_and(SceneRenderer::bindings_animating);
         let frame_interval = self.governor.frame_interval();
-        let mut binding_poll = false;
-        let binding_at = if bindings_moving {
-            if frame_interval.is_zero() {
-                if presented {
-                    if Instant::now().saturating_duration_since(now) < VSYNC_PRESENT_MIN {
-                        self.fast_present_streak = self.fast_present_streak.saturating_add(1);
-                    } else {
-                        self.fast_present_streak = 0;
-                    }
-                    if self.fast_present_streak <= MAX_FAST_PRESENT_STREAK
-                        && self.retry_at.is_none()
-                        && self.rebuild_at.is_none()
-                        && throttle_at.is_none()
-                    {
-                        binding_poll = true;
-                        None
-                    } else {
-                        Some(now + FAST_PRESENT_FALLBACK)
-                    }
-                } else {
-                    Some(now + FAST_PRESENT_FALLBACK)
-                }
-            } else {
-                self.fast_present_streak = 0;
-                Some(now + frame_interval)
-            }
-        } else {
-            self.fast_present_streak = 0;
-            None
-        };
+        let binding_cadence = self
+            .scene3d
+            .as_ref()
+            .and_then(Scene3dRenderer::frame_interval)
+            .unwrap_or(Duration::from_millis(16))
+            .max(frame_interval)
+            .max(Duration::from_millis(16));
+        let binding_at = bindings_moving.then(|| now + binding_cadence);
         let governor_at = self.governor.next_deadline(now);
         // Caixa 3D recém-construída por este render e 3D ainda sem quadro: volta já.
         let scene3d_at = scene3d_at.or_else(|| {
@@ -2159,8 +2313,7 @@ impl LoopHandler for NativeApp {
         // `MOUSE` (mouses 500-1000 Hz não acordam o loop 1000×/s entre quadros de 60 FPS). O
         // cursor exato continua sendo lido em `process_signals` no instante de cada quadro; ao
         // assentar, `MOUSE` volta imediatamente para `wake_mask` (0% CPU em repouso, <0,1ms wake).
-        let frame_scheduled = binding_poll
-            || scene3d_at.is_some()
+        let frame_scheduled = scene3d_at.is_some()
             || binding_at.is_some()
             || throttle_at.is_some()
             || widget3d_at.is_some();
@@ -2177,9 +2330,6 @@ impl LoopHandler for NativeApp {
                 }
             }
         }
-        if binding_poll {
-            return ControlFlow::Poll;
-        }
         let next = [
             self.retry_at,
             self.rebuild_at,
@@ -2190,6 +2340,8 @@ impl LoopHandler for NativeApp {
             scene3d_at,
             video_at,
             widget_at,
+            win_wp_at,
+            self.win_wallpaper_reattach_at,
             mouse_race_wake,
         ]
         .into_iter()

@@ -13,6 +13,7 @@
 //! `unwrap/expect`; nenhum código de SO.
 
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -717,6 +718,69 @@ impl Compositor2D {
         self.draw_with(canvas, &mut pass, on_marker);
     }
 
+    /// Renderiza um intervalo de batches (`range`) em `view`, limpando com `clear` (ou mantendo
+    /// o conteúdo anterior com `LoadOp::Load` quando `clear` é `None`). Usado tanto no passe final
+    /// quanto na captura progressiva de múltiplos estágios de vidro intercalados com 3D/vídeo.
+    pub fn render_range_with<F>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: Option<[f32; 4]>,
+        canvas: &Canvas,
+        range: std::ops::Range<usize>,
+        mut on_marker: F,
+    ) where
+        F: FnMut(&mut wgpu::RenderPass<'_>, u32),
+    {
+        let load = match clear {
+            Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(c[0]),
+                g: f64::from(c[1]),
+                b: f64::from(c[2]),
+                a: f64::from(c[3]),
+            }),
+            None => wgpu::LoadOp::Load,
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("prismview_c2d_range_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        let end = range.end.min(canvas.batches.len());
+        let start = range.start.min(end);
+        if start >= end {
+            return;
+        }
+        pass.set_bind_group(0, &canvas.bind_group, &[]);
+        let mut current: Option<BlendKind> = None;
+        for batch in &canvas.batches[start..end] {
+            if batch.marker != NO_MARKER {
+                on_marker(&mut pass, batch.marker);
+                pass.set_bind_group(0, &canvas.bind_group, &[]);
+                current = None;
+                continue;
+            }
+            if current != Some(batch.blend) {
+                pass.set_pipeline(&self.pipelines[batch.blend as usize]);
+                current = Some(batch.blend);
+            }
+            let Some(group) = self.entry(batch.tex).and_then(|t| t.bind_group.as_ref()) else {
+                continue;
+            };
+            pass.set_bind_group(1, group, &[]);
+            pass.draw(0..4, batch.start..batch.end);
+        }
+    }
+
     /// Renderiza em `view` tudo que aparece **antes do primeiro marcador** (fundo, gradientes,
     /// imagem, vídeo, cena 3D e camadas abaixo do vidro) para servir de backdrop composto real
     /// do vidro óptico (sempre opaco e 1:1 com a viewport).
@@ -839,11 +903,26 @@ impl Scene3dPlacement {
     }
 }
 
+/// Contador global monotônico de versões de `BackdropTarget`: garante que nenhum `Canvas` novo
+/// (ex.: após `rebuild_outputs`, segundo monitor ou `render_clean_snapshot`) reutilize o mesmo
+/// `version` de um `BackdropTarget` anterior no cache de bind groups do `GlassRenderer`/`BlurPyramid`.
+static NEXT_BACKDROP_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// Estágio contíguo de marcadores de vidro em `Canvas::batches` (pré-calculado em `Canvas::flush`).
+/// Cenas com vidro antes e depois de 3D/vídeo/texto (ex.: texto de vidro atrás do 3D + relógio de
+/// vidro na frente do 3D) geram ≥2 estágios, permitindo captura progressiva do backdrop sem alocar.
+#[derive(Clone, Debug)]
+pub struct GlassStage {
+    pub pre_batches: std::ops::Range<usize>,
+    pub marker_batches: std::ops::Range<usize>,
+    pub markers: std::ops::Range<usize>,
+}
+
 /// Textura offscreen que captura o fundo composto (gradiente + imagem + vídeo + cena 3D) logo
-/// abaixo do primeiro vidro óptico desta saída. Só é alocada quando a cena contém vidro.
+/// abaixo do vidro óptico desta saída. Só é alocada quando a cena contém vidro.
 pub struct BackdropTarget {
     pub size: (u32, u32),
-    pub _texture: wgpu::Texture,
+    pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub version: u64,
 }
@@ -865,13 +944,18 @@ pub struct Canvas {
     pub built_scale: f32,
     /// Vidros ópticos desta saída (cada um é um marcador na ordem Z; ver `core::glass`).
     pub glass: Option<GlassLayer>,
-    /// Backdrop composto capturado abaixo do primeiro vidro desta saída (sob demanda).
+    /// Backdrop composto capturado abaixo do vidro desta saída (sob demanda).
     pub backdrop: Option<BackdropTarget>,
+    /// Cópia de leitura do backdrop para cenas com múltiplos estágios de vidro intercalados.
+    pub backdrop_snap: Option<BackdropTarget>,
+    /// Estágios contíguos de vidro pré-calculados em `flush` (0 alocação por frame).
+    pub glass_stages: Vec<GlassStage>,
+    pub stage_markers: Vec<u32>,
+    pub post_glass_batches: std::ops::Range<usize>,
     /// Contador do conteúdo do backdrop composto (cache do `BlurPyramid`).
     pub backdrop_token: u64,
     /// Último `live_token` já capturado em `backdrop`.
     pub last_live_token: u64,
-    backdrop_version_seq: u64,
     /// Regiões tocáveis (controles de mídia) desta saída, refeitas junto com a lista.
     pub hits: super::interaction::HitMap,
     /// Camada 3D desenhada nesta saída (a primeira visível da cena), se houver.
@@ -943,9 +1027,12 @@ impl Canvas {
             built_scale: 0.0,
             glass: None,
             backdrop: None,
+            backdrop_snap: None,
+            glass_stages: Vec::new(),
+            stage_markers: Vec::new(),
+            post_glass_batches: 0..0,
             backdrop_token: 0,
             last_live_token: u64::MAX,
-            backdrop_version_seq: 1,
             hits: super::interaction::HitMap::default(),
             scene3d: None,
             bound: Vec::new(),
@@ -981,15 +1068,54 @@ impl Canvas {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let version = self.backdrop_version_seq;
-        self.backdrop_version_seq = self.backdrop_version_seq.wrapping_add(1).max(1);
+        let version = NEXT_BACKDROP_VERSION.fetch_add(1, Ordering::Relaxed);
         self.backdrop = Some(BackdropTarget {
             size,
-            _texture: texture,
+            texture,
+            view,
+            version,
+        });
+        true
+    }
+
+    /// Aloca sob demanda a cópia de leitura do backdrop para cenas com ≥2 estágios de vidro
+    /// separados por 3D/vídeo/imagem/texto.
+    pub fn ensure_backdrop_snap(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.backdrop_snap.as_ref().is_some_and(|b| b.size == size) {
+            return false;
+        }
+        self.backdrop_snap = None;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_glass_backdrop_snap"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let version = NEXT_BACKDROP_VERSION.fetch_add(1, Ordering::Relaxed);
+        self.backdrop_snap = Some(BackdropTarget {
+            size,
+            texture,
             view,
             version,
         });
@@ -998,6 +1124,7 @@ impl Canvas {
 
     pub fn release_backdrop(&mut self) {
         self.backdrop = None;
+        self.backdrop_snap = None;
     }
 
     /// Próximo `seq` (início/fim do intervalo de uma subárvore).
@@ -1183,6 +1310,36 @@ impl Canvas {
                     marker: NO_MARKER,
                 }),
             }
+        }
+
+        self.glass_stages.clear();
+        self.stage_markers.clear();
+        let mut cursor = 0usize;
+        let total = self.batches.len();
+        while cursor < total {
+            let pre_start = cursor;
+            while cursor < total && self.batches[cursor].marker == NO_MARKER {
+                cursor += 1;
+            }
+            let pre_end = cursor;
+            if cursor >= total {
+                self.post_glass_batches = pre_start..pre_end;
+                break;
+            }
+            let mk_batch_start = cursor;
+            let mk_idx_start = self.stage_markers.len();
+            while cursor < total && self.batches[cursor].marker != NO_MARKER {
+                self.stage_markers.push(self.batches[cursor].marker);
+                cursor += 1;
+            }
+            let mk_batch_end = cursor;
+            let mk_idx_end = self.stage_markers.len();
+            self.glass_stages.push(GlassStage {
+                pre_batches: pre_start..pre_end,
+                marker_batches: mk_batch_start..mk_batch_end,
+                markers: mk_idx_start..mk_idx_end,
+            });
+            self.post_glass_batches = cursor..total;
         }
 
         if self.gpu_instances.len() > self.capacity {

@@ -401,7 +401,8 @@ impl Scene3dRenderer {
             let variant = ShowcaseVariant::parse(obj.showcase_variant.as_deref());
             let asset = build_showcase_asset(variant);
             let model = self.shared.model(gpu, &asset);
-            let instance = ModelInstance::new(gpu.device(), &self.shared.deform, model, &obj.playback);
+            // Esculturas SHOWCASE no Estúdio (Three.js) são montadas em escala natural (sem normalizar para 2,4).
+            let instance = ModelInstance::new(gpu.device(), &self.shared.deform, model, &obj.playback, false);
             return ObjectSlot {
                 id: obj.id.clone(),
                 src: variant.key().to_owned(),
@@ -463,7 +464,7 @@ impl Scene3dRenderer {
                         continue;
                     };
                     let model = shared.model(gpu, asset);
-                    slot.instance = Some(ModelInstance::new(gpu.device(), &shared.deform, model, &obj.playback));
+                    slot.instance = Some(ModelInstance::new(gpu.device(), &shared.deform, model, &obj.playback, true));
                     slot.ticket = None;
                     slot.error = None;
                     rebuild_slot_overrides(

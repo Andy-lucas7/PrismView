@@ -332,6 +332,7 @@ impl Frame<'_> {
                 TextAlign::Center => TextAlignment::Center,
                 TextAlign::End => TextAlignment::End,
             },
+            max_width_px: (layer.text.max_width_px.max(0.0)) * self.ui,
         };
         let layout = self.text.update(self.device, self.scratch.as_str(), &spec);
 

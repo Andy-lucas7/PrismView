@@ -55,7 +55,7 @@ pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;
 pub use sensors::{SensorsConfig, Win32SystemSensors};
-pub use shell::{acquire_single_instance, open_studio, shell_open};
+pub use shell::{acquire_single_instance, open_studio, set_windows_desktop_wallpaper, shell_open};
 pub use tray::{parse_tray_enabled, TrayAction};
 #[allow(unused_imports)]
 pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
@@ -478,9 +478,20 @@ impl Win32DesktopHost {
         }
     }
 
+    /// Redescobre a camada WorkerW/Progman e reanexa/reordena todas as superfícies de wallpaper
+    /// (ex.: logo após `SPI_SETDESKWALLPAPER`, quando o Explorer traz o WorkerW estático para cima).
+    /// Retorna `true` se a camada do desktop ou algum HWND mudou (exigindo recriar superfícies GPU).
+    pub fn reattach_wallpapers(&mut self) -> bool {
+        self.reattach_after_shell_change_inner(false)
+    }
+
     /// Explorer reiniciou ou destruiu nossas janelas: redescobre a camada, recria as
     /// superfícies próprias perdidas e reanexa tudo. Emite `ShellRestarted` se algo mudou.
     fn reattach_after_shell_change(&mut self) {
+        let _ = self.reattach_after_shell_change_inner(true);
+    }
+
+    fn reattach_after_shell_change_inner(&mut self, emit_event: bool) -> bool {
         let layer = match workerw::discover(self.config.shell_message_timeout_ms) {
             Ok(layer) => layer,
             Err(_) => {
@@ -488,7 +499,7 @@ impl Win32DesktopHost {
                     self.shell_retries += 1;
                     signals::schedule_ms(TIMER_SHELL, SHELL_RETRY_INTERVAL_MS);
                 }
-                return;
+                return false;
             }
         };
         self.shell_retries = 0;
@@ -519,9 +530,13 @@ impl Win32DesktopHost {
         }
         self.attachments.retain(|a| unsafe { IsWindow(a.hwnd) }.as_bool());
 
-        if changed {
+        if !self.attachments.is_empty() {
+            signals::raise(signals::SIG_REPAINT);
+        }
+        if emit_event && changed {
             self.pending.push(DesktopEvent::ShellRestarted);
         }
+        changed
     }
 
     fn evaluate_visibility(&mut self, emit: bool) {

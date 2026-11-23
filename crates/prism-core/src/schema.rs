@@ -402,6 +402,9 @@ pub struct TextContent {
     pub axes: BTreeMap<String, f32>,
     #[serde(default)]
     pub stem_stretch: StemStretchParams,
+    /// Largura máxima da caixa de texto em px lógicos (0 = largura automática sem quebra).
+    #[serde(default)]
+    pub max_width_px: f32,
 }
 
 fn default_clock_text() -> String {
@@ -430,6 +433,7 @@ impl Default for TextContent {
             align: TextAlign::Center,
             axes: BTreeMap::new(),
             stem_stretch: StemStretchParams::default(),
+            max_width_px: 0.0,
         }
     }
 }
@@ -1243,10 +1247,19 @@ pub enum IpcRequest {
     /// é o mesmo arquivo que o motor relê ao iniciar sem o Studio.
     LoadSceneFile {
         path: String,
+        /// `true` em aplicações explícitas ("Aplicar no Desktop") para atualizar o wallpaper do Windows
+        /// se a preferência do usuário estiver ligada; `false` em autosave/arraste de slider.
+        #[serde(default)]
+        sync_windows: bool,
     },
     /// Etapa 6: mostra ou oculta o ícone da engine na bandeja do sistema em tempo real.
     SetTrayVisible {
         visible: bool,
+    },
+    /// Atualiza o papel de parede real do Windows (`SPI_SETDESKWALLPAPER`) com uma imagem limpa
+    /// (sem relógio/telemetria/mídia) toda vez que um wallpaper for aplicado.
+    SetSyncWindowsWallpaper {
+        enabled: bool,
     },
     /// Entrega 3: remove só o wallpaper (janelas WorkerW + `active_scene.json`); widgets nativos
     /// continuam no ar. O motor sai sozinho se não sobrar nada para desenhar.

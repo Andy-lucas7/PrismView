@@ -367,6 +367,8 @@ export interface SceneLayer {
     colorAlpha?: number;
     stemStretch: number;
     shadowBlur: number;
+    /** Largura máxima da caixa de texto em px lógicos (undefined/0 = largura automática sem quebrar linha) */
+    maxWidth?: number;
   };
   progress?: {
     source: "MEDIA" | "CPU" | "RAM" | "BATTERY";

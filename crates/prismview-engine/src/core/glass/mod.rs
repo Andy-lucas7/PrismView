@@ -551,6 +551,53 @@ impl GlassRenderer {
         queue.write_buffer(&layer.globals, 0, bytemuck::bytes_of(&globals));
     }
 
+    /// Inicia um frame de preparação de vidros (zera o anel de uniforms 1× por encoder).
+    pub fn begin_prepare(&mut self) {
+        self.ring.reset();
+        self.blur.begin_frame();
+        if self.groups_epoch != self.blur.epoch {
+            self.groups.clear();
+            self.groups_epoch = self.blur.epoch;
+        }
+    }
+
+    /// Encerra o frame de preparação de vidros (varre mapas de glifo não usados).
+    pub fn finish_prepare(&mut self) {
+        self.glyphs.sweep();
+    }
+
+    /// Prepara apenas os vidros indicados em `markers` contra o `backdrop` atual. Permite múltiplas
+    /// etapas progressivas no mesmo `CommandEncoder` (ex.: Vidro A → 3D → Vidro B).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_markers<'v, B, M>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &mut GlassLayer,
+        markers: &[u32],
+        frame_token: u64,
+        backdrop: B,
+        mask: M,
+    ) where
+        B: Fn(TextureId) -> Option<(&'v wgpu::TextureView, u64)>,
+        M: Fn(&str) -> Option<&'v wgpu::TextureView>,
+    {
+        self.blur.begin_frame();
+        if self.groups_epoch != self.blur.epoch {
+            self.groups.clear();
+            self.groups_epoch = self.blur.epoch;
+        }
+
+        for &marker in markers {
+            let index = marker as usize;
+            if index >= layer.draws.len() {
+                continue;
+            }
+            self.prepare_one(device, queue, encoder, layer, index, frame_token, &backdrop, &mask);
+        }
+    }
+
     /// Roda o que falta de GPU para os vidros de `layer` neste frame: pirâmide de blur (cache por
     /// hash + `frame_token`) e mapas de glifo. Chamar com o `CommandEncoder` do frame, **antes** de
     /// abrir o passe de render.
@@ -572,125 +619,136 @@ impl GlassRenderer {
         B: Fn(TextureId) -> Option<(&'v wgpu::TextureView, u64)>,
         M: Fn(&str) -> Option<&'v wgpu::TextureView>,
     {
-        self.ring.reset();
-        self.blur.begin_frame();
-        if self.groups_epoch != self.blur.epoch {
-            self.groups.clear();
-            self.groups_epoch = self.blur.epoch;
-        }
-
+        self.begin_prepare();
         for index in 0..layer.draws.len() {
-            let draw = &layer.draws[index];
-            layer.groups[index] = None;
+            self.prepare_one(device, queue, encoder, layer, index, frame_token, &backdrop, &mask);
+        }
+        self.finish_prepare();
+    }
 
-            let Some((sharp, version)) = backdrop(draw.backdrop.texture) else {
-                continue;
-            };
-            let tex_raw = draw.backdrop.texture.raw();
-            let source_id = hash_combine(u64::from(tex_raw), version);
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_one<'v, B, M>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: &mut GlassLayer,
+        index: usize,
+        frame_token: u64,
+        backdrop: &B,
+        mask: &M,
+    ) where
+        B: Fn(TextureId) -> Option<(&'v wgpu::TextureView, u64)>,
+        M: Fn(&str) -> Option<&'v wgpu::TextureView>,
+    {
+        let draw = &layer.draws[index];
+        layer.groups[index] = None;
 
-            // Blur (px de tela → px da fonte).
-            let mut blur_handle = None;
-            if self.blur_enabled && draw.params.blur_px > MIN_BLUR_PX {
-                let token = if draw.backdrop.live { frame_token } else { 0 };
-                blur_handle = self.blur.blur(
-                    device,
-                    queue,
-                    encoder,
-                    &mut self.ring,
-                    &mut self.stats,
-                    BlurSource {
-                        view: sharp,
-                        id: source_id,
-                        width: draw.backdrop.size.0,
-                        height: draw.backdrop.size.1,
-                    },
-                    BlurRequest {
-                        content_hash: draw.backdrop.content_hash,
-                        frame_token: token,
-                        blur_px: (draw.params.blur_px * draw.backdrop.src_per_screen_px).max(0.5),
-                        opaque: draw.backdrop.opaque,
-                    },
-                );
-            }
+        let Some((sharp, version)) = backdrop(draw.backdrop.texture) else {
+            return;
+        };
+        let tex_raw = draw.backdrop.texture.raw();
+        let source_id = hash_combine(u64::from(tex_raw), version);
 
-            // Mapa de normais do glifo.
-            let mut glyph_uid = 0u64;
-            if draw.mode == GlassMode::Glyph {
-                let Some(source) = draw.glyph.as_ref() else {
-                    continue;
-                };
-                let Some(mask_view) = mask(&source.key) else {
-                    continue;
-                };
-                if !self.glyphs.ensure(
-                    device,
-                    queue,
-                    encoder,
-                    &mut self.ring,
-                    &mut self.stats,
-                    source,
-                    mask_view,
-                ) {
-                    continue;
-                }
-                let Some((uid, _)) = self.glyphs.view(&source.key) else {
-                    continue;
-                };
-                glyph_uid = uid;
-            }
-
-            let blur_key = match (blur_handle, self.blur.targets.as_ref()) {
-                (Some(h), Some(_)) => (u64::from(self.blur.epoch) << 8) | (h.slot as u64 + 1),
-                _ => 0,
-            };
-            let key = GroupKey {
-                tex_raw,
-                tex_version: version,
-                blur: blur_key,
-                glyph: glyph_uid,
-            };
-            if !self.groups.contains_key(&key) {
-                if self.groups.len() >= GROUP_CACHE_LIMIT {
-                    self.groups.clear();
-                }
-                let blur_view = blur_handle.and_then(|h| self.blur.view(h)).unwrap_or(sharp);
-                let glyph_view = if glyph_uid != 0 {
-                    draw.glyph
-                        .as_ref()
-                        .and_then(|g| self.glyphs.view(&g.key))
-                        .map_or(sharp, |(_, v)| v)
-                } else {
-                    sharp
-                };
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("prismview_glass_textures"),
-                    layout: &self.tex_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(sharp),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(blur_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(glyph_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                    ],
-                });
-                self.groups.insert(key, group);
-            }
-            layer.groups[index] = Some(key);
+        // Blur (px de tela → px da fonte).
+        let mut blur_handle = None;
+        if self.blur_enabled && draw.params.blur_px > MIN_BLUR_PX {
+            let token = if draw.backdrop.live { frame_token } else { 0 };
+            blur_handle = self.blur.blur(
+                device,
+                queue,
+                encoder,
+                &mut self.ring,
+                &mut self.stats,
+                BlurSource {
+                    view: sharp,
+                    id: source_id,
+                    width: draw.backdrop.size.0,
+                    height: draw.backdrop.size.1,
+                },
+                BlurRequest {
+                    content_hash: draw.backdrop.content_hash,
+                    frame_token: token,
+                    blur_px: (draw.params.blur_px * draw.backdrop.src_per_screen_px).max(0.5),
+                    opaque: draw.backdrop.opaque,
+                },
+            );
         }
 
-        self.glyphs.sweep();
+        // Mapa de normais do glifo.
+        let mut glyph_uid = 0u64;
+        if draw.mode == GlassMode::Glyph {
+            let Some(source) = draw.glyph.as_ref() else {
+                return;
+            };
+            let Some(mask_view) = mask(&source.key) else {
+                return;
+            };
+            if !self.glyphs.ensure(
+                device,
+                queue,
+                encoder,
+                &mut self.ring,
+                &mut self.stats,
+                source,
+                mask_view,
+            ) {
+                return;
+            }
+            let Some((uid, _)) = self.glyphs.view(&source.key) else {
+                return;
+            };
+            glyph_uid = uid;
+        }
+
+        let blur_key = match (blur_handle, self.blur.targets.as_ref()) {
+            (Some(h), Some(_)) => (u64::from(self.blur.epoch) << 8) | (h.slot as u64 + 1),
+            _ => 0,
+        };
+        let key = GroupKey {
+            tex_raw,
+            tex_version: version,
+            blur: blur_key,
+            glyph: glyph_uid,
+        };
+        if !self.groups.contains_key(&key) {
+            if self.groups.len() >= GROUP_CACHE_LIMIT {
+                self.groups.clear();
+            }
+            let blur_view = blur_handle.and_then(|h| self.blur.view(h)).unwrap_or(sharp);
+            let glyph_view = if glyph_uid != 0 {
+                draw.glyph
+                    .as_ref()
+                    .and_then(|g| self.glyphs.view(&g.key))
+                    .map_or(sharp, |(_, v)| v)
+            } else {
+                sharp
+            };
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("prismview_glass_textures"),
+                layout: &self.tex_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(sharp),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(blur_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(glyph_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.groups.insert(key, group);
+        }
+        layer.groups[index] = Some(key);
     }
 
     /// Desenha o vidro `marker` dentro do passe de render do compositor.

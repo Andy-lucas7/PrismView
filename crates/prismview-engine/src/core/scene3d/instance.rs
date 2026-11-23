@@ -175,7 +175,13 @@ pub struct ModelInstance {
 }
 
 impl ModelInstance {
-    pub fn new(device: &wgpu::Device, kernel: &DeformKernel, model: Arc<GpuModel>, playback: &Scene3dPlayback) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        kernel: &DeformKernel,
+        model: Arc<GpuModel>,
+        playback: &Scene3dPlayback,
+        normalize_bounds: bool,
+    ) -> Self {
         let rig = &model.rig;
         let pose = rig.rest_pose.clone();
         let node_count = pose.node_count();
@@ -253,9 +259,9 @@ impl ModelInstance {
             Self::create_deform(device, kernel, &model, &job_data, out_vertices, joint_total, pose.weights.len())
         });
 
-        // ── Normalização (Box3 do modelo → 2,4 no maior eixo, centrado) ──
+        // ── Normalização (Box3 de modelos GLB → 2,4 no maior eixo, centrado; SHOWCASE fica 1:1) ──
         let bounds = rig.bounds;
-        let normalize = if bounds.is_empty() {
+        let normalize = if !normalize_bounds || bounds.is_empty() {
             Mat4::IDENTITY
         } else {
             let size = bounds.max - bounds.min;

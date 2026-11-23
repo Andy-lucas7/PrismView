@@ -33,6 +33,8 @@ const WIDGET_SCENES_DIR: &str = "widgets";
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
 /// Preferência de exibição da engine na bandeja do sistema (`"1"` / `"0"`, padrão: `"1"`).
 const TRAY_ENABLED_FILE: &str = "tray_enabled.txt";
+/// Sincronizar papel de parede real do Windows (imagem limpa sem HUD) ao aplicar (`"1"` / `"0"`, padrão: `"0"`).
+const SYNC_WINDOWS_WALLPAPER_FILE: &str = "sync_windows_wallpaper.txt";
 /// Marcador: o usuário desligou o início com o Windows (não reativar sozinho no "Aplicar").
 const AUTOSTART_OPT_OUT_FILE: &str = "autostart_disabled";
 /// Valor em `HKCU\...\Run` que sobe o motor no login.
@@ -329,6 +331,32 @@ pub fn set_tray_visible(visible: bool) -> Result<bool, String> {
     Ok(visible)
 }
 
+/// Lê a preferência persistida de atualizar o papel de parede real do Windows (padrão: `false`).
+pub fn sync_windows_wallpaper_enabled() -> bool {
+    let Ok(dir) = state_dir() else {
+        return false;
+    };
+    match fs::read_to_string(dir.join(SYNC_WINDOWS_WALLPAPER_FILE)) {
+        Ok(raw) => {
+            let t = raw.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Persiste a preferência de atualizar o papel de parede real do Windows e notifica a engine via IPC.
+pub fn save_sync_windows_wallpaper(enabled: bool) -> Result<bool, String> {
+    let path = state_dir()?.join(SYNC_WINDOWS_WALLPAPER_FILE);
+    crate::atomic_fs::write_atomic(&path, if enabled { b"1" } else { b"0" }, false)
+        .map_err(|e| format!("sync_windows_wallpaper_write: {e}"))?;
+    let _ = pipe_try_once(&json!({
+        "cmd": "SET_SYNC_WINDOWS_WALLPAPER",
+        "enabled": enabled,
+    }));
+    Ok(enabled)
+}
+
 /// Agenda a atualização do `.prism` em `packages/` numa única thread em background (coalescida:
 /// aplicações rápidas em sequência só compactam o estado mais recente, sem bloquear o "Aplicar").
 fn schedule_background_archive(engine: &SharedEngine, project: Value) {
@@ -407,6 +435,7 @@ impl NativeEngine {
         pipe_request(&json!({
             "cmd": "LOAD_SCENE_FILE",
             "path": final_path.to_string_lossy(),
+            "sync_windows": archive,
         }))?;
         drop(_guard);
         // 4) Atualiza o `.prism` otimizado em `packages/` fora do caminho crítico.
@@ -717,6 +746,20 @@ pub async fn native_engine_set_power(
     preference: String,
 ) -> Result<Value, String> {
     blocking(&engine, move |e| e.set_power(&preference)).await
+}
+
+/// Lê se o PrismView atualiza o papel de parede estático do Windows ao aplicar uma cena.
+#[tauri::command]
+pub fn get_sync_windows_wallpaper() -> Result<bool, String> {
+    Ok(sync_windows_wallpaper_enabled())
+}
+
+/// Ativa/desativa a sincronização do papel de parede real do Windows (snapshot limpo sem HUD).
+#[tauri::command]
+pub async fn set_sync_windows_wallpaper(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || save_sync_windows_wallpaper(enabled))
+        .await
+        .map_err(|e| format!("sync_windows_wallpaper_task: {e}"))?
 }
 
 #[cfg(test)]

@@ -24,6 +24,14 @@ import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3D
 
 import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, snapCoordinate, supportsCorsUrl } from "./UnifiedCompositorParts";
 
+export type LayerResizePatch = {
+  width?: number;
+  height?: number;
+  fontSize?: number;
+  /** `null` volta para largura automática (sem quebra de linha) */
+  textMaxWidth?: number | null;
+};
+
 export interface UnifiedCompositorProps {
   project: PrismProject;
   telemetry: LiveTelemetry;
@@ -45,7 +53,7 @@ export interface UnifiedCompositorProps {
   ) => void;
   onMoveLayer?: (id: string, x: number, y: number) => void;
   onMoveLayers?: (moves: Array<{ id: string; x: number; y: number }>) => void;
-  onResizeLayer?: (id: string, width: number, height: number, isText: boolean) => void;
+  onResizeLayer?: (id: string, patch: LayerResizePatch) => void;
   onDragStateChange?: (dragging: boolean) => void;
   onInspectScene3D?: (layerId: string, info: Scene3DInspectInfo) => void;
   onHoverMesh3D?: (meshName: string | null) => void;
@@ -148,6 +156,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
 
   const dragRef = useRef<{
     mode: "MOVE" | "RESIZE";
+    resizeHandle?: "nw" | "ne" | "sw" | "se" | "w" | "e" | "n" | "s";
     id: string;
     isText: boolean;
     isTopLevel: boolean;
@@ -159,6 +168,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     startY: number;
     startW: number;
     startH: number;
+    /** Texto: fontSize inicial (px lógicos), maxWidth inicial (0 = auto) e largura renderizada inicial (px lógicos). */
+    startFont?: number;
+    startTextMaxW?: number;
+    startBoxW?: number;
+    startBoxH?: number;
+    naturalTextW?: number;
     halfW: number;
     halfH: number;
     snapTargetsX: number[];
@@ -172,6 +187,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     clientX: number;
     clientY: number;
     altKey: boolean;
+    shiftKey: boolean;
   } | null>(null);
 
   useEffect(() => {
@@ -406,15 +422,61 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         );
       }
     } else if (drag.mode === "RESIZE" && onResizeLayer) {
+      const handle = drag.resizeHandle ?? "se";
       const dxLog = (pending.clientX - drag.startClientX) / Math.max(scale, 0.05);
       const dyLog = (pending.clientY - drag.startClientY) / Math.max(scale, 0.05);
+      const signX = handle.includes("e") ? 1 : handle.includes("w") ? -1 : 0;
+      const signY = handle.includes("s") ? 1 : handle.includes("n") ? -1 : 0;
+
       if (drag.isText) {
-        const nextFont = Math.max(12, Math.min(340, Math.round(drag.startW + dxLog)));
-        onResizeLayer(drag.id, nextFont, nextFont, true);
+        const startFont = drag.startFont ?? drag.startW;
+        const startBoxW = Math.max(40, drag.startBoxW ?? 320);
+        const startBoxH = Math.max(24, drag.startBoxH ?? startFont * 1.1);
+        const startMaxW = drag.startTextMaxW ?? 0;
+
+        if (handle === "e" || handle === "w") {
+          // Alças laterais (estilo Canva): mudam APENAS a largura da caixa (quebra de linha), sem alterar a fonte.
+          const rawW = Math.max(60, Math.min(2400, Math.round(startBoxW + signX * dxLog * 2)));
+          const natW = drag.naturalTextW ?? 0;
+          // Se puxou além da largura natural em 1 linha, destrava de volta para auto-width (1 linha limpa).
+          if (natW > 0 && rawW >= natW + 12) {
+            onResizeLayer(drag.id, { textMaxWidth: null });
+          } else {
+            onResizeLayer(drag.id, { textMaxWidth: rawW });
+          }
+        } else {
+          // Alças de canto (estilo Canva): escalam proporcionalmente fonte + largura da caixa mantendo as mesmas quebras!
+          const diag = Math.hypot(startBoxW, startBoxH);
+          const proj = (signX * dxLog * 2 * startBoxW + signY * dyLog * 2 * startBoxH) / Math.max(diag, 1);
+          const ratio = Math.max(0.15, (diag + proj) / Math.max(diag, 1));
+          const nextFont = Math.max(10, Math.min(340, Math.round(startFont * ratio)));
+          if (startMaxW > 0) {
+            const actualRatio = nextFont / Math.max(startFont, 1);
+            const nextMaxW = Math.max(60, Math.min(2400, Math.round(startMaxW * actualRatio)));
+            onResizeLayer(drag.id, { fontSize: nextFont, textMaxWidth: nextMaxW });
+          } else {
+            onResizeLayer(drag.id, { fontSize: nextFont });
+          }
+        }
+      } else if (handle === "e" || handle === "w") {
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
+        onResizeLayer(drag.id, { width: nw });
+      } else if (handle === "n" || handle === "s") {
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
+        onResizeLayer(drag.id, { height: nh });
+      } else if (pending.shiftKey) {
+        // Shift no canto = redimensionamento livre nos dois eixos.
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
+        onResizeLayer(drag.id, { width: nw, height: nh });
       } else {
-        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + dxLog * 2)));
-        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + dyLog * 2)));
-        onResizeLayer(drag.id, nw, nh, false);
+        // Canto (estilo Canva): mantém a proporção exata da caixa.
+        const diag = Math.hypot(drag.startW, drag.startH);
+        const proj = (signX * dxLog * 2 * drag.startW + signY * dyLog * 2 * drag.startH) / Math.max(diag, 1);
+        const ratio = Math.max(0.1, (diag + proj) / Math.max(diag, 1));
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW * ratio)));
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH * ratio)));
+        onResizeLayer(drag.id, { width: nw, height: nh });
       }
     }
   };
@@ -438,6 +500,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       clientX: e.clientX,
       clientY: e.clientY,
       altKey: e.altKey,
+      shiftKey: e.shiftKey,
     };
     if (dragMoveRafRef.current === null) {
       dragMoveRafRef.current = requestAnimationFrame(() => {
@@ -1194,6 +1257,9 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           const fontStack = `"${safeFamily}", "Outfit", "Inter", "Segoe UI", sans-serif`;
           const textMode = g.textMode ?? "GLYPH";
 
+          const textMaxWLog = layer.text.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : 0;
+          const textMaxWPx = textMaxWLog > 0 ? textMaxWLog * containerScale : 0;
+
           const baseTextStyle: React.CSSProperties = {
             fontFamily: fontStack,
             fontSize: `${scaledFont}px`,
@@ -1202,7 +1268,11 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             textAlign: layer.text.align,
             color: fillRgba,
             lineHeight: 1.06,
-            whiteSpace: "pre-wrap",
+            // Sem `maxWidth` explícito = largura automática em 1 linha (respeitando `\n`), sem a
+            // quebra artificial em 50% do CSS shrink-to-fit. Com `maxWidth` (alças laterais) = quebra limpa.
+            whiteSpace: textMaxWPx > 0 ? "pre-wrap" : "pre",
+            width: textMaxWPx > 0 ? `${textMaxWPx}px` : "max-content",
+            overflowWrap: textMaxWPx > 0 ? "break-word" : undefined,
             fontVariantNumeric: "tabular-nums",
             textShadow:
               glyphAlpha <= 0.002
@@ -1267,6 +1337,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               align: layer.text.align,
               bevelPx,
               fontRev,
+              maxWidthPx: textMaxWPx > 0 ? textMaxWPx : undefined,
             });
             if (maps) {
               return (
@@ -1380,7 +1451,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           </div>
         )}
 
-        {/* Interactive Selection Box + Corner Resize Handle (pure absolute, zero layout shift) */}
+        {/* Interactive Selection Box + Canva-style Handles (corners = proportional, sides = width/height) */}
         {isSelected && !test3dMode && !roomActive && (
           <>
             <div
@@ -1390,38 +1461,153 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   : "border-white/55 border-dashed"
               }`}
             />
-            {isPrimarySelected && !layer.locked && onResizeLayer && (
-              <button
-                type="button"
-                aria-label="Redimensionar"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                  dragRef.current = {
-                    mode: "RESIZE",
-                    id: layer.id,
-                    isText: layer.kind === "TEXT",
-                    isTopLevel,
-                    containerW: size.w,
-                    containerH: size.h,
-                    startClientX: e.clientX,
-                    startClientY: e.clientY,
-                    startX: layer.x,
-                    startY: layer.y,
-                    startW: layer.kind === "TEXT" ? layer.text?.fontSize ?? 96 : layer.width,
-                    startH: layer.kind === "TEXT" ? layer.text?.fontSize ?? 96 : layer.height,
-                    halfW: 0,
-                    halfH: 0,
-                    snapTargetsX: [],
-                    snapTargetsY: [],
-                    moved: true,
-                    wasAlreadyInMulti: false,
-                  };
-                  onDragStateChange?.(true);
-                }}
-                className="absolute -right-2 -bottom-2 w-3.5 h-3.5 rounded-full bg-white border-2 border-black shadow-md cursor-nwse-resize z-40"
-              />
-            )}
+            {isPrimarySelected && !layer.locked && onResizeLayer && (() => {
+              const startResize = (
+                handle: "nw" | "ne" | "sw" | "se" | "w" | "e" | "n" | "s",
+                e: React.PointerEvent<HTMLButtonElement>
+              ) => {
+                e.stopPropagation();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                const el = layerElsRef.current.get(layer.id);
+                const rect = el?.getBoundingClientRect();
+                const safeScale = Math.max(containerScale, 0.05);
+                const renderedWLog = rect ? rect.width / safeScale : layer.width;
+                const renderedHLog = rect ? rect.height / safeScale : layer.height;
+                let naturalTextW = 0;
+                if (layer.kind === "TEXT" && layer.text && typeof document !== "undefined") {
+                  const probe = document.createElement("canvas").getContext("2d");
+                  if (probe) {
+                    const safeFam = (layer.text.fontFamily || "Outfit").replace(/"/g, "");
+                    probe.font = `${layer.text.fontWeight} ${layer.text.fontSize}px "${safeFam}", "Outfit", "Inter", "Segoe UI", sans-serif`;
+                    const resolvedTxt = evaluateFormula(layer.text.content, telemetry, project.globals, now);
+                    const lsPx = layer.text.letterSpacing * layer.text.fontSize;
+                    for (const ln of resolvedTxt.split("\n")) {
+                      const chars = Array.from(ln);
+                      const w =
+                        Math.abs(lsPx) >= 0.25
+                          ? chars.reduce((acc, ch, i) => acc + probe.measureText(ch).width + (i < chars.length - 1 ? lsPx : 0), 0)
+                          : probe.measureText(ln).width;
+                      naturalTextW = Math.max(naturalTextW, Math.ceil(w));
+                    }
+                  }
+                }
+                dragRef.current = {
+                  mode: "RESIZE",
+                  resizeHandle: handle,
+                  id: layer.id,
+                  isText: layer.kind === "TEXT",
+                  isTopLevel,
+                  containerW: size.w,
+                  containerH: size.h,
+                  startClientX: e.clientX,
+                  startClientY: e.clientY,
+                  startX: layer.x,
+                  startY: layer.y,
+                  startW: layer.width,
+                  startH: layer.height,
+                  startFont: layer.text?.fontSize ?? 96,
+                  startTextMaxW: layer.text?.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : 0,
+                  startBoxW: layer.kind === "TEXT"
+                    ? (layer.text?.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : renderedWLog)
+                    : layer.width,
+                  startBoxH: renderedHLog,
+                  naturalTextW,
+                  halfW: 0,
+                  halfH: 0,
+                  snapTargetsX: [],
+                  snapTargetsY: [],
+                  moved: true,
+                  wasAlreadyInMulti: false,
+                };
+                onDragStateChange?.(true);
+              };
+
+              const corners: Array<{
+                id: "nw" | "ne" | "sw" | "se";
+                cls: string;
+                cursor: string;
+              }> = [
+                { id: "nw", cls: "-left-2.5 -top-2.5", cursor: "cursor-nwse-resize" },
+                { id: "ne", cls: "-right-2.5 -top-2.5", cursor: "cursor-nesw-resize" },
+                { id: "sw", cls: "-left-2.5 -bottom-2.5", cursor: "cursor-nesw-resize" },
+                { id: "se", cls: "-right-2.5 -bottom-2.5", cursor: "cursor-nwse-resize" },
+              ];
+              const showSideHorizontal = layer.kind !== "GROUP";
+              const showSideVertical = layer.kind !== "TEXT" && layer.kind !== "GROUP";
+
+              return (
+                <>
+                  {corners.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      aria-label="Redimensionar proporcionalmente"
+                      title={
+                        layer.kind === "TEXT"
+                          ? "Arraste o canto para aumentar ou diminuir o texto mantendo a proporção"
+                          : "Arraste o canto para escalar proporcionalmente (Shift = livre)"
+                      }
+                      onPointerDown={(e) => startResize(c.id, e)}
+                      className={`absolute ${c.cls} w-3 h-3 rounded-full bg-white border-2 border-black shadow-md ${c.cursor} z-40 hover:scale-125 transition-transform`}
+                    />
+                  ))}
+                  {showSideHorizontal && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label="Ajustar largura"
+                        title={
+                          layer.kind === "TEXT"
+                            ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
+                            : "Arraste para ajustar a largura"
+                        }
+                        onPointerDown={(e) => startResize("w", e)}
+                        onDoubleClick={(e) => {
+                          if (layer.kind !== "TEXT") return;
+                          e.stopPropagation();
+                          onResizeLayer(layer.id, { textMaxWidth: null });
+                        }}
+                        className="absolute -left-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                      />
+                      <button
+                        type="button"
+                        aria-label="Ajustar largura"
+                        title={
+                          layer.kind === "TEXT"
+                            ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
+                            : "Arraste para ajustar a largura"
+                        }
+                        onPointerDown={(e) => startResize("e", e)}
+                        onDoubleClick={(e) => {
+                          if (layer.kind !== "TEXT") return;
+                          e.stopPropagation();
+                          onResizeLayer(layer.id, { textMaxWidth: null });
+                        }}
+                        className="absolute -right-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                      />
+                    </>
+                  )}
+                  {showSideVertical && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label="Ajustar altura"
+                        title="Arraste para ajustar a altura"
+                        onPointerDown={(e) => startResize("n", e)}
+                        className="absolute -top-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                      />
+                      <button
+                        type="button"
+                        aria-label="Ajustar altura"
+                        title="Arraste para ajustar a altura"
+                        onPointerDown={(e) => startResize("s", e)}
+                        className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                      />
+                    </>
+                  )}
+                </>
+              );
+            })()}
           </>
         )}
       </div>

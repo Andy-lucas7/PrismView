@@ -32,6 +32,8 @@ export interface GlyphGlassParams {
   align: "left" | "center" | "right";
   bevelPx: number;
   fontRev: number;
+  /** Optional wrap width in CSS px (>0 wraps words inside the box; 0/undefined = auto-width). */
+  maxWidthPx?: number;
 }
 
 const glyphMapsCache = new Map<string, GlyphGlassMaps>();
@@ -85,6 +87,8 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   // Continuous sigma proportional to bevelPx (0.55 * 0.65 = 0.3575, 1:1 parity with native glyph.rs)
   const heightBlurPx = Math.max(0.8, Math.min(31.2, Math.round(params.bevelPx * 0.3575 * 2) / 2));
 
+  const maxWidthPx = params.maxWidthPx && params.maxWidthPx > 1 ? Math.round(params.maxWidthPx) : 0;
+
   const key = [
     text,
     params.fontStack,
@@ -94,6 +98,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     params.align,
     heightBlurPx.toFixed(1),
     params.fontRev,
+    maxWidthPx,
   ].join("|");
 
   const hit = glyphMapsCache.get(key);
@@ -104,7 +109,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     return hit;
   }
 
-  const lines = text.split("\n");
+  const rawParagraphs = text.split("\n");
   const lineH = Math.ceil(fontSize * 1.06);
   const pad = Math.max(12, Math.ceil(fontSize * 0.14));
 
@@ -132,12 +137,56 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
     return Math.max(0, total);
   };
 
+  const lines: string[] = [];
+  if (maxWidthPx > 0) {
+    for (const para of rawParagraphs) {
+      if (!para) {
+        lines.push("");
+        continue;
+      }
+      const words = para.split(/(\s+)/);
+      let current = "";
+      for (const token of words) {
+        if (!token) continue;
+        const candidate = current ? current + token : token;
+        if (!current || measureLine(candidate) <= maxWidthPx) {
+          current = candidate;
+        } else if (/^\s+$/.test(token)) {
+          lines.push(current);
+          current = "";
+        } else {
+          lines.push(current.trimEnd());
+          if (measureLine(token) <= maxWidthPx) {
+            current = token;
+          } else {
+            // Word wider than box: break by character
+            let chunk = "";
+            for (const ch of Array.from(token)) {
+              const nextChunk = chunk + ch;
+              if (chunk && measureLine(nextChunk) > maxWidthPx) {
+                lines.push(chunk);
+                chunk = ch;
+              } else {
+                chunk = nextChunk;
+              }
+            }
+            current = chunk;
+          }
+        }
+      }
+      if (current) lines.push(current);
+    }
+  } else {
+    lines.push(...rawParagraphs);
+  }
+
   let maxLineW = 0;
   for (const line of lines) {
     maxLineW = Math.max(maxLineW, measureLine(line));
   }
 
-  const cssW = Math.max(24, Math.ceil(maxLineW + pad * 2));
+  const contentW = maxWidthPx > 0 ? Math.max(maxWidthPx, maxLineW) : maxLineW;
+  const cssW = Math.max(24, Math.ceil(contentW + pad * 2));
   const cssH = Math.max(24, Math.ceil(lines.length * lineH + pad * 2));
 
   // Cap BOTH width and height so tall multi-line text never stalls CPU Sobel pass

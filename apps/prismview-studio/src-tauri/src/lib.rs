@@ -971,6 +971,8 @@ pub fn run() {
             native_engine::native_engine_status,
             native_engine::native_engine_apply,
             native_engine::native_engine_set_power,
+            native_engine::get_sync_windows_wallpaper,
+            native_engine::set_sync_windows_wallpaper,
         ])
         .build(tauri::generate_context!())
         .expect("Erro ao construir PrismView");

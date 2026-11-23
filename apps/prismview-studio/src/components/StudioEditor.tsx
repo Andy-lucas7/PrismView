@@ -162,8 +162,10 @@ function scaleLayerTree(layer: SceneLayer, f: number): SceneLayer {
     next.text = {
       ...layer.text,
       fontSize: r(layer.text.fontSize),
-      letterSpacing: r(layer.text.letterSpacing),
+      // `letterSpacing` é em `em` (já proporcional ao `fontSize`), não deve ser multiplicado por `f`.
+      letterSpacing: layer.text.letterSpacing,
       shadowBlur: r(layer.text.shadowBlur),
+      maxWidth: layer.text.maxWidth && layer.text.maxWidth > 0 ? Math.max(60, Math.round(layer.text.maxWidth * f)) : undefined,
     };
   }
   if (layer.image) next.image = { ...layer.image, borderRadius: r(layer.image.borderRadius) };
@@ -2000,14 +2002,29 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onSelectLayer={(id, modifiers) => handleSelectLayer(id, modifiers)}
             onMoveLayer={(id, x, y) => patchLayerRaw(id, (l) => ({ ...l, x, y }))}
             onMoveLayers={patchMultiplePositionsRaw}
-            onResizeLayer={(id, w, h, isText) =>
-              patchLayerRaw(id, (l) =>
-                isText && l.text
-                  ? { ...l, text: { ...l.text, fontSize: Math.max(10, Math.min(340, w)) } }
-                  : l.kind === "GROUP" && l.width > 0
-                    ? scaleLayerTree(l, w / l.width)
-                    : { ...l, width: w, height: h }
-              )
+            onResizeLayer={(id, patch) =>
+              patchLayerRaw(id, (l) => {
+                if (l.kind === "TEXT" && l.text) {
+                  const nextText = { ...l.text };
+                  if (patch.fontSize !== undefined) {
+                    nextText.fontSize = Math.max(10, Math.min(340, patch.fontSize));
+                  }
+                  if (patch.textMaxWidth === null) {
+                    delete nextText.maxWidth;
+                  } else if (patch.textMaxWidth !== undefined) {
+                    nextText.maxWidth = Math.max(60, Math.min(2400, patch.textMaxWidth));
+                  }
+                  return { ...l, text: nextText };
+                }
+                if (l.kind === "GROUP" && l.width > 0 && patch.width !== undefined) {
+                  return scaleLayerTree(l, patch.width / l.width);
+                }
+                return {
+                  ...l,
+                  width: patch.width ?? l.width,
+                  height: patch.height ?? l.height,
+                };
+              })
             }
             onDragStateChange={(dragging) => {
               if (dragging) {

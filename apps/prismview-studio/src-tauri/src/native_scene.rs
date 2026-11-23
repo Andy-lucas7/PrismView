@@ -326,6 +326,7 @@ impl Ctx {
                 _ => "CENTER",
             },
             "stem_stretch": { "stretch": number(t, "stemStretch", 1.0).clamp(1.0, 2.8) },
+            "max_width_px": number(t, "maxWidth", 0.0).max(0.0),
         });
         if let Some(path) = local_path(text(t, "fontPath")) {
             content["font_path"] = json!(path);

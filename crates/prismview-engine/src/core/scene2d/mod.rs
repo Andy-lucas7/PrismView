@@ -38,7 +38,7 @@ use prism_core::fx::{EvalContext, FxEngine};
 use prism_core::schema::{
     Anchor, BackgroundSource, BlendMode, DirtyFlags, FillMode, GradientKind as SchemaGradient,
     LayerKind, LayerNode, PrismScene, ShapeKind, StackDir, StaticOrFx, TextAlign, TouchAction,
-    VisibilityCondition,
+    TouchActionType, VisibilityCondition,
 };
 
 use super::bindings::{LayerBindingSolver, LayerFx};
@@ -106,6 +106,87 @@ fn resolve_asset_path(scene: &PrismScene, asset_root: Option<&Path>, raw: &str) 
 struct Scene3dOutput {
     id: TextureId,
     size: (u32, u32),
+}
+
+/// Produz uma cópia limpa da cena contendo **apenas o visual do wallpaper** (fundo, vídeo, fotos,
+/// camadas de imagem, SVG decorativo, cena 3D e placas visuais puras), removendo componentes de
+/// HUD dinâmicos (relógio, texto, telemetria, barras de progresso, capa de música e controles de mídia).
+pub fn clean_wallpaper_scene(scene: &PrismScene) -> PrismScene {
+    fn is_media_cover_asset(asset: &StaticOrFx<String>) -> bool {
+        let contains_mi = |s: &str| {
+            let low = s.to_ascii_lowercase();
+            low.contains("$mi(") || low.contains("mi(cover)")
+        };
+        match asset {
+            StaticOrFx::Static(s) => contains_mi(s),
+            StaticOrFx::Fx { expr, fallback } => contains_mi(expr) || contains_mi(fallback),
+        }
+    }
+
+    fn is_media_touch(layer: &LayerNode) -> bool {
+        matches!(
+            layer.touch.action_type,
+            TouchActionType::MediaPlayPause
+                | TouchActionType::MediaNext
+                | TouchActionType::MediaPrev
+        )
+    }
+
+    fn filter_layers(layers: &[LayerNode]) -> Vec<LayerNode> {
+        let mut out = Vec::with_capacity(layers.len());
+        for layer in layers {
+            if layer.hidden {
+                continue;
+            }
+            if is_media_touch(layer) {
+                continue;
+            }
+            match layer.kind {
+                // Textos = relógio, data, telemetria, título/artista de música.
+                LayerKind::Text => continue,
+                // Imagens de capa de música dinâmica não entram no wallpaper limpo.
+                LayerKind::Image if is_media_cover_asset(&layer.asset) => continue,
+                // Barras/anéis de progresso (mídia, CPU, RAM, bateria) e pílulas de texto.
+                LayerKind::Shape
+                    if matches!(layer.shape_kind, ShapeKind::Bar | ShapeKind::Ring)
+                        || layer.id.ends_with("__pill") =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+
+            let had_children = !layer.children.is_empty();
+            let filtered_children = if had_children {
+                filter_layers(&layer.children)
+            } else {
+                Vec::new()
+            };
+
+            // Contêineres / placas que agrupavam apenas HUD (texto/barras/mídia) somem por completo
+            // para não deixar retângulos vazios no papel de parede do Windows.
+            if had_children
+                && filtered_children.is_empty()
+                && matches!(
+                    layer.kind,
+                    LayerKind::Group | LayerKind::Stack | LayerKind::Shape
+                )
+            {
+                continue;
+            }
+
+            let mut kept = layer.clone();
+            kept.children = filtered_children;
+            out.push(kept);
+        }
+        out
+    }
+
+    let mut clean = scene.clone();
+    clean.layers = filter_layers(&scene.layers);
+    // Sem parallax/molas no snapshot estático (posição central limpa).
+    clean.bindings.clear();
+    clean
 }
 
 /// Recursos compartilhados por todas as saídas (monitores) de um `GpuContext`.
@@ -509,6 +590,198 @@ impl SceneRenderer {
         self.images.failed.iter().map(String::as_str)
     }
 
+    /// `true` enquanto alguma imagem ainda está decodificando em thread ou algum vídeo da cena
+    /// ainda não entregou o 1º frame à GPU.
+    pub fn has_pending_visual_assets(&self) -> bool {
+        if !self.images.pending.is_empty() {
+            return true;
+        }
+        for (path, _) in self.video_sources() {
+            let key = path.to_string_lossy();
+            let ready = self.videos.get(&*key).is_some_and(|v| v.alias.is_some());
+            if !ready {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Renderiza a versão limpa da cena atual (sem texto/relógio/telemetria/mídia) em uma textura
+    /// offscreen e devolve `(width, height, rgb8)` prontos para salvar como wallpaper do Windows.
+    /// Reaproveita vídeo, 3D, imagens e SVGs já carregados sem perturbar o estado ao vivo.
+    pub fn render_clean_snapshot(
+        &mut self,
+        gpu: &GpuContext,
+        size: (u32, u32),
+        ui_scale: f32,
+        ctx: &EvalContext,
+        clear: [f32; 4],
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let clean = clean_wallpaper_scene(self.scene.as_ref()?);
+        let (mut w, mut h) = (size.0.max(1), size.1.max(1));
+        const MAX_W: u32 = 3840;
+        const MAX_H: u32 = 2160;
+        let down = (MAX_W as f32 / w as f32).min(MAX_H as f32 / h as f32).min(1.0);
+        if down < 0.999 {
+            w = ((w as f32 * down).round() as u32).max(1);
+            h = ((h as f32 * down).round() as u32).max(1);
+        }
+        let scale = if ui_scale.is_finite() && ui_scale > 0.0 {
+            ui_scale * down
+        } else {
+            down
+        };
+
+        let mut canvas = self.create_canvas(gpu);
+        canvas.begin(w, h);
+        if let Some(layer) = canvas.glass.as_mut() {
+            layer.begin(w, h);
+        }
+        let empty_fx = LayerBindingSolver::new();
+        {
+            let mut frame = Frame {
+                videos: &self.videos,
+                svgs: &mut self.svgs,
+                touch_index: &self.touch_index,
+                scene3d_out: self.scene3d_out,
+                backdrop: None,
+                scene: &clean,
+                ctx,
+                device: gpu.device(),
+                queue: gpu.queue(),
+                compositor: &mut self.compositor,
+                text: &mut self.text,
+                images: &mut self.images,
+                bindings: &mut self.text_bindings,
+                canvas: &mut canvas,
+                canvas_key: "__win_wallpaper_snapshot__",
+                scratch: &mut self.key_scratch,
+                asset_root: self.asset_root.as_deref(),
+                fx: &empty_fx,
+                ui: scale,
+                vw: w as f32,
+                vh: h as f32,
+                z: 0,
+            };
+            frame.build();
+        }
+        canvas.flush(&self.compositor, gpu.device(), gpu.queue());
+        if let Some(layer) = canvas.glass.as_mut() {
+            self.glass.flush(layer, gpu.device(), gpu.queue());
+        }
+
+        let format = self.compositor.format();
+        let out_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_win_wallpaper_snapshot"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
+        if has_glass {
+            canvas.ensure_backdrop(gpu.device(), (w, h), format);
+            if multi_stage {
+                canvas.ensure_backdrop_snap(gpu.device(), (w, h), format);
+            }
+            canvas.backdrop_token = canvas.backdrop_token.wrapping_add(1);
+        }
+
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prismview_win_wallpaper_enc"),
+            });
+        Self::record_composited_frame(
+            &self.compositor,
+            &self.text,
+            &mut self.glass,
+            gpu,
+            &mut encoder,
+            &out_view,
+            clear,
+            &mut canvas,
+            has_glass,
+            true,
+        );
+
+        let bpr = ((w * 4 + 255) / 256) * 256;
+        let staging = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prismview_win_wallpaper_readback"),
+            size: u64::from(bpr) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &out_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue().submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = tx.send(res);
+        });
+        gpu.device().poll(wgpu::Maintain::Wait);
+        if !matches!(rx.recv(), Ok(Ok(()))) {
+            return None;
+        }
+        let data = slice.get_mapped_range();
+        let is_bgra = matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut rgb = vec![0u8; (w as usize) * (h as usize) * 3];
+        for y in 0..h as usize {
+            let src = &data[y * bpr as usize..y * bpr as usize + (w as usize * 4)];
+            let dst = &mut rgb[y * (w as usize) * 3..(y + 1) * (w as usize) * 3];
+            for x in 0..w as usize {
+                let s = x * 4;
+                let d = x * 3;
+                if is_bgra {
+                    dst[d] = src[s + 2];
+                    dst[d + 1] = src[s + 1];
+                    dst[d + 2] = src[s];
+                } else {
+                    dst[d] = src[s];
+                    dst[d + 1] = src[s + 1];
+                    dst[d + 2] = src[s + 2];
+                }
+            }
+        }
+        drop(data);
+        staging.unmap();
+        Some((w, h, rgb))
+    }
+
     /// Imagens decodificadas em segundo plano ficaram prontas: invalida a lista (o rebuild faz o
     /// upload). Chamar 1× por iteração do loop; `true` = redesenhar.
     pub fn poll_images(&mut self) -> bool {
@@ -667,10 +940,12 @@ impl SceneRenderer {
         let mut stale = canvas.built_version != self.version
             || canvas.built_size != (w, h)
             || (canvas.built_scale - ui_scale).abs() > 1e-4;
+        let mut fx_moved_backdrop = false;
         if !stale && canvas.built_fx_gen != self.fx_gen {
             // Só os deltas de binding mudaram (parallax, molas): sem layout nem reordenação.
             stale = !Self::apply_bindings_fast(canvas, &self.layer_bindings, gpu.queue());
             canvas.built_fx_gen = self.fx_gen;
+            fx_moved_backdrop = canvas.bound.iter().any(|b| b.markers.is_empty());
         }
         if stale {
             self.rebuild(gpu, canvas, canvas_key, (w, h), ui_scale, ctx);
@@ -686,10 +961,16 @@ impl SceneRenderer {
         }
 
         let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
         let mut capture_backdrop = false;
         if has_glass {
-            let recreated = canvas.ensure_backdrop(gpu.device(), (w, h), self.compositor.format());
-            if stale || recreated || canvas.last_live_token != self.live_token {
+            let mut recreated = canvas.ensure_backdrop(gpu.device(), (w, h), self.compositor.format());
+            if multi_stage {
+                recreated |= canvas.ensure_backdrop_snap(gpu.device(), (w, h), self.compositor.format());
+            } else {
+                canvas.backdrop_snap = None;
+            }
+            if stale || recreated || multi_stage || fx_moved_backdrop || canvas.last_live_token != self.live_token {
                 canvas.backdrop_token = canvas.backdrop_token.wrapping_add(1);
                 canvas.last_live_token = self.live_token;
                 capture_backdrop = true;
@@ -702,40 +983,172 @@ impl SceneRenderer {
         let compositor = &self.compositor;
         let text = &self.text;
         let glass = &mut self.glass;
-        let backdrop_token = canvas.backdrop_token;
 
         surface.render_with(gpu, |encoder, view| {
-            // 1) Captura o fundo composto real (gradiente + imagem + vídeo + 3D) abaixo do vidro
-            //    e roda a pirâmide Gaussiana + mapas de glifo antes do passe principal.
-            if has_glass {
-                if let Some(bd) = canvas.backdrop.as_ref() {
-                    if capture_backdrop {
-                        compositor.render_before_first_marker(encoder, &bd.view, clear, canvas);
-                    }
-                    let bd_view = &bd.view;
-                    let bd_ver = bd.version;
-                    if let Some(layer) = canvas.glass.as_mut() {
-                        glass.prepare(
-                            gpu.device(),
-                            gpu.queue(),
-                            encoder,
-                            layer,
-                            backdrop_token,
-                            |_| Some((bd_view, bd_ver)),
-                            |key| text.texture_view(key),
-                        );
-                    }
+            Self::record_composited_frame(
+                compositor,
+                text,
+                glass,
+                gpu,
+                encoder,
+                view,
+                clear,
+                canvas,
+                has_glass,
+                capture_backdrop,
+            );
+        })
+    }
+
+    /// Grava o frame completo em `encoder`:
+    /// - Sem vidro: 1 passe direto em `out_view`.
+    /// - 1 estágio de vidro (caso comum): 1 captura `render_before_first_marker` → `glass.prepare` → 1 passe.
+    /// - ≥2 estágios intercalados com 3D/vídeo/texto (ex.: texto de vidro atrás do 3D + relógio de
+    ///   vidro na frente do 3D): captura progressiva por estágio (`bd` → `bd_snap` → blur/refração
+    ///   → desenha estágio em `bd` e `out_view`), garantindo que CADA vidro refrate tudo abaixo dele!
+    #[allow(clippy::too_many_arguments)]
+    fn record_composited_frame(
+        compositor: &Compositor2D,
+        text: &TextSystem,
+        glass: &mut GlassRenderer,
+        gpu: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        out_view: &wgpu::TextureView,
+        clear: [f32; 4],
+        canvas: &mut Canvas,
+        has_glass: bool,
+        capture_backdrop: bool,
+    ) {
+        let stage_count = if has_glass { canvas.glass_stages.len() } else { 0 };
+        if stage_count == 0 {
+            compositor.render_with(encoder, out_view, clear, canvas, |_, _| {});
+            return;
+        }
+
+        let backdrop_token = canvas.backdrop_token;
+        if stage_count == 1 {
+            if let Some(bd) = canvas.backdrop.as_ref() {
+                if capture_backdrop {
+                    compositor.render_before_first_marker(encoder, &bd.view, clear, canvas);
+                }
+                let bd_view = &bd.view;
+                let bd_ver = bd.version;
+                if let Some(layer) = canvas.glass.as_mut() {
+                    glass.prepare(
+                        gpu.device(),
+                        gpu.queue(),
+                        encoder,
+                        layer,
+                        backdrop_token,
+                        |_| Some((bd_view, bd_ver)),
+                        |key| text.texture_view(key),
+                    );
                 }
             }
-            // 2) Passe do compositor; cada marcador Z desenha um vidro na posição certa.
-            let canvas = &*canvas;
-            let glass = &*glass;
-            compositor.render_with(encoder, view, clear, canvas, |pass, marker| {
-                if let Some(layer) = canvas.glass.as_ref() {
-                    glass.draw(layer, pass, marker);
+            let canvas_ref = &*canvas;
+            let glass_ref = &*glass;
+            compositor.render_with(encoder, out_view, clear, canvas_ref, |pass, marker| {
+                if let Some(layer) = canvas_ref.glass.as_ref() {
+                    glass_ref.draw(layer, pass, marker);
                 }
             });
-        })
+            return;
+        }
+
+        // Caminho progressivo multi-estágio: cada grupo de vidros enxerga TODO o conteúdo abaixo
+        // dele (incluindo vidros anteriores + 3D + vídeo + imagens + texto).
+        glass.begin_prepare();
+        for si in 0..stage_count {
+            let pre_range = canvas.glass_stages[si].pre_batches.clone();
+            let mk_batch_range = canvas.glass_stages[si].marker_batches.clone();
+            let mk_slice_range = canvas.glass_stages[si].markers.clone();
+            let stage_clear = if si == 0 { Some(clear) } else { None };
+
+            // 1) Atualiza `bd` com as camadas não-vidro anteriores a este estágio e tira snapshot.
+            if let (Some(bd), Some(snap)) = (canvas.backdrop.as_ref(), canvas.backdrop_snap.as_ref()) {
+                compositor.render_range_with(encoder, &bd.view, stage_clear, canvas, pre_range.clone(), |_, _| {});
+                let copy_w = bd.size.0.min(snap.size.0);
+                let copy_h = bd.size.1.min(snap.size.1);
+                encoder.copy_texture_to_texture(
+                    bd.texture.as_image_copy(),
+                    snap.texture.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: copy_w,
+                        height: copy_h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+
+            // 2) Prepara pirâmide de blur + normais de glifo só dos vidros deste estágio contra `bd_snap`.
+            let stage_tok = backdrop_token.wrapping_mul(31).wrapping_add(si as u64 + 1);
+            let Canvas {
+                backdrop_snap,
+                glass: glass_layer,
+                stage_markers,
+                ..
+            } = canvas;
+            if let (Some(snap), Some(layer)) = (backdrop_snap.as_ref(), glass_layer.as_mut()) {
+                let snap_view = &snap.view;
+                let snap_ver = snap.version;
+                let markers = &stage_markers[mk_slice_range];
+                glass.prepare_markers(
+                    gpu.device(),
+                    gpu.queue(),
+                    encoder,
+                    layer,
+                    markers,
+                    stage_tok,
+                    |_| Some((snap_view, snap_ver)),
+                    |key| text.texture_view(key),
+                );
+            }
+
+            // 3) Desenha os vidros deste estágio em `bd` (para que os próximos estágios os enxerguem).
+            if si + 1 < stage_count {
+                if let Some(bd) = canvas.backdrop.as_ref() {
+                    let canvas_ref = &*canvas;
+                    let glass_ref = &*glass;
+                    compositor.render_range_with(
+                        encoder,
+                        &bd.view,
+                        None,
+                        canvas_ref,
+                        mk_batch_range.clone(),
+                        |pass, marker| {
+                            if let Some(layer) = canvas_ref.glass.as_ref() {
+                                glass_ref.draw(layer, pass, marker);
+                            }
+                        },
+                    );
+                }
+            }
+
+            // 4) Desenha o segmento + vidros deste estágio diretamente na saída `out_view`.
+            {
+                let canvas_ref = &*canvas;
+                let glass_ref = &*glass;
+                compositor.render_range_with(
+                    encoder,
+                    out_view,
+                    stage_clear,
+                    canvas_ref,
+                    pre_range.start..mk_batch_range.end,
+                    |pass, marker| {
+                        if let Some(layer) = canvas_ref.glass.as_ref() {
+                            glass_ref.draw(layer, pass, marker);
+                        }
+                    },
+                );
+            }
+        }
+
+        // 5) Camadas finais acima do último vidro (ex.: Data Editorial, telemetria).
+        let post = canvas.post_glass_batches.clone();
+        if !post.is_empty() {
+            compositor.render_range_with(encoder, out_view, None, canvas, post, |_, _| {});
+        }
+        glass.finish_prepare();
     }
 
     fn rebuild(
@@ -851,10 +1264,16 @@ mod gpu_glass_tests {
             }
         }
         let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
         let mut capture_backdrop = false;
         if has_glass {
-            let recreated = canvas.ensure_backdrop(gpu.device(), (w, h), renderer.compositor.format());
-            if stale || recreated || canvas.last_live_token != renderer.live_token {
+            let mut recreated = canvas.ensure_backdrop(gpu.device(), (w, h), renderer.compositor.format());
+            if multi_stage {
+                recreated |= canvas.ensure_backdrop_snap(gpu.device(), (w, h), renderer.compositor.format());
+            } else {
+                canvas.backdrop_snap = None;
+            }
+            if stale || recreated || multi_stage || canvas.last_live_token != renderer.live_token {
                 canvas.backdrop_token = canvas.backdrop_token.wrapping_add(1);
                 canvas.last_live_token = renderer.live_token;
                 capture_backdrop = true;
@@ -864,41 +1283,18 @@ mod gpu_glass_tests {
         let mut encoder = gpu
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_enc") });
-        if has_glass {
-            if let Some(bd) = canvas.backdrop.as_ref() {
-                if capture_backdrop {
-                    renderer
-                        .compositor
-                        .render_before_first_marker(&mut encoder, &bd.view, clear, canvas);
-                }
-                let bd_view = &bd.view;
-                let bd_ver = bd.version;
-                let backdrop_token = canvas.backdrop_token;
-                let text = &renderer.text;
-                if let Some(layer) = canvas.glass.as_mut() {
-                    renderer.glass.prepare(
-                        gpu.device(),
-                        gpu.queue(),
-                        &mut encoder,
-                        layer,
-                        backdrop_token,
-                        |_| Some((bd_view, bd_ver)),
-                        |key| text.texture_view(key),
-                    );
-                }
-            }
-        }
-        {
-            let canvas_ref = &*canvas;
-            let glass_ref = &renderer.glass;
-            renderer
-                .compositor
-                .render_with(&mut encoder, &out_view, clear, canvas_ref, |pass, marker| {
-                    if let Some(layer) = canvas_ref.glass.as_ref() {
-                        glass_ref.draw(layer, pass, marker);
-                    }
-                });
-        }
+        SceneRenderer::record_composited_frame(
+            &renderer.compositor,
+            &renderer.text,
+            &mut renderer.glass,
+            gpu,
+            &mut encoder,
+            &out_view,
+            clear,
+            canvas,
+            has_glass,
+            capture_backdrop,
+        );
 
         let bpr = ((w * 4 + 255) / 256) * 256;
         let staging = gpu.device().create_buffer(&wgpu::BufferDescriptor {
@@ -1146,6 +1542,304 @@ mod gpu_glass_tests {
         assert!(p0 > 40 && p0 < 120, "0% alpha should show blurred 3D backdrop, got {p0}");
         assert!(p50 > p0 + 60 && p50 < p100 - 40, "50% alpha should blend cleanly: {p0} < {p50} < {p100}");
         assert!(p100 >= 245, "100% alpha should be solid #FAFAFA, got {p100}");
+
+        let err = pollster::block_on(gpu.device().pop_error_scope());
+        assert!(err.is_none(), "wgpu validation error: {err:?}");
+    }
+
+    #[test]
+    fn clean_wallpaper_scene_strips_hud_and_preserves_visual_layers() {
+        use prism_core::schema::{TouchAction, TouchActionType};
+
+        let mut bg = LayerNode::default();
+        bg.id = "__studio_background__".into();
+        bg.kind = LayerKind::Shape;
+        bg.fill_parent = true;
+
+        let mut video = LayerNode::default();
+        video.id = "l-video".into();
+        video.kind = LayerKind::Video;
+        video.asset = StaticOrFx::Static("clip.mp4".into());
+
+        let mut photo = LayerNode::default();
+        photo.id = "l-photo".into();
+        photo.kind = LayerKind::Image;
+        photo.asset = StaticOrFx::Static("photo.jpg".into());
+
+        let mut media_cover = LayerNode::default();
+        media_cover.id = "l-cover".into();
+        media_cover.kind = LayerKind::Image;
+        media_cover.asset = StaticOrFx::Fx {
+            expr: "$mi(cover)$".into(),
+            fallback: String::new(),
+        };
+
+        let mut s3d = LayerNode::default();
+        s3d.id = "l-3d".into();
+        s3d.kind = LayerKind::Scene3d;
+
+        let mut deco_svg = LayerNode::default();
+        deco_svg.id = "l-deco-svg".into();
+        deco_svg.kind = LayerKind::Svg;
+        deco_svg.svg_markup =
+            "<svg viewBox='0 0 10 10'><circle cx='5' cy='5' r='4'/></svg>".into();
+
+        let mut play_btn = LayerNode::default();
+        play_btn.id = "l-play".into();
+        play_btn.kind = LayerKind::Svg;
+        play_btn.touch = TouchAction {
+            action_type: TouchActionType::MediaPlayPause,
+            ..TouchAction::default()
+        };
+
+        let mut clock = LayerNode::default();
+        clock.id = "l-clock".into();
+        clock.kind = LayerKind::Text;
+        clock.text.text = "$df(HH:mm)$".into();
+
+        let mut bar = LayerNode::default();
+        bar.id = "l-cpu-bar".into();
+        bar.kind = LayerKind::Shape;
+        bar.shape_kind = ShapeKind::Bar;
+
+        let mut pill = LayerNode::default();
+        pill.id = "l-clock__pill".into();
+        pill.kind = LayerKind::Shape;
+
+        let mut hud_group = LayerNode::default();
+        hud_group.id = "l-media-group".into();
+        hud_group.kind = LayerKind::Group;
+        hud_group.children = vec![media_cover, play_btn, clock.clone(), bar];
+
+        let mut mixed_group = LayerNode::default();
+        mixed_group.id = "l-mixed-group".into();
+        mixed_group.kind = LayerKind::Group;
+        mixed_group.children = vec![photo.clone(), clock];
+
+        let scene = PrismScene {
+            id: "wp-test".into(),
+            layers: vec![bg, video, s3d, deco_svg, pill, hud_group, mixed_group],
+            bindings: vec![serde_json::json!({ "id": "b1" })],
+            ..PrismScene::default()
+        };
+
+        let clean = clean_wallpaper_scene(&scene);
+        assert!(clean.bindings.is_empty(), "static snapshot should clear bindings");
+        let ids: Vec<&str> = clean.layers.iter().map(|l| l.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["__studio_background__", "l-video", "l-3d", "l-deco-svg", "l-mixed-group"]
+        );
+        let mixed_children: Vec<&str> = clean.layers[4]
+            .children
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect();
+        assert_eq!(mixed_children, vec!["l-photo"]);
+    }
+
+    #[test]
+    fn real_gpu_clean_snapshot_strips_hud_and_keeps_visuals() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let (w, h) = (320u32, 180u32);
+        let mut renderer = SceneRenderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
+
+        // Synthetic bright cyan 3D output in the center + solid white clock text over it.
+        let mut s3d_pixels = vec![0u8; (w * h * 4) as usize];
+        for y in 40..140 {
+            for x in 100..220 {
+                let idx = ((y * w + x) * 4) as usize;
+                s3d_pixels[idx] = 0;
+                s3d_pixels[idx + 1] = 210;
+                s3d_pixels[idx + 2] = 255;
+                s3d_pixels[idx + 3] = 255;
+            }
+        }
+        let s3d_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("snap_test_3d"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue().write_texture(
+            s3d_tex.as_image_copy(),
+            &s3d_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        renderer.set_scene3d_output(
+            &gpu,
+            s3d_tex.create_view(&wgpu::TextureViewDescriptor::default()),
+            (w, h),
+        );
+
+        let mut scene = make_scene_with_glass(0.0, 0.0, "#FFFFFFFF");
+        // Make the text solid red so if it leaked into the snapshot it would corrupt the cyan center.
+        scene.layers[2].fill = FillMode::Solid;
+        scene.layers[2].color = StaticOrFx::Static("#FFFF0000".into());
+
+        let ctx = EvalContext::default();
+        renderer.set_scene(scene, &ctx);
+
+        let (sw, sh, rgb) = renderer
+            .render_clean_snapshot(&gpu, (w, h), 1.0, &ctx, [0.0, 0.0, 0.0, 1.0])
+            .expect("render_clean_snapshot should produce RGB pixels");
+        assert_eq!((sw, sh), (w, h));
+        assert_eq!(rgb.len(), (w * h * 3) as usize);
+
+        // Center pixel must show the cyan 3D layer, with zero red clock leakage.
+        let center_idx = (((h / 2) * w + (w / 2)) * 3) as usize;
+        let (r, g, b) = (rgb[center_idx], rgb[center_idx + 1], rgb[center_idx + 2]);
+        assert!(
+            r < 30 && g >= 190 && b >= 240,
+            "expected clean cyan 3D pixel without red HUD text, got ({r}, {g}, {b})"
+        );
+
+        let err = pollster::block_on(gpu.device().pop_error_scope());
+        assert!(err.is_none(), "wgpu validation error: {err:?}");
+    }
+
+    #[test]
+    fn real_gpu_interleaved_glass_above_3d_refracts_and_blurs_3d() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        gpu.device().push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let (w, h) = (320u32, 180u32);
+        let mut renderer = SceneRenderer::new(&gpu, wgpu::TextureFormat::Bgra8Unorm);
+
+        // Bright cyan 3D center stripe placed BETWEEN two glass layers (just like Grupo(4) -> 3D -> Clock!).
+        let mut s3d_pixels = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                if (y as i32 - 90).abs() <= 4 {
+                    let idx = ((y * w + x) * 4) as usize;
+                    s3d_pixels[idx] = 0;
+                    s3d_pixels[idx + 1] = 240;
+                    s3d_pixels[idx + 2] = 255;
+                    s3d_pixels[idx + 3] = 255;
+                }
+            }
+        }
+        let s3d_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("interleaved_3d"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        gpu.queue().write_texture(
+            s3d_tex.as_image_copy(),
+            &s3d_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        renderer.set_scene3d_output(
+            &gpu,
+            s3d_tex.create_view(&wgpu::TextureViewDescriptor::default()),
+            (w, h),
+        );
+
+        let mut bg = LayerNode::default();
+        bg.id = "__studio_background__".into();
+        bg.kind = LayerKind::Shape;
+        bg.fill_parent = true;
+        bg.fill = FillMode::Solid;
+        bg.color = StaticOrFx::Static("#FF08080C".into());
+
+        // Glass A BELOW 3D (triggers stage 0)
+        let mut glass_below = LayerNode::default();
+        glass_below.id = "glass-below".into();
+        glass_below.kind = LayerKind::Shape;
+        glass_below.fill = FillMode::OpticalCrystal;
+        glass_below.x = StaticOrFx::Static(0.2);
+        glass_below.y = StaticOrFx::Static(0.2);
+        glass_below.width_px = StaticOrFx::Static(80.0);
+        glass_below.height_px = StaticOrFx::Static(40.0);
+
+        // 3D BETWEEN Glass A and Glass B
+        let mut s3d = LayerNode::default();
+        s3d.id = "l-3d".into();
+        s3d.kind = LayerKind::Scene3d;
+        s3d.fill_parent = true;
+
+        // Glass B ABOVE 3D (stage 1) — MUST see and blur the cyan 3D stripe!
+        let mut glass_above = LayerNode::default();
+        glass_above.id = "glass-above".into();
+        glass_above.kind = LayerKind::Shape;
+        glass_above.fill = FillMode::OpticalCrystal;
+        glass_above.x = StaticOrFx::Static(0.5);
+        glass_above.y = StaticOrFx::Static(0.5);
+        glass_above.width_px = StaticOrFx::Static(140.0);
+        glass_above.height_px = StaticOrFx::Static(100.0);
+        glass_above.crystal = OpticalCrystalParams {
+            blur_px: StaticOrFx::Static(16.0),
+            refraction: StaticOrFx::Static(24.0),
+            frost_amount: StaticOrFx::Static(0.0),
+            fresnel_intensity: StaticOrFx::Static(0.0),
+            prismatic_rim_intensity: StaticOrFx::Static(0.0),
+            dispersion_rgb: StaticOrFx::Static(0.0),
+            grain: 0.0,
+            tint_rgba: StaticOrFx::Static("#00FFFFFF".into()),
+            ..OpticalCrystalParams::default()
+        };
+
+        let ctx = EvalContext::default();
+        renderer.set_scene(
+            PrismScene {
+                id: "interleaved".into(),
+                layers: vec![bg, glass_below, s3d, glass_above],
+                ..PrismScene::default()
+            },
+            &ctx,
+        );
+        renderer.scene3d_frame_rendered();
+        let mut canvas = renderer.create_canvas(&gpu);
+        let img = render_offscreen(&gpu, &mut renderer, &mut canvas, (w, h), &ctx);
+
+        // Inside Glass B, 12px away from the 4px cyan stripe (y=102, x=160), blurred cyan glow MUST be visible!
+        let idx = ((102 * w + 160) * 4) as usize;
+        let (r, g, b) = (img[idx], img[idx + 1], img[idx + 2]);
+        assert!(
+            g > 45 && b > 50,
+            "Glass B above 3D did not capture/blur 3D stripe behind it (got RGB={r},{g},{b})"
+        );
 
         let err = pollster::block_on(gpu.device().pop_error_scope());
         assert!(err.is_none(), "wgpu validation error: {err:?}");

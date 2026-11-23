@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { AnimatePresence, motion, MotionConfig } from "framer-motion";
 import {
@@ -517,8 +518,11 @@ const StudioHubApp: React.FC = () => {
   const [autostart, setAutostart] = useState(false);
   const [engineTrayEnabled, setEngineTrayEnabled] = useState(true);
   const [trayBusy, setTrayBusy] = useState(false);
+  const [syncWindowsWallpaper, setSyncWindowsWallpaper] = useState(false);
+  const [syncWinBusy, setSyncWinBusy] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
   const optionsRef = useRef<HTMLDivElement | null>(null);
+  const optionsPanelRef = useRef<HTMLDivElement | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const saveTimerRef = useRef<number | null>(null);
@@ -632,11 +636,12 @@ const StudioHubApp: React.FC = () => {
   }, [saveProjectOrReport]);
 
   const loadAll = useCallback(async () => {
-    const [savedRes, rtRes, autoRes, trayRes] = await Promise.allSettled([
+    const [savedRes, rtRes, autoRes, trayRes, syncWinRes] = await Promise.allSettled([
       invokeCmd<ProjectListDto>("list_projects"),
       invokeCmd<RuntimeState>("get_runtime_state"),
       invokeCmd<boolean>("get_autostart_enabled"),
       invokeCmd<boolean>("get_engine_tray_enabled"),
+      invokeCmd<boolean>("get_sync_windows_wallpaper"),
     ]);
 
     if (savedRes.status === "fulfilled") {
@@ -676,6 +681,9 @@ const StudioHubApp: React.FC = () => {
     }
     if (trayRes.status === "fulfilled") {
       setEngineTrayEnabled(Boolean(trayRes.value));
+    }
+    if (syncWinRes.status === "fulfilled") {
+      setSyncWindowsWallpaper(Boolean(syncWinRes.value));
     }
   }, [saveProjectOrReport]);
 
@@ -1456,7 +1464,10 @@ const StudioHubApp: React.FC = () => {
   useEffect(() => {
     if (!optionsOpen) return;
     const onPointerDown = (ev: MouseEvent) => {
-      if (optionsRef.current && !optionsRef.current.contains(ev.target as Node)) {
+      const target = ev.target as Node;
+      const inTrigger = optionsRef.current?.contains(target) ?? false;
+      const inPanel = optionsPanelRef.current?.contains(target) ?? false;
+      if (!inTrigger && !inPanel) {
         setOptionsOpen(false);
       }
     };
@@ -1519,6 +1530,31 @@ const StudioHubApp: React.FC = () => {
         );
       }
     });
+  };
+
+  const toggleSyncWindowsWallpaper = async () => {
+    if (syncWinBusy) return;
+    const next = !syncWindowsWallpaper;
+    setSyncWinBusy(true);
+    setSyncWindowsWallpaper(next);
+    try {
+      const saved = await invokeCmd<boolean>("set_sync_windows_wallpaper", { enabled: next });
+      setSyncWindowsWallpaper(Boolean(saved));
+      notify(
+        saved
+          ? "Wallpaper do Windows será atualizado ao aplicar"
+          : "Sincronização com o wallpaper do Windows desativada"
+      );
+    } catch (err) {
+      setSyncWindowsWallpaper(!next);
+      notify(
+        isTauriRuntime()
+          ? friendlyError(err, "Não foi possível alterar a sincronização com o Windows.")
+          : "Disponível no app desktop"
+      );
+    } finally {
+      setSyncWinBusy(false);
+    }
   };
 
   const toggleAutostart = async () => {
@@ -1799,8 +1835,12 @@ const StudioHubApp: React.FC = () => {
                 <Settings className="w-4 h-4" />
               </button>
 
-              {optionsOpen && (
-                <div className="absolute left-0 bottom-12 z-50 w-80 frosted-chrome frosted-chrome-panel rounded-2xl p-4 shadow-2xl border border-white/15 space-y-3.5">
+              {optionsOpen &&
+                createPortal(
+                  <div
+                    ref={optionsPanelRef}
+                    className="fixed left-4 bottom-16 z-[80] w-80 frosted-chrome-popover frosted-chrome-panel rounded-2xl p-4 space-y-3.5"
+                  >
                   <div className="flex items-center justify-between border-b border-white/10 pb-2">
                     <span className="text-xs font-semibold text-white">Opções do Aplicativo</span>
                     <button
@@ -1873,6 +1913,36 @@ const StudioHubApp: React.FC = () => {
                     </button>
                   </label>
 
+                  {/* Sync Windows Desktop Wallpaper Toggle */}
+                  <label className="flex items-start justify-between gap-3 cursor-pointer select-none pt-2 border-t border-white/10">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-medium text-white">
+                        Atualizar wallpaper do Windows
+                      </div>
+                      <p className="text-[11px] leading-snug text-[#A1A1AA]">
+                        Define a imagem limpa do fundo (vídeo, foto, SVG ou 3D, sem relógio nem HUD) como papel de parede real do Windows ao aplicar.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={syncWindowsWallpaper}
+                      disabled={syncWinBusy}
+                      onClick={() => void toggleSyncWindowsWallpaper()}
+                      className={`mt-0.5 shrink-0 w-9 h-5 rounded-full transition-colors relative ${
+                        syncWindowsWallpaper ? "bg-white" : "bg-white/15"
+                      } ${syncWinBusy ? "opacity-60" : ""}`}
+                    >
+                      <span
+                        className={`block w-3.5 h-3.5 rounded-full transition-transform absolute top-[3px] ${
+                          syncWindowsWallpaper
+                            ? "translate-x-[19px] bg-black"
+                            : "translate-x-[3px] bg-white/80"
+                        }`}
+                      />
+                    </button>
+                  </label>
+
                   {/* Power Preference */}
                   <div className="pt-2 border-t border-white/10 space-y-1.5">
                     <div className="flex items-center justify-between text-xs">
@@ -1911,7 +1981,8 @@ const StudioHubApp: React.FC = () => {
                       Desligar Engine
                     </button>
                   </div>
-                </div>
+                </div>,
+                document.body
               )}
             </div>
           </div>
