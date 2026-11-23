@@ -19,6 +19,7 @@ import { getGlyphGlassMaps } from "../utils/glassLens";
 import { BackdropSourceInfo, getCssBackgroundCanvas } from "../utils/opticalGlassWebGL";
 import { OpticalGlassSurface } from "./OpticalGlassSurface";
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
+import { HUB_MOCK_NOW, HUB_MOCK_WEATHER } from "../engine/hubMock";
 // Type-only: keeps the 3D engine in its own lazy chunk
 import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
 
@@ -43,6 +44,8 @@ export interface UnifiedCompositorProps {
   subscribeReactiveTick?: (cb: () => void) => () => void;
   paused?: boolean;
   isThumbnail?: boolean;
+  /** Só miniaturas: `full` = vidro/3D/vídeo reais (3 por vez no Hub); `basic` (padrão) = só o básico. */
+  thumbnailTier?: "full" | "basic";
   interactive?: boolean;
   test3dMode?: boolean;
   selectedLayerId?: string | null;
@@ -74,6 +77,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   subscribeReactiveTick,
   paused = false,
   isThumbnail = false,
+  thumbnailTier = "basic",
   interactive = false,
   test3dMode = false,
   selectedLayerId = null,
@@ -103,7 +107,10 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     }
     return { w: 1280, h: 720 };
   });
-  const [now, setNow] = useState<Date>(() => new Date());
+  const [now, setNow] = useState<Date>(() => (isThumbnail ? HUB_MOCK_NOW : new Date()));
+  /** Miniatura básica: sem vidro WebGL, sem 3D, sem vídeo. */
+  const lite = isThumbnail && thumbnailTier !== "full";
+  const fxWeather = isThumbnail ? HUB_MOCK_WEATHER : undefined;
   const [fontRev, setFontRev] = useState(0);
   const [mediaRev, setMediaRev] = useState(0);
   const [snapGuide, setSnapGuide] = useState<{ x: number | null; y: number | null }>({
@@ -567,12 +574,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     const candidate = project.layers[i];
     let alive = !candidate.hidden;
     if (alive && candidate.fx?.visible) {
-      const v = evaluateFormula(candidate.fx.visible, telemetry, project.globals, now).trim().toLowerCase();
+      const v = evaluateFormula(candidate.fx.visible, telemetry, project.globals, now, fxWeather).trim().toLowerCase();
       if (v === "0" || v === "false" || v === "") alive = false;
     }
     if (alive) {
       const candOp = candidate.fx?.opacity
-        ? Number(evaluateFormula(candidate.fx.opacity, telemetry, project.globals, now).replace(/%/g, "").trim())
+        ? Number(evaluateFormula(candidate.fx.opacity, telemetry, project.globals, now, fxWeather).replace(/%/g, "").trim())
         : candidate.opacity;
       if ((Number.isFinite(candOp) ? candOp : candidate.opacity) <= 0.001) alive = false;
     }
@@ -589,7 +596,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   };
 
   const computeBackdropForTopIndex = (topIndex: number): BackdropResolution => {
-    if (isThumbnail) return { backdrop: null, hasIntermediateHtml: false };
+    if (lite) return { backdrop: null, hasIntermediateHtml: false };
 
     let hasIntermediateHtml = false;
     for (let i = topIndex - 1; i >= 0; i--) {
@@ -761,18 +768,18 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     const fxVal = (key: string, fallback: number): number => {
       const expr = layer.fx?.[key];
       if (!expr) return fallback;
-      const out = evaluateFormula(expr, telemetry, project.globals, now).replace(/%/g, "").trim();
+      const out = evaluateFormula(expr, telemetry, project.globals, now, fxWeather).replace(/%/g, "").trim();
       const num = Number(out);
       return Number.isFinite(num) ? num : fallback;
     };
     const fxStr = (key: string, fallback: string): string => {
       const expr = layer.fx?.[key];
       if (!expr) return fallback;
-      const out = evaluateFormula(expr, telemetry, project.globals, now).trim();
+      const out = evaluateFormula(expr, telemetry, project.globals, now, fxWeather).trim();
       return out || fallback;
     };
     if (layer.fx?.visible) {
-      const v = evaluateFormula(layer.fx.visible, telemetry, project.globals, now).trim().toLowerCase();
+      const v = evaluateFormula(layer.fx.visible, telemetry, project.globals, now, fxWeather).trim().toLowerCase();
       if (v === "0" || v === "false" || v === "") return null;
     }
 
@@ -812,8 +819,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       ? resolveBackdropForTopIndex(topIndex)
       : { backdrop: null, hasIntermediateHtml: false };
     const plateUseCssFallback =
-      isThumbnail || isTransparentWidget || resolvedBackdrop.hasIntermediateHtml || !resolvedBackdrop.backdrop;
-    const glyphUseCssFallback = isThumbnail || isTransparentWidget || !resolvedBackdrop.backdrop;
+      lite || isTransparentWidget || resolvedBackdrop.hasIntermediateHtml || !resolvedBackdrop.backdrop;
+    const glyphUseCssFallback = lite || isTransparentWidget || !resolvedBackdrop.backdrop;
 
     return (
       <div
@@ -968,7 +975,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         )}
 
         {/* 3D INTERACTIVE SCENE LAYER (glTF / GLB + Draco/Meshopt/KTX2 + Zero-Copy Glass Backdrop) */}
-        {layer.kind === "SCENE_3D" && (
+        {layer.kind === "SCENE_3D" && !lite && (
           <div
             style={{
               width: `${wPx}px`,
@@ -1017,7 +1024,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         )}
 
         {/* VIDEO LAYER */}
-        {layer.kind === "VIDEO" && layer.video && (
+        {layer.kind === "VIDEO" && layer.video && !lite && (
           <div
             style={{
               width: `${wPx}px`,
@@ -1083,7 +1090,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   radiusPx={plateRadiusPx}
                   tintRgb={tintRgb}
                   forceCssFallback={plateUseCssFallback}
-                  isThumbnail={isThumbnail}
+                  isThumbnail={lite}
                 />
               )}
               {imgUrl ? (
@@ -1238,7 +1245,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 radiusPx={plateRadiusPx}
                 tintRgb={tintRgb}
                 forceCssFallback={plateUseCssFallback}
-                isThumbnail={isThumbnail}
+                isThumbnail={lite}
               />
             )}
           </div>
@@ -1250,7 +1257,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           const pigmentRgb = hexToRgbTuple(rawColor);
           const glyphAlpha = layer.text.colorAlpha === undefined ? 1 : Math.max(0, Math.min(1, layer.text.colorAlpha));
           const fillRgba = colorWithAlpha(rawColor, glyphAlpha);
-          const resolved = evaluateFormula(layer.text.content, telemetry, project.globals, now);
+          const resolved = evaluateFormula(layer.text.content, telemetry, project.globals, now, fxWeather);
           const scaledFont = layer.text.fontSize * containerScale;
           const stretchY = Math.max(1, Math.min(2.8, layer.text.stemStretch || 1));
           const safeFamily = (layer.text.fontFamily || "Outfit").replace(/"/g, "");
@@ -1320,7 +1327,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   radiusPx={plateRadiusPx}
                   tintRgb={tintRgb}
                   forceCssFallback={plateUseCssFallback}
-                  isThumbnail={isThumbnail}
+                  isThumbnail={lite}
                 />
                 <div style={{ ...baseTextStyle, position: "relative", opacity }}>{resolved}</div>
               </div>
@@ -1377,7 +1384,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                     pigmentRgba={[pigmentRgb[0], pigmentRgb[1], pigmentRgb[2], glyphAlpha]}
                     glyphDropShadowPx={layer.text.shadowBlur}
                     forceCssFallback={glyphUseCssFallback}
-                    isThumbnail={isThumbnail}
+                    isThumbnail={lite}
                   />
                 </div>
               );
@@ -1432,7 +1439,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 radiusPx={plateRadiusPx}
                 tintRgb={tintRgb}
                 forceCssFallback={plateUseCssFallback}
-                isThumbnail={isThumbnail}
+                isThumbnail={lite}
               />
             )}
             <div
@@ -1479,7 +1486,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   if (probe) {
                     const safeFam = (layer.text.fontFamily || "Outfit").replace(/"/g, "");
                     probe.font = `${layer.text.fontWeight} ${layer.text.fontSize}px "${safeFam}", "Outfit", "Inter", "Segoe UI", sans-serif`;
-                    const resolvedTxt = evaluateFormula(layer.text.content, telemetry, project.globals, now);
+                    const resolvedTxt = evaluateFormula(layer.text.content, telemetry, project.globals, now, fxWeather);
                     const lsPx = layer.text.letterSpacing * layer.text.fontSize;
                     for (const ln of resolvedTxt.split("\n")) {
                       const chars = Array.from(ln);

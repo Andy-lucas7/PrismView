@@ -24,7 +24,7 @@ Documento irmão de `PRISMVIEW_IDENTIDADE_MOVIMENTO.md`. Seções 0, 1 e as etap
 3. Só animar `transform`, `opacity`, `clip-path` / `graphicsLayer`. Nada de layout/medição por quadro.
 4. Zero alocação por quadro (reusar objetos/arrays). Zero estado de UI por quadro (valor animado lido na camada de desenho, não via recomposição/re-render).
 5. Blur só em transições curtas e nunca em cartões vivos: usar **imagem pré-desfocada** com cross-fade (mesma técnica do `HubPreviewCache`).
-6. Só a View central é "viva" (render real). Vizinhas e grid usam **snapshot** em cache; descartar com `dispose()`/`recycle()` ao sair da janela de ±2.
+6. **Miniaturas em 3 níveis:** `full` (vidro, 3D e vídeo reais) só para 3 por vez (a central + as 2 laterais); as demais visíveis ficam `basic` (texto, imagem e formas; sem vidro/3D/vídeo); fora da tela vira poster (só a cor de fundo) e o render é descartado com `dispose()`/`recycle()`. Hora, data, clima, bateria e mídia nas miniaturas são **valores fixos** (18:45, quinta 12/03, 24 °C...), nunca relógio/telemetria ao vivo. PrismView: `engine/hubMock.ts` + `HubThumbnail`. Prismlock: `HUB_MOCK_ENV` (já existe) deve seguir os mesmos valores.
 7. Respeitar modo de energia e "reduzir movimento": blur → fade simples; spring → tween `fast`; intro pulada.
 8. Nada anima durante render pesado em tela cheia (Studio 3D ativo, jogo em foreground).
 

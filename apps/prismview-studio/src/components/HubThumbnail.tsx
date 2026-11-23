@@ -1,10 +1,11 @@
 import React, { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { DEFAULT_TELEMETRY, type PrismProject } from "../types/prism";
+import type { PrismProject } from "../types/prism";
+import { HUB_MOCK_TELEMETRY } from "../engine/hubMock";
 import { UnifiedCompositor } from "./UnifiedCompositor";
 import { HubLiveBudget } from "../engine/hubLiveBudget";
 
-/** Máx. de miniaturas com render real ao mesmo tempo (cada uma pode custar 1 WebGL; teto Chromium ~16). */
-const hubBudget = new HubLiveBudget(8);
+/** Miniaturas `full` (vidro/3D/vídeo reais): só 3 por vez (centro + 2 laterais). Teto Chromium ~16 WebGL. */
+const hubBudget = new HubLiveBudget(3);
 
 const POSTER_FALLBACK = "radial-gradient(circle at 50% 18%, #181920 0%, #09090C 62%, #050507 100%)";
 
@@ -17,10 +18,12 @@ function useIsLive(id: string): boolean {
 }
 
 /**
- * Miniatura do Hub: só renderiza de verdade quando visível E dentro do orçamento.
- * Fora disso mostra um poster leve e o compositor é desmontado (libera WebGL/vídeo).
- * `rank` explícito (carrossel: distância ao centro) sobrescreve o rank por visibilidade.
- * Memo + telemetria fixa: não re-renderiza no tick de 1,5 s.
+ * Miniatura do Hub, 3 níveis:
+ *  - `full`: dentro do orçamento (3 melhores ranks) → vidro, 3D e vídeo reais;
+ *  - `basic`: visível mas fora do orçamento → só o básico (texto, imagem, formas; sem vidro WebGL/3D/vídeo);
+ *  - poster: fora da tela → só a cor de fundo; compositor desmontado (libera WebGL/vídeo).
+ * Hora/data/clima/telemetria são fixos (`hubMock`). `rank` explícito (carrossel: 0 = centro,
+ * 1 = laterais, ...) sobrescreve o rank por visibilidade. Memo: nunca re-renderiza por telemetria.
  */
 export const HubThumbnail = React.memo(function HubThumbnail({
   project,
@@ -57,13 +60,14 @@ export const HubThumbnail = React.memo(function HubThumbnail({
       className="relative w-full h-full overflow-hidden"
       style={{ background: project.backgroundColor && project.backgroundColor !== "#000000" ? project.backgroundColor : POSTER_FALLBACK }}
     >
-      {live && (
+      {effective !== null && (
         <div className="absolute inset-0 prism-thumb-in">
           <UnifiedCompositor
             project={project}
-            telemetry={DEFAULT_TELEMETRY}
+            telemetry={HUB_MOCK_TELEMETRY}
             paused
             isThumbnail
+            thumbnailTier={live ? "full" : "basic"}
             interactive={false}
           />
         </div>
