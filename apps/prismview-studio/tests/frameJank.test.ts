@@ -10,25 +10,46 @@ const feed = (m: FrameJankMonitor, dt: number, n: number): boolean => {
 };
 
 test("144 Hz estável não degrada", () => {
+  assert.equal(feed(new FrameJankMonitor(), 6.9, 600), false);
+});
+
+test("queda sustentada para ~30 fps após aprender 144 Hz degrada", () => {
   const m = new FrameJankMonitor();
+  feed(m, 6.9, 160);
+  assert.equal(feed(m, 33, 400), true);
+});
+
+test("pico isolado (troca de card) não degrada", () => {
+  const m = new FrameJankMonitor();
+  feed(m, 6.9, 160);
+  assert.equal(feed(m, 45, 6), false);
+  assert.equal(feed(m, 6.9, 200), false);
+});
+
+test("1 quadro ruim a cada 10 (GC periódico) não degrada", () => {
+  const m = new FrameJankMonitor();
+  feed(m, 6.9, 160);
+  let fired = false;
+  for (let i = 0; i < 600; i++) fired = m.push(i % 10 === 0 ? 40 : 6.9) || fired;
+  assert.equal(fired, false);
+});
+
+test("aquecimento lento (montagem) é ignorado após reset", () => {
+  const m = new FrameJankMonitor();
+  feed(m, 6.9, 160);
+  m.reset();
+  assert.equal(feed(m, 50, 10), false);
   assert.equal(feed(m, 6.9, 300), false);
-});
-
-test("queda para ~30 fps após aprender 144 Hz degrada", () => {
-  const m = new FrameJankMonitor();
-  feed(m, 6.9, 80);
-  assert.equal(feed(m, 33, 120), true);
-});
-
-test("pico isolado não degrada", () => {
-  const m = new FrameJankMonitor();
-  feed(m, 6.9, 80);
-  assert.equal(feed(m, 40, 3), false);
-  assert.equal(feed(m, 6.9, 100), false);
 });
 
 test("intervalos de pausa (>250 ms) são ignorados", () => {
   const m = new FrameJankMonitor();
-  feed(m, 16.7, 80);
+  feed(m, 16.7, 160);
   assert.equal(feed(m, 900, 100), false);
+});
+
+test("monitor 60 Hz: 60 fps estável não degrada, 25 fps sustentado degrada", () => {
+  const m = new FrameJankMonitor();
+  assert.equal(feed(m, 16.7, 300), false);
+  assert.equal(feed(m, 40, 400), true);
 });
