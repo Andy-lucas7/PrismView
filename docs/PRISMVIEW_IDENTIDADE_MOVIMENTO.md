@@ -14,7 +14,7 @@ Documento irmão de `PRISMLOCK_IDENTIDADE_MOVIMENTO.md`. Seções 0, 1 e as etap
 | **Hub** | Tela inicial. Principal = **Carrossel**; alternativa = **Grid**. |
 | **Studio** | Tela de edição de uma View. |
 | **Aplicar** | Definir a View como wallpaper/lock ativo ou fixar o widget. |
-| Abas do Hub | `Wallpapers` · `Widgets` · `Cenas 3D` (PrismView) / `Telas` · `Widgets` (Prismlock) |
+| Abas do Hub | `Wallpapers` · `Widgets` · `Templates` (PrismView) / `Telas` · `Widgets` (Prismlock) |
 
 **Tokens de movimento: fonte única** `docs/motion.tokens.json`, consumida por TS (PrismView) e Kotlin (Prismlock) via script de geração. Nenhum número de duração/easing fora dele.
 
@@ -136,6 +136,7 @@ Handoff: assim que o Studio entrega o 1º quadro, cross-fade snapshot → Studio
 - Inspiração de padrões do react-bits; implementar como componentes próprios (verificar licença antes de copiar qualquer código).
 
 ### Etapa 7: Tokens, vocabulário e docs ★ simples (fazer primeiro)
+- **Já feito no PrismView:** `<MotionConfig reducedMotion="user">` na raiz do `App.tsx` e `@media (prefers-reduced-motion)` no `prism.css`. Falta o resto abaixo.
 - Criar `docs/motion.tokens.json` + geradores (TS e Kotlin).
 - Unificar paleta: `#000000` / `#0D0D0F` / `#141418` / `#A1A1AA` / `#27272A`. *(PrismView hoje mistura `#060608`/`#0d0d10` com `#000`: escolher um conjunto e aplicar em `tailwind.config.js` + `prism.css`.)*
 - Renomear na UI: "tema/tela/projeto" → **View**; abas e botões conforme o vocabulário.
@@ -166,4 +167,24 @@ Handoff: assim que o Studio entrega o 1º quadro, cross-fade snapshot → Studio
 - Teclado: ←/→ no carrossel, Enter = Editar, Esc = voltar do Studio, `G` = alternar Grid.
 - Verificação: DevTools → Performance (frames > orçamento), `npm run build` e checar tamanho do chunk principal após cada etapa.
 
-**Plano de entrega sugerido (1 etapa por sessão):** 7 → 2 → 1 → 3 → 4 → 5 → 6.
+**Pré-requisito novo: snapshots das miniaturas.** `HubThumbnail` (`App.tsx`) ainda é um `UnifiedCompositor` completo por card (480×270, `paused`), ou seja, 1 WebGL cada. Carrossel, grid e expansão dependem de um cache de `ImageBitmap` por `id + versão`. Fica como **Etapa 2a**, dentro do carrossel, e vem antes dele.
+
+**Estado atual do código (auditado no `main` de 23/11/2026, 18:18)**
+
+| Item | Estado |
+|---|---|
+| Movimento reduzido (`MotionConfig` + CSS) | Feito |
+| Toast/diálogos com `SPRING_TACTILE` + `AnimatePresence`, `useDialogFocus` | Feito |
+| Módulos separados (`UnifiedCompositorParts`, `InspectorControls`, `Scene3DLayerParts`, `types/prism*`) | Feito: componentes de movimento vão em `src/components/motion/`, sem inflar o `App.tsx` |
+| `motion.ts`, tokens, paleta única | Pendente (Etapa 7) |
+| Snapshots de miniaturas | Pendente (2a) |
+| Carrossel | Pendente (2); o Hub é grid de 3 colunas nas abas `WALLPAPERS`, `WIDGETS`, `TEMPLATES` |
+| Expandir View → Studio | Pendente (1); `if (editing)` é corte seco |
+| Transição de abas | Pendente (4); `hubTab ===` é render condicional |
+| Grid como modo alternativo | Pendente (5); não há modo de visualização |
+| Intro | Pendente (3) |
+
+**Aplicar já é instantâneo no PrismView** (commit `2363599`): o fade + blur da Etapa 1 roda **em paralelo** ao aplicar, sem atrasar o motor nativo.
+
+**Plano de entrega sugerido (1 etapa por sessão):** 7 → 2a → 2 → 1 → 4 → 5 → 3 → 6.
+*(Intro depois do grid porque o PrismView ainda não tem nenhuma; o ganho visual de Hub/Studio vem antes. Se preferir o ganho rápido, a Etapa 4 é independente e pode vir logo após a 7.)*
