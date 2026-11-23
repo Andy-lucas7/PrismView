@@ -566,6 +566,8 @@ thread_local! {
 }
 
 const RECOVERY_TIMER_ID: usize = 0x5052;
+/// Checagem do `stop` na thread de recuperação (a saída do app encerra o processo de qualquer jeito).
+const RECOVERY_STOP_POLL_MS: u32 = 30_000;
 
 unsafe extern "system" fn recovery_wnd_proc(
     hwnd: HWND,
@@ -688,7 +690,10 @@ where
                 None,
             ) {
                 if !hwnd.is_invalid() {
-                    let _ = SetTimer(hwnd, RECOVERY_TIMER_ID, 500, None);
+                    // Hooks de visibilidade vivem nesta thread (tem laço de mensagens).
+                    let _vis_hooks = crate::vis_events::VisibilityHooks::install();
+                    // Só confere o `stop` (saída); eventos chegam por mensagem, não por este timer.
+                    let _ = SetTimer(hwnd, RECOVERY_TIMER_ID, RECOVERY_STOP_POLL_MS, None);
                     let mut msg = MSG::default();
                     loop {
                         let ret = GetMessageW(&mut msg, HWND::default(), 0, 0).0;

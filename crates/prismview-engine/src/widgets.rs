@@ -184,6 +184,7 @@ pub struct Scene3dDeps<'a> {
     pub loader: &'a mut AssetLoader,
     pub waker: Option<Arc<dyn Fn() + Send + Sync>>,
     pub render_scale_cap: f32,
+    pub msaa_cap: u32,
 }
 
 /// Um widget no ar. Ordem dos campos = ordem de drop: 3D → canvas → renderer → superfície
@@ -311,6 +312,7 @@ impl WidgetRuntime {
             s
         });
         scene3d.set_render_scale_cap(deps.render_scale_cap);
+        scene3d.set_msaa_cap(deps.msaa_cap);
         scene3d.set_config(gpu, config, deps.loader);
         scene3d.set_media_cover(gpu, cover);
         self.scene3d_bound_gen = SCENE3D_UNBOUND;
@@ -329,9 +331,10 @@ impl WidgetRuntime {
         }
     }
 
-    pub fn set_render_scale_cap(&mut self, cap: f32) {
+    pub fn set_render_scale_cap(&mut self, cap: f32, msaa_cap: u32) {
         if let Some(s) = self.scene3d.as_mut() {
             s.set_render_scale_cap(cap);
+            s.set_msaa_cap(msaa_cap);
         }
         self.scene3d_next_at = None;
     }

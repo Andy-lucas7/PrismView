@@ -449,11 +449,18 @@ pub struct Scene3dStats {
 
 // ───────────────────────── Renderer ─────────────────────────
 
+/// Acima disto (px de render) o MSAA 4× é desligado mesmo no modo Normal.
+const MSAA_MAX_PIXELS: u64 = 2560 * 1440;
+
 pub struct Scene3dRenderer {
     shared: Arc<Scene3dShared>,
     sample_count: u32,
     /// [opaco, opaco double-sided, blend, blend double-sided]
     pipelines: [wgpu::RenderPipeline; 4],
+    /// Pipelines do outro `sample_count` (1 ↔ 4), guardados ao trocar: voltar não recompila.
+    spare_pipelines: Option<(u32, [wgpu::RenderPipeline; 4])>,
+    /// Teto de MSAA do PowerGovernor (`PowerCaps::msaa`).
+    msaa_cap: u32,
     tonemap_pipeline: wgpu::RenderPipeline,
 
     config: Scene3dConfig,
@@ -579,6 +586,8 @@ impl Scene3dRenderer {
             shared,
             sample_count,
             pipelines,
+            spare_pipelines: None,
+            msaa_cap: sample_count,
             tonemap_pipeline,
             config: Scene3dConfig::default(),
             objects: Vec::new(),
@@ -648,6 +657,36 @@ impl Scene3dRenderer {
             self.viewport = (width, height);
             self.dirty = true;
         }
+    }
+
+    /// Teto de MSAA vindo do PowerGovernor (Normal = 4; Eco/Ultra = 1). O efetivo também cai para
+    /// 1 acima de 2560×1440 de render (alvo MSAA HDR em 4K custa ~265 MB). Aplicado no `render`.
+    pub fn set_msaa_cap(&mut self, samples: u32) {
+        let samples = if samples >= 4 { 4 } else { 1 };
+        if samples != self.msaa_cap {
+            self.msaa_cap = samples;
+            self.dirty = true;
+        }
+    }
+
+    /// Troca o `sample_count` (pipelines + alvos) só quando o efetivo muda.
+    fn apply_msaa(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        let wanted = if self.msaa_cap >= 4 && u64::from(size.0) * u64::from(size.1) <= MSAA_MAX_PIXELS {
+            4
+        } else {
+            1
+        };
+        if wanted == self.sample_count {
+            return;
+        }
+        let next = match self.spare_pipelines.take() {
+            Some((count, pipelines)) if count == wanted => pipelines,
+            _ => build_pbr_pipelines(&self.shared, device, wanted),
+        };
+        let previous = std::mem::replace(&mut self.pipelines, next);
+        self.spare_pipelines = Some((self.sample_count, previous));
+        self.sample_count = wanted;
+        self.targets = None; // MSAA/profundidade com o novo sample_count
     }
 
     /// Teto de escala de render vindo do PowerGovernor (`renderScaleCap`).
@@ -1522,6 +1561,7 @@ impl Scene3dRenderer {
         let device = gpu.device();
         let queue = gpu.queue();
         let size = self.render_size();
+        self.apply_msaa(device, size);
         self.ensure_targets(device, size);
 
         // 1. Matrizes de objeto (pai antes do filho).

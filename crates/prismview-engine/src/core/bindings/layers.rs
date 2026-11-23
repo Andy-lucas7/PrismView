@@ -220,6 +220,12 @@ impl LayerBindingSolver {
         self.animating && self.bindings.iter().any(|b| b.layer_id == layer_id)
     }
 
+    /// A camada tem algum binding (mesmo com delta nulo agora).
+    #[inline]
+    pub fn has_binding(&self, layer_id: &str) -> bool {
+        self.bindings.iter().any(|b| b.layer_id == layer_id)
+    }
+
     /// Delta atual da camada (`None` = sem binding ou delta nulo).
     #[inline]
     pub fn fx(&self, layer_id: &str) -> Option<LayerFx> {

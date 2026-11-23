@@ -41,10 +41,10 @@ use prism_core::schema::{
     VisibilityCondition,
 };
 
-use super::bindings::LayerBindingSolver;
+use super::bindings::{LayerBindingSolver, LayerFx};
 use super::compositor::{
-    BlendKind, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind, Scene3dPlacement,
-    TextureId,
+    BlendKind, BoundSubtree, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind,
+    Scene3dPlacement, TextureId,
 };
 use super::interaction::{DesktopAction, HitRegion};
 use super::signals::{SignalKind, SignalSnapshot};
@@ -98,6 +98,36 @@ impl Affine {
     /// Fator de escala uniforme (norma da coluna X).
     fn scale(&self) -> f32 {
         self.m[0].hypot(self.m[1])
+    }
+
+    /// Inversa (`None` se degenerada).
+    fn inverse(&self) -> Option<Self> {
+        let m = &self.m;
+        let det = m[0] * m[3] - m[2] * m[1];
+        if !det.is_finite() || det.abs() < 1e-8 {
+            return None;
+        }
+        let k = 1.0 / det;
+        let inv = [m[3] * k, -m[1] * k, -m[2] * k, m[0] * k];
+        let t = [
+            -(inv[0] * self.t[0] + inv[2] * self.t[1]),
+            -(inv[1] * self.t[0] + inv[3] * self.t[1]),
+        ];
+        Some(Self { m: inv, t })
+    }
+
+    /// `self ∘ other`.
+    fn then_apply(&self, other: &Self) -> Self {
+        let (a, b) = (&self.m, &other.m);
+        Self {
+            m: [
+                a[0] * b[0] + a[2] * b[1],
+                a[1] * b[0] + a[3] * b[1],
+                a[0] * b[2] + a[2] * b[3],
+                a[1] * b[2] + a[3] * b[3],
+            ],
+            t: self.apply(other.t),
+        }
     }
 
     fn is_identity_linear(&self) -> bool {
@@ -184,6 +214,20 @@ struct ImageEntry {
     h: u32,
 }
 
+/// Teto de memória da decodificação de uma imagem (bytes).
+const IMAGE_MAX_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+/// Lado máximo aceito na decodificação (px); maiores são recusados.
+const IMAGE_MAX_SIDE: u32 = 16384;
+
+/// Fator (≤ 1) para a imagem ainda cobrir a saída inteira (`viewport`) sem ultrapassar `max`.
+/// Maior que isso só gastaria VRAM: na tela ela nunca aparece maior que a saída.
+fn image_target_scale(size: (u32, u32), viewport: (u32, u32), max: u32) -> f32 {
+    let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    let cover = (viewport.0.max(1) as f32 / w).max(viewport.1.max(1) as f32 / h);
+    let device = max.max(1) as f32 / w.max(h);
+    cover.min(device).min(1.0)
+}
+
 /// Acorda o loop quando uma imagem termina de decodificar (registrado 1× pelo host).
 pub type ImageWaker = Arc<dyn Fn() + Send + Sync>;
 
@@ -218,6 +262,7 @@ impl ImageCache {
     fn get(
         &mut self,
         path: &Path,
+        viewport: (u32, u32),
         compositor: &mut Compositor2D,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -231,7 +276,7 @@ impl ImageCache {
         }
         let key = key.into_owned();
         let Some(rx) = self.pending.get(&key) else {
-            self.spawn_decode(path, key, compositor.max_texture_dim());
+            self.spawn_decode(path, key, compositor.max_texture_dim(), viewport);
             return None;
         };
         let decoded = match rx.try_recv() {
@@ -243,7 +288,7 @@ impl ImageCache {
         self.pending.remove(&key);
         let entry = decoded.and_then(|img| {
             compositor
-                .create_texture_rgba(device, queue, img.w, img.h, &img.rgba)
+                .create_texture_rgba_mipped(device, queue, img.w, img.h, &img.rgba)
                 .map(|id| ImageEntry { id, w: img.w, h: img.h })
         });
         match entry {
@@ -259,14 +304,14 @@ impl ImageCache {
         }
     }
 
-    fn spawn_decode(&mut self, path: &Path, key: String, max_dim: u32) {
+    fn spawn_decode(&mut self, path: &Path, key: String, max_dim: u32, viewport: (u32, u32)) {
         let (tx, rx) = mpsc::channel();
         let completed = Arc::clone(&self.completed);
         let path = path.to_path_buf();
         let spawned = std::thread::Builder::new()
             .name("prismview-image-decode".into())
             .spawn(move || {
-                let decoded = Self::decode(&path, max_dim);
+                let decoded = Self::decode(&path, max_dim, viewport);
                 let delivered = tx.send(decoded).is_ok();
                 completed.store(true, Ordering::Release);
                 if delivered {
@@ -287,8 +332,19 @@ impl ImageCache {
     }
 
     /// Decodifica (CPU, fora do loop), limita ao máximo do device e pré-multiplica.
-    fn decode(path: &Path, max: u32) -> Option<DecodedImage> {
-        let mut img = match image::open(path) {
+    /// Decodifica com limites (sem "bomba" de descompressão), reduz ao necessário para cobrir a
+    /// saída (`viewport`, px) e ao máximo do device, e pré-multiplica. Fora do loop de render.
+    fn decode(path: &Path, max: u32, viewport: (u32, u32)) -> Option<DecodedImage> {
+        let decoded = (|| -> image::ImageResult<image::DynamicImage> {
+            let mut reader = image::ImageReader::open(path)?.with_guessed_format()?;
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(IMAGE_MAX_ALLOC_BYTES);
+            limits.max_image_width = Some(IMAGE_MAX_SIDE);
+            limits.max_image_height = Some(IMAGE_MAX_SIDE);
+            reader.limits(limits);
+            reader.decode()
+        })();
+        let mut img = match decoded {
             Ok(img) => img.into_rgba8(),
             Err(err) => {
                 eprintln!("[scene2d] imagem {}: {err}", path.display());
@@ -296,11 +352,11 @@ impl ImageCache {
             }
         };
         let (w, h) = img.dimensions();
-        if w > max || h > max {
-            let k = max as f32 / w.max(h) as f32;
-            let nw = ((w as f32 * k) as u32).max(1);
-            let nh = ((h as f32 * k) as u32).max(1);
-            img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+        let k = image_target_scale((w, h), viewport, max);
+        if k < 1.0 {
+            let nw = ((w as f32 * k).ceil() as u32).max(1);
+            let nh = ((h as f32 * k).ceil() as u32).max(1);
+            img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::CatmullRom);
         }
         let (w, h) = img.dimensions();
         for px in img.chunks_exact_mut(4) {
@@ -345,6 +401,9 @@ struct VideoBinding {
     slots: Vec<(usize, TextureId)>,
     generation: u64,
     current: Option<TextureId>,
+    /// Id estável usado na lista de desenho; aponta para `current` (troca de frame = só
+    /// `set_alias`, sem rebuild).
+    alias: Option<TextureId>,
     size: (u32, u32),
     content_hash: u64,
 }
@@ -452,6 +511,9 @@ pub struct SceneRenderer {
     videos: HashMap<String, VideoBinding>,
     /// Muda a cada frame novo de fonte viva (vídeo, cena 3D): chave do blur do vidro.
     live_token: u64,
+    /// Geração dos deltas de binding: muda a cada `apply_signals` com mudança. As listas
+    /// recebem o delta pelo caminho rápido (sem rebuild) quando possível.
+    fx_gen: u64,
     svgs: SvgCache,
     /// `TouchAction`s não-mídia da cena (índice = `DesktopAction::Custom`) e id da camada → índice.
     touch_table: Vec<TouchAction>,
@@ -480,6 +542,7 @@ impl SceneRenderer {
             glass: GlassRenderer::new(gpu.device(), format),
             videos: HashMap::new(),
             live_token: 0,
+            fx_gen: 0,
             svgs: SvgCache::default(),
             touch_table: Vec::new(),
             touch_index: HashMap::new(),
@@ -550,7 +613,61 @@ impl SceneRenderer {
         if self.scene.is_none() || !self.layer_bindings.solve(snap, dt) {
             return false;
         }
-        self.version += 1;
+        // Não é mudança estrutural: o `render` reaplica o delta nas instâncias (caminho rápido)
+        // e só refaz a lista se a subárvore não permitir.
+        self.fx_gen = self.fx_gen.wrapping_add(1);
+        true
+    }
+
+    /// Caminho rápido dos bindings: volta à base do rebuild e aplica, por subárvore com binding
+    /// (filhos antes dos pais), `xf(fx1) ∘ xf(fx0)⁻¹`. Sem alocação. `false` = precisa de rebuild
+    /// (opacidade/vidro mudou, subárvore com vidro/3D, camada pulada, estado de animação virou).
+    fn apply_bindings_fast(canvas: &mut Canvas, solver: &LayerBindingSolver, queue: &wgpu::Queue) -> bool {
+        if canvas.bound_skipped {
+            return false;
+        }
+        canvas.reset_to_base();
+        for i in 0..canvas.bound.len() {
+            let (seq, hits, lin, t) = {
+                let b = &canvas.bound[i];
+                let fx1 = solver.fx(&b.key).unwrap_or_default();
+                if solver.is_layer_animating(&b.key) != b.moving0 {
+                    return false;
+                }
+                if fx1 == b.fx0 {
+                    continue;
+                }
+                if b.rigid
+                    || (fx1.opacity - b.fx0.opacity).abs() > 1e-4
+                    || fx1.glass != b.fx0.glass
+                {
+                    return false;
+                }
+                let parent = Affine {
+                    m: b.parent_m,
+                    t: b.parent_t,
+                };
+                let xf = |fx: &LayerFx| {
+                    parent.child(
+                        [
+                            b.center_base[0] + fx.offset[0] * b.ui,
+                            b.center_base[1] + fx.offset[1] * b.ui,
+                        ],
+                        b.rot_base + fx.rotation_deg.to_radians(),
+                        b.scale_base * (1.0 + fx.scale),
+                    )
+                };
+                let Some(inv0) = xf(&b.fx0).inverse() else {
+                    return false;
+                };
+                let delta = xf(&fx1).then_apply(&inv0);
+                (b.seq.clone(), b.hits.clone(), delta.m, delta.t)
+            };
+            if !canvas.transform_range(&seq, &hits, lin, t) {
+                return false;
+            }
+        }
+        canvas.upload_instances(queue);
         true
     }
 
@@ -638,6 +755,7 @@ impl SceneRenderer {
                     slots: Vec::with_capacity(5),
                     generation: frame.generation,
                     current: None,
+                    alias: None,
                     size: (frame.width, frame.height),
                     content_hash: hash_str(&key),
                 },
@@ -649,6 +767,10 @@ impl SceneRenderer {
         if entry.generation != frame.generation {
             for (_, id) in entry.slots.drain(..) {
                 self.compositor.release_texture(id);
+            }
+            if let Some(alias) = entry.alias.take() {
+                self.compositor.release_texture(alias);
+                self.version += 1;
             }
             entry.current = None;
             entry.generation = frame.generation;
@@ -663,9 +785,20 @@ impl SceneRenderer {
             }
         };
         let size = (frame.width, frame.height);
-        if entry.current != Some(id) || entry.size != size {
+        if entry.current != Some(id) {
             entry.current = Some(id);
-            entry.size = size;
+            match entry.alias {
+                // Frame novo: só redireciona o alias (lista de desenho intacta).
+                Some(alias) => self.compositor.set_alias(alias, id),
+                // 1º frame: a camada passa a existir na lista → rebuild estrutural.
+                None => {
+                    entry.alias = Some(self.compositor.create_alias(id));
+                    self.version += 1;
+                }
+            }
+        }
+        if entry.size != size {
+            entry.size = size; // UV de cover depende do tamanho → rebuild
             self.version += 1;
         }
         self.live_token = self.live_token.wrapping_add(1);
@@ -680,6 +813,9 @@ impl SceneRenderer {
         for (_, v) in self.videos.drain() {
             for (_, id) in v.slots {
                 self.compositor.release_texture(id);
+            }
+            if let Some(alias) = v.alias {
+                self.compositor.release_texture(alias);
             }
             self.glass.invalidate_backdrop(v.content_hash);
         }
@@ -908,11 +1044,17 @@ impl SceneRenderer {
         } else {
             1.0
         };
-        let stale = canvas.built_version != self.version
+        let mut stale = canvas.built_version != self.version
             || canvas.built_size != (w, h)
             || (canvas.built_scale - ui_scale).abs() > 1e-4;
+        if !stale && canvas.built_fx_gen != self.fx_gen {
+            // Só os deltas de binding mudaram (parallax, molas): sem layout nem reordenação.
+            stale = !Self::apply_bindings_fast(canvas, &self.layer_bindings, gpu.queue());
+            canvas.built_fx_gen = self.fx_gen;
+        }
         if stale {
             self.rebuild(gpu, canvas, canvas_key, (w, h), ui_scale, ctx);
+            canvas.built_fx_gen = self.fx_gen;
             canvas.built_version = self.version;
             canvas.built_size = (w, h);
             canvas.built_scale = ui_scale;
@@ -1246,7 +1388,7 @@ impl Frame<'_> {
             let binding = self
                 .resolve_asset(path)
                 .and_then(|p| videos.get(&*p.to_string_lossy()));
-            if let Some((id, v)) = binding.and_then(|v| v.current.map(|id| (id, v))) {
+            if let Some((id, v)) = binding.and_then(|v| v.alias.map(|id| (id, v))) {
                 let inst = QuadInstance::new(center, half, Affine::IDENTITY.m, 1.0)
                     .kind(QuadKind::Opaque)
                     .uv(cover_uv(v.size.0, v.size.1, vw, vh));
@@ -1257,7 +1399,7 @@ impl Frame<'_> {
             if let Some(path) = self.resolve_asset(path) {
                 if let Some(img) = self
                     .images
-                    .get(&path, self.compositor, self.device, self.queue)
+                    .get(&path, (self.vw as u32, self.vh as u32), self.compositor, self.device, self.queue)
                 {
                     let inst = QuadInstance::new(center, half, Affine::IDENTITY.m, 1.0)
                         .kind(QuadKind::Texture)
@@ -1392,20 +1534,32 @@ impl Frame<'_> {
         forced_center: Option<[f32; 2]>,
         parent_moving: bool,
     ) {
+        let bound = self.fx.has_binding(layer.id.as_str());
         if !self.is_visible(layer) {
+            // Binding pode trazê-la de volta: o caminho rápido não tem itens dela.
+            self.canvas.bound_skipped |= bound;
             return;
         }
         // Base (estática/FX) + delta dos bindings: o delta é recalculado por quadro, sem deriva.
         let fx = self.fx.fx(layer.id.as_str()).unwrap_or_default();
-        let moving = parent_moving || self.fx.is_layer_animating(layer.id.as_str());
+        let own_moving = self.fx.is_layer_animating(layer.id.as_str());
+        let moving = parent_moving || own_moving;
         let opacity = (self.f(&layer.opacity) + fx.opacity).clamp(0.0, 1.0) * inherited_opacity;
         if opacity <= 0.003 {
+            self.canvas.bound_skipped |= bound;
             return;
         }
-        let scale = self.f(&layer.scale) * (1.0 + fx.scale);
+        let base_scale = self.f(&layer.scale);
+        let scale = base_scale * (1.0 + fx.scale);
         if scale.abs() < 1e-3 {
+            self.canvas.bound_skipped |= bound;
             return;
         }
+        // Início da subárvore (caminho rápido dos bindings: `Canvas::bound`).
+        let seq0 = self.canvas.next_seq();
+        let hits0 = self.canvas.hits.len();
+        let markers0 = self.canvas.marker_count();
+        let had_scene3d = self.canvas.scene3d.is_some();
         let ui = self.ui;
 
         let mut text_draw = None;
@@ -1460,6 +1614,13 @@ impl Frame<'_> {
         };
         let rot = (self.f(&layer.rotation_deg) + fx.rotation_deg).to_radians();
         let xf = parent_xf.child(center, rot, scale);
+        // Parâmetros sem o delta do binding (o caminho rápido recompõe com o delta novo).
+        let bound_base = bound.then(|| {
+            (
+                [center[0] - fx.offset[0] * ui, center[1] - fx.offset[1] * ui],
+                rot - fx.rotation_deg.to_radians(),
+            )
+        });
 
         // Controle de mídia tocável: mesma caixa orientada do desenho (mín. 10 px lógicos).
         let action = DesktopAction::from_touch(layer.touch.action_type).or_else(|| {
@@ -1488,21 +1649,41 @@ impl Frame<'_> {
             LayerKind::Stack | LayerKind::Group | LayerKind::DepthSubject => {}
         }
 
-        if layer.children.is_empty() {
-            return;
-        }
-        if layer.kind == LayerKind::Stack {
-            self.stack_children(layer, size, &xf, opacity, moving);
-        } else {
-            let pb = ParentBox {
-                left: -size.w * 0.5,
-                top: -size.h * 0.5,
-                w: size.w,
-                h: size.h,
-            };
-            for child in &layer.children {
-                self.layer(child, &pb, xf, opacity, None, moving);
+        if !layer.children.is_empty() {
+            if layer.kind == LayerKind::Stack {
+                self.stack_children(layer, size, &xf, opacity, moving);
+            } else {
+                let pb = ParentBox {
+                    left: -size.w * 0.5,
+                    top: -size.h * 0.5,
+                    w: size.w,
+                    h: size.h,
+                };
+                for child in &layer.children {
+                    self.layer(child, &pb, xf, opacity, None, moving);
+                }
             }
+        }
+
+        // Fim da subárvore: pós-ordem (filhos já gravados antes deste pai).
+        if let Some((center_base, rot_base)) = bound_base {
+            let rigid = self.canvas.marker_count() != markers0
+                || (!had_scene3d && self.canvas.scene3d.is_some());
+            let entry = BoundSubtree {
+                key: Arc::from(layer.id.as_str()),
+                seq: seq0..self.canvas.next_seq(),
+                hits: hits0..self.canvas.hits.len(),
+                parent_m: parent_xf.m,
+                parent_t: parent_xf.t,
+                center_base,
+                rot_base,
+                scale_base: base_scale,
+                ui,
+                fx0: fx,
+                moving0: own_moving,
+                rigid,
+            };
+            self.canvas.bound.push(entry);
         }
     }
 
@@ -1892,7 +2073,7 @@ impl Frame<'_> {
         let Some(v) = videos.get(&*path.to_string_lossy()) else {
             return;
         };
-        let Some(id) = v.current else {
+        let Some(id) = v.alias else {
             return; // 1º frame ainda não decodificado; `set_video_frame` refaz a lista
         };
         let scale = xf.scale();
@@ -1965,7 +2146,7 @@ impl Frame<'_> {
         };
         let Some(img) = self
             .images
-            .get(&path, self.compositor, self.device, self.queue)
+            .get(&path, (self.vw as u32, self.vh as u32), self.compositor, self.device, self.queue)
         else {
             return;
         };
@@ -1999,4 +2180,44 @@ struct ShadowQuad {
     basis: [f32; 4],
     scale: f32,
     radius: f32,
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::Affine;
+
+    fn close(a: [f32; 2], b: [f32; 2]) -> bool {
+        (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
+    }
+
+    /// O delta `xf1 ∘ xf0⁻¹` leva qualquer ponto desenhado com `xf0` ao mesmo ponto com `xf1`
+    /// (o que o caminho rápido aplica às instâncias em vez de refazer o layout).
+    #[test]
+    fn delta_maps_old_world_to_new_world() {
+        let parent = Affine::IDENTITY.child([400.0, 300.0], 0.3, 1.5);
+        let xf0 = parent.child([12.0, -8.0], 0.1, 1.0);
+        let xf1 = parent.child([20.0, 4.0], 0.25, 1.2);
+        let delta = xf1.then_apply(&xf0.inverse().expect("inversível"));
+        for local in [[0.0, 0.0], [50.0, -20.0], [-7.5, 33.0]] {
+            assert!(close(delta.apply(xf0.apply(local)), xf1.apply(local)));
+        }
+    }
+
+    #[test]
+    fn image_is_reduced_to_cover_the_output_only() {
+        use super::image_target_scale;
+        // 6000×4000 num 1080p: cobre com 1920×1280 (k = 0,32).
+        let k = image_target_scale((6000, 4000), (1920, 1080), 16384);
+        assert!((k - 0.32).abs() < 0.01, "k = {k}");
+        // Imagem menor que a saída nunca é ampliada aqui.
+        assert_eq!(image_target_scale((800, 600), (1920, 1080), 16384), 1.0);
+        // Teto do device vence.
+        assert!(image_target_scale((40000, 100), (100, 100), 16384) <= 16384.0 / 40000.0);
+    }
+
+    #[test]
+    fn degenerate_affine_has_no_inverse() {
+        let flat = Affine::IDENTITY.child([0.0, 0.0], 0.0, 0.0);
+        assert!(flat.inverse().is_none());
+    }
 }

@@ -381,6 +381,7 @@ impl NativeApp {
         if self.scene3d.is_none() {
             let mut scene3d = Scene3dRenderer::new(shared, gpu, Scene3dOptions::default());
             scene3d.set_render_scale_cap(self.governor.caps().render_scale_cap);
+            scene3d.set_msaa_cap(self.governor.caps().msaa);
             if let Some(proxy) = proxy {
                 scene3d.set_waker(Some(Arc::new(move || {
                     let _ = proxy.wake();
@@ -840,6 +841,7 @@ impl NativeApp {
                 loader,
                 waker,
                 render_scale_cap: cap,
+                msaa_cap: self.governor.caps().msaa,
             }),
             _ => None,
         };
@@ -945,10 +947,11 @@ impl NativeApp {
             }
             if let Some(scene3d) = self.scene3d.as_mut() {
                 scene3d.set_render_scale_cap(caps.render_scale_cap);
+                scene3d.set_msaa_cap(caps.msaa);
             }
             for w in &mut self.widgets {
                 w.set_post_processing(caps.post_processing);
-                w.set_render_scale_cap(caps.render_scale_cap);
+                w.set_render_scale_cap(caps.render_scale_cap, caps.msaa);
             }
             self.scene3d_next_at = None;
         }

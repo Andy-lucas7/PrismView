@@ -5,6 +5,7 @@ mod log_file;
 mod native_engine;
 mod native_scene;
 mod reactive_sensors;
+mod vis_events;
 
 use desktop_host::{GsmtcHandle, LiveMediaDto, MediaCommand, MonitorInfoDto};
 use reactive_sensors::ReactiveSensorsHandle;
@@ -525,7 +526,18 @@ fn prismview_root_dir() -> PathBuf {
         .clone()
 }
 
+/// Thread `prism-bg-monitor` (dorme em `park` quando não há trabalho; ver `wake_background`).
+static BG_THREAD: OnceLock<thread::Thread> = OnceLock::new();
+
+/// Acorda a thread de fundo (evento de visibilidade, widget novo/movido, saída, recuperação).
+fn wake_background() {
+    if let Some(t) = BG_THREAD.get() {
+        t.unpark();
+    }
+}
+
 fn open_or_focus_studio(app: &AppHandle) {
+    wake_background();
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.unminimize();
         let _ = win.show();
@@ -1856,6 +1868,7 @@ fn apply_manual_pause_inner(app: &AppHandle, state: &SharedState, paused: bool) 
         let mut st = state.lock().map_err(|e| e.to_string())?;
         st.manual_paused = paused;
         st.force_vis_resync = true;
+        vis_events::mark_dirty();
         save_session_from_state(&st);
 
         let wgs: Vec<(String, bool)> = st
@@ -1907,6 +1920,7 @@ fn widget_window_ready(
         let mut st = state.lock().map_err(|e| e.to_string())?;
         let monitors = ensure_monitors_loaded(&mut st);
         st.ready_windows.insert(label);
+        vis_events::mark_dirty();
         let proj = st.pinned_widgets.get(&widget_id).cloned();
         let (wx, wy) = phys_pos.unwrap_or_else(|| {
             let x = proj
@@ -2494,10 +2508,21 @@ fn get_live_telemetry(state: tauri::State<'_, SharedState>) -> Result<LiveTeleme
     Ok(build_telemetry_snapshot(&hostname, &media_cache))
 }
 
+/// Telemetria para janelas visíveis (Hub/widgets).
+const TELEMETRY_INTERVAL: Duration = Duration::from_millis(1500);
+/// Intervalo mínimo entre recálculos de cobertura (arrastos geram muitos eventos).
+const VIS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+/// Rede de segurança para eventos perdidos (só com widgets/Hub visíveis).
+const VIS_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
+
 fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<AtomicBool>) {
     thread::Builder::new()
         .name("prism-bg-monitor".to_string())
         .spawn(move || {
+            if BG_THREAD.set(thread::current()).is_err() {
+                eprintln!("[prismview-studio] prism-bg-monitor já registrado");
+            }
+            vis_events::set_waker(Box::new(wake_background));
             let mut last_global_vis = true;
             let mut last_window_vis: HashMap<String, bool> = HashMap::new();
             let boot_past = Instant::now()
@@ -2551,7 +2576,12 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                     .and_then(|w| w.is_visible().ok())
                     .unwrap_or(false);
 
-                if need_resync || now.duration_since(last_vis_check) >= Duration::from_millis(500) {
+                // Cobertura do desktop só sob evento (`vis_events`), no máx. 1×/100 ms durante
+                // arrastos; rede de segurança a cada 5 s.
+                let vis_due = now.duration_since(last_vis_check) >= VIS_MIN_INTERVAL
+                    && (vis_events::take_dirty()
+                        || now.duration_since(last_vis_check) >= VIS_SAFETY_INTERVAL);
+                if need_resync || vis_due {
                     last_vis_check = now;
                     let studio_hwnd = main_win
                         .as_ref()
@@ -2777,7 +2807,7 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                 }
 
                 if !telemetry_targets.is_empty()
-                    && now.duration_since(last_telemetry) >= Duration::from_millis(1500)
+                    && now.duration_since(last_telemetry) >= TELEMETRY_INTERVAL
                 {
                     last_telemetry = now;
                     let dto = build_telemetry_snapshot(&hostname, &media_cache);
@@ -2857,10 +2887,33 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                     prev_lbutton_down = false;
                 }
 
-                if fast_tick {
-                    thread::sleep(Duration::from_millis(24));
+                // Dorme até o próximo trabalho: cursor/sensores (24 ms), telemetria visível (1,5 s),
+                // saves de widget pendentes; sem nada disso, `park` sem prazo (0 ciclos) até um
+                // evento de visibilidade/widget/saída chamar `wake_background`.
+                let (has_dirty_saves, has_widgets, recovering) = state
+                    .lock()
+                    .map(|st| {
+                        (
+                            !st.dirty_widget_saves.is_empty(),
+                            !st.pinned_widgets.is_empty(),
+                            st.pending_recovery_at.is_some(),
+                        )
+                    })
+                    .unwrap_or((false, false, false));
+                let wait = if fast_tick {
+                    Some(Duration::from_millis(24))
+                } else if has_dirty_saves || recovering {
+                    Some(Duration::from_millis(250))
+                } else if !telemetry_targets.is_empty() {
+                    Some(TELEMETRY_INTERVAL.saturating_sub(now.duration_since(last_telemetry)).max(Duration::from_millis(50)))
+                } else if has_widgets {
+                    Some(VIS_SAFETY_INTERVAL)
                 } else {
-                    thread::sleep(Duration::from_millis(250));
+                    None
+                };
+                match wait {
+                    Some(d) => thread::park_timeout(d),
+                    None => thread::park(),
                 }
             }
         })
@@ -3144,6 +3197,7 @@ pub fn run() {
                             st.shutting_down = st.allow_exit;
                         } else {
                             st.pending_recovery_at = Some(Instant::now());
+                            wake_background();
                         }
                     }
                 },
@@ -3182,6 +3236,7 @@ pub fn run() {
                                     w_obj.insert("posY".to_string(), Value::from(pos.y));
                                 }
                                 st.dirty_widget_saves.insert(wid, Instant::now());
+                                wake_background();
                             }
                         }
                     }
@@ -3241,6 +3296,7 @@ pub fn run() {
                 api.prevent_exit();
             } else {
                 stop_for_run.store(true, Ordering::Relaxed);
+                wake_background();
                 if let Some(g) = gsmtc_opt {
                     g.wake();
                 }

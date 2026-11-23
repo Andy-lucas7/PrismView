@@ -174,8 +174,9 @@ impl MipGenerator {
         }
     }
 
-    /// Preenche os mips 1.. de `texture` a partir do mip 0 (só RGBA8/RGBA8 sRGB).
-    fn generate(
+    /// Preenche os mips 1.. de `texture` a partir do mip 0 (só RGBA8/RGBA8 sRGB). Também usado
+    /// pelas imagens 2D do compositor.
+    pub(crate) fn generate(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,

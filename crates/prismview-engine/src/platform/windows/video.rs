@@ -85,7 +85,6 @@ pub const VIDEO_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const FENCE_TIMEOUT_MS: u32 = 2000;
-const WORKER_IDLE_WAIT: Duration = Duration::from_millis(100);
 const DEFAULT_FRAME_MS: u64 = 33;
 
 const FIRST_VIDEO_STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -164,10 +163,13 @@ impl Shared {
         self.state.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Dorme sem timeout: toda transição que o worker espera notifica a condvar (slot devolvido
+    /// em `advance`, `seek_ms`, `stop_worker`; `set_looping` no fim do stream passa por `seek_ms`).
+    /// Pausado/coberto = zero wakeups da thread.
     fn wait<'a>(&self, guard: MutexGuard<'a, SharedState>) -> MutexGuard<'a, SharedState> {
-        match self.cv.wait_timeout(guard, WORKER_IDLE_WAIT) {
-            Ok((guard, _)) => guard,
-            Err(poison) => poison.into_inner().0,
+        match self.cv.wait(guard) {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
         }
     }
 }
