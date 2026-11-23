@@ -59,7 +59,7 @@ import { nativeCompatIssues } from "./utils/nativeCompat";
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
-import { HubThumbnail } from "./components/HubThumbnail";
+import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -796,6 +796,17 @@ const StudioHubApp: React.FC = () => {
       return true;
     });
   }, [templates3d, defaultTemplates, templateFilter, hubQuery]);
+
+  /** Projetos da aba atual, para o HubStillWarmer gerar os stills de vídeo/3D que faltam. */
+  const warmProjects = useMemo(
+    () =>
+      hubTab === "WALLPAPERS"
+        ? filteredWallpapers
+        : hubTab === "WIDGETS"
+        ? filteredWidgets
+        : unifiedTemplates.map((t) => t.project),
+    [hubTab, filteredWallpapers, filteredWidgets, unifiedTemplates]
+  );
 
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
@@ -2114,6 +2125,7 @@ const StudioHubApp: React.FC = () => {
 
         {/* Scrollable Workspace Body */}
         <main className="flex-1 overflow-y-auto px-7 py-5">
+          <HubStillWarmer projects={warmProjects} />
           {hubTab === "WALLPAPERS" && (
             <div className="max-w-7xl mx-auto space-y-5">
               {/* Filter Chips + Multi-Monitor Selector */}

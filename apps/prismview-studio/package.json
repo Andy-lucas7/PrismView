@@ -9,7 +9,7 @@
     "preview": "vite preview --port 1420",
     "tauri": "tauri",
     "gen:motion": "node scripts/gen-motion.mjs",
-    "test": "node scripts/gen-motion.mjs --check && node --test tests/fxEngine.test.ts tests/scene3dQuick.test.ts tests/importReview.test.ts tests/hubLiveBudget.test.ts"
+    "test": "node scripts/gen-motion.mjs --check && node --test tests/fxEngine.test.ts tests/scene3dQuick.test.ts tests/importReview.test.ts tests/hubLiveBudget.test.ts tests/hubStillCache.test.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

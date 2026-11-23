@@ -45,7 +45,11 @@ export interface UnifiedCompositorProps {
   paused?: boolean;
   isThumbnail?: boolean;
   /** Só miniaturas: `full` = vidro/3D/vídeo reais (3 por vez no Hub); `basic` (padrão) = só o básico. */
-  thumbnailTier?: "full" | "basic";
+  thumbnailTier?: "full" | "still";
+  /** Miniatura `still`: imagem parada (layerId → URL) no lugar de vídeo/3D vivos. */
+  stillFrames?: Readonly<Record<string, string>>;
+  /** Miniatura `full`: avisa quando uma camada VIDEO/3D tem quadro para capturar. */
+  onThumbFrame?: (layerId: string, el: HTMLCanvasElement | HTMLVideoElement) => void;
   interactive?: boolean;
   test3dMode?: boolean;
   selectedLayerId?: string | null;
@@ -77,7 +81,9 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   subscribeReactiveTick,
   paused = false,
   isThumbnail = false,
-  thumbnailTier = "basic",
+  thumbnailTier = "still",
+  stillFrames,
+  onThumbFrame,
   interactive = false,
   test3dMode = false,
   selectedLayerId = null,
@@ -108,7 +114,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     return { w: 1280, h: 720 };
   });
   const [now, setNow] = useState<Date>(() => (isThumbnail ? HUB_MOCK_NOW : new Date()));
-  /** Miniatura básica: sem vidro WebGL, sem 3D, sem vídeo. */
+  /** Miniatura `still`: tudo parado; vídeo/3D viram imagem em cache; vidro só em CSS (sem WebGL). */
   const lite = isThumbnail && thumbnailTier !== "full";
   const fxWeather = isThumbnail ? HUB_MOCK_WEATHER : undefined;
   const [fontRev, setFontRev] = useState(0);
@@ -975,6 +981,29 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         )}
 
         {/* 3D INTERACTIVE SCENE LAYER (glTF / GLB + Draco/Meshopt/KTX2 + Zero-Copy Glass Backdrop) */}
+        {layer.kind === "SCENE_3D" && lite && stillFrames?.[layer.id] && (
+          <img
+            src={stillFrames[layer.id]}
+            alt=""
+            draggable={false}
+            style={{ width: `${wPx}px`, height: `${hPx}px`, objectFit: "cover", display: "block", opacity: g.enabled ? opacity : undefined }}
+          />
+        )}
+        {layer.kind === "VIDEO" && layer.video && lite && stillFrames?.[layer.id] && (
+          <img
+            src={stillFrames[layer.id]}
+            alt=""
+            draggable={false}
+            style={{
+              width: `${wPx}px`,
+              height: `${hPx}px`,
+              objectFit: layer.video.objectFit,
+              display: "block",
+              borderRadius: `${g.enabled ? plateRadiusPx : layer.video.clipRadius * containerScale}px`,
+              opacity: g.enabled ? opacity : undefined,
+            }}
+          />
+        )}
         {layer.kind === "SCENE_3D" && !lite && (
           <div
             style={{
@@ -1017,6 +1046,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 onInspectScene3D={onInspectScene3D}
                 onHoverMesh3D={onHoverMesh3D}
                 onScene3DStats={onScene3DStats}
+                onThumbFrame={isThumbnail ? onThumbFrame : undefined}
                 room3d={roomActive && room3d && room3d.layerId === layer.id ? room3d : null}
               />
             </Suspense>
@@ -1047,7 +1077,14 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 if (el) mediaElementsRef.current.set(layer.id, el);
                 else mediaElementsRef.current.delete(layer.id);
               }}
-              onMediaReady={() => setMediaRev((r) => r + 1)}
+              eager={isThumbnail}
+              onMediaReady={() => {
+                setMediaRev((r) => r + 1);
+                if (isThumbnail && onThumbFrame) {
+                  const el = mediaElementsRef.current.get(layer.id);
+                  if (el instanceof HTMLVideoElement) onThumbFrame(layer.id, el);
+                }
+              }}
             />
           </div>
         )}
