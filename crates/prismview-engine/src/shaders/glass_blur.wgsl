@@ -1,7 +1,7 @@
 // Pirâmide de blur do vidro óptico (core/glass.rs): Dual Kawase em resolução reduzida.
 //
 // Três passes de fragmento sobre um triângulo de tela cheia, todos lendo `src_tex` e
-// escrevendo num alvo Rgba16Float:
+// escrevendo num alvo Rgba8Unorm:
 //   fs_down_first : fonte em resolução cheia -> 1/4 (4 taps bilineares em ±1 texel = caixa 4x4
 //                   exata, sem aliasing num único passe).
 //   fs_down       : nível i-1 -> nível i (1/2), filtro Kawase de 5 taps.

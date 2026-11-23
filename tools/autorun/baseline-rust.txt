@@ -1,7 +1,0 @@
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `U`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `a`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `b`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `c`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `f`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `m`: unknown character escape
-apps\prismview-studio\src-tauri\src\native_scene.rs: error: unknown character escape: `v`: unknown character escape

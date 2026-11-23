@@ -321,7 +321,6 @@ impl GpuMemory {
 // ───────────── worker ─────────────
 
 pub(super) fn run(shared: Arc<Shared>, config: SensorsConfig) {
-    let _com = super::ComMta::init();
     let mut cpu = CpuSampler::default();
     let mut gpu: Option<GpuUsage> = None;
     let mut vram: Option<GpuMemory> = None;
@@ -330,19 +329,22 @@ pub(super) fn run(shared: Arc<Shared>, config: SensorsConfig) {
 
     while !shared.stop.load(Ordering::Relaxed) {
         let demand = shared.bus.demand();
-        let telemetry = demand.contains(SignalKind::TELEMETRY);
+        let gpu_telemetry = demand.contains(SignalKind::GPU_TELEMETRY);
+        let telemetry = demand.contains(SignalKind::TELEMETRY) || gpu_telemetry;
         let power = demand.contains(SignalKind::POWER) || telemetry;
 
-        if !telemetry && (gpu.is_some() || vram.is_some() || gpu_tried) {
-            // Libera a query PDH/adapter fora da demanda.
+        if !gpu_telemetry && (gpu.is_some() || vram.is_some() || gpu_tried) {
+            // Libera a query PDH e o adapter DXGI assim que ninguém mais pede telemetria de GPU.
             gpu = None;
             vram = None;
             gpu_tried = false;
+        }
+        if !telemetry {
             cpu = CpuSampler::default();
         }
 
         if telemetry {
-            if !gpu_tried {
+            if gpu_telemetry && !gpu_tried {
                 gpu_tried = true;
                 gpu = GpuUsage::open();
                 vram = GpuMemory::open(config.gpu_adapter_luid);

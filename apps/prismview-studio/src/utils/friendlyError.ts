@@ -6,6 +6,8 @@
 const RULES: Array<[RegExp, string]> = [
   [/invalid_json|invalid_response/i, "O motor respondeu de forma inesperada. Reinicie o PrismView e tente de novo."],
   [/engine_timeout|engine_start_timeout/i, "O motor nativo demorou a responder. Tente novamente em instantes."],
+  [/engine_busy/i, "O motor nativo está ocupado carregando a cena. Tente novamente em instantes."],
+  [/scene_path_denied/i, "O motor recusou um arquivo de cena fora da pasta do PrismView."],
   [/engine_closed|pipe_closed|engine_unreachable|pipe_write|pipe_read/i, "Não foi possível falar com o motor nativo. Ele pode ter sido encerrado."],
   [/engine_exited_early|engine_spawn_failed|PRISMVIEW_ENGINE_EXE/i, "O motor nativo não conseguiu iniciar. Verifique a instalação do PrismView."],
   [/gpu_unavailable/i, "A GPU não está disponível no momento. Tente novamente."],

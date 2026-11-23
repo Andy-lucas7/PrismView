@@ -48,6 +48,21 @@ pub struct NativeHandles {
     pub display: RawDisplayHandle,
 }
 
+/// Apresentação fora da swapchain do wgpu. O wgpu 24/DX12 só expõe `CompositeAlphaMode::Opaque`,
+/// então widgets transparentes desenham numa textura própria e o host (`platform/windows`, via
+/// DirectComposition + `DXGI_ALPHA_MODE_PREMULTIPLIED`) copia na GPU para o backbuffer e apresenta.
+/// Nunca há leitura para a CPU.
+pub trait ExternalPresenter {
+    /// `texture` acabou de ser renderizada (último uso: color target) e submetida na fila do
+    /// wgpu. Copia para o backbuffer da cadeia e apresenta.
+    fn present(&mut self, gpu: &GpuContext, texture: &wgpu::Texture) -> FrameStatus;
+    /// Novo tamanho dos buffers (px). `false` = cadeia inutilizável (refazer a janela).
+    fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) -> bool;
+}
+
+/// Formato da textura de saída de superfícies externas (= backbuffer B8G8R8A8 do DXGI).
+pub const EXTERNAL_SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+
 impl NativeHandles {
     fn target(&self) -> wgpu::SurfaceTargetUnsafe {
         wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -78,16 +93,36 @@ impl GpuContext {
         width: u32,
         height: u32,
     ) -> Result<(Self, WindowSurface), GpuError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::DX12,
-            ..Default::default()
-        });
+        // Sem layer de validação D3D12 por padrão (economiza ~40–60 MB mesmo em builds debug;
+        // pode ser reativada sob demanda via `WGPU_VALIDATION=1`).
+        let instance = Self::create_instance();
 
         // SAFETY: o chamador garante que a janela vive enquanto a superfície existir.
         let surface = unsafe { instance.create_surface_unsafe(handles.target()) }
             .map_err(|e| GpuError::Surface(e.to_string()))?;
 
-        let adapter = Self::pick_adapter(&instance, &surface)?;
+        let adapter = Self::pick_adapter(&instance, Some(&surface))?;
+        let ctx = Self::with_adapter(instance, adapter)?;
+        let window_surface = WindowSurface::configure_new(&ctx, surface, handles, width, height)?;
+        Ok((ctx, window_surface))
+    }
+
+    /// Device sem superfície (só widgets nativos no ar; o wallpaper pode nunca existir).
+    pub fn new_headless() -> Result<Self, GpuError> {
+        let instance = Self::create_instance();
+        let adapter = Self::pick_adapter(&instance, None)?;
+        Self::with_adapter(instance, adapter)
+    }
+
+    fn create_instance() -> wgpu::Instance {
+        wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            flags: wgpu::InstanceFlags::empty().with_env(),
+            ..Default::default()
+        })
+    }
+
+    fn with_adapter(instance: wgpu::Instance, adapter: wgpu::Adapter) -> Result<Self, GpuError> {
         let adapter_name = adapter.get_info().name;
 
         // BC7 (texturas KTX2/UASTC transcodificadas) só se o adapter suportar; o resto é core.
@@ -96,6 +131,8 @@ impl GpuContext {
             &wgpu::DeviceDescriptor {
                 label: Some("prismview_dx12_device"),
                 required_features,
+                // Blocos de subalocação mínimos (8 MB device / 4 MB host em vez de 256 MB / 64 MB).
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 ..Default::default()
             },
             None,
@@ -116,7 +153,7 @@ impl GpuContext {
             }));
         }
 
-        let ctx = Self {
+        Ok(Self {
             instance,
             adapter,
             device,
@@ -124,19 +161,17 @@ impl GpuContext {
             adapter_name,
             device_lost,
             uncaptured_error,
-        };
-        let window_surface = WindowSurface::configure_new(&ctx, surface, handles, width, height)?;
-        Ok((ctx, window_surface))
+        })
     }
 
     fn pick_adapter(
         instance: &wgpu::Instance,
-        surface: &wgpu::Surface<'_>,
+        surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<wgpu::Adapter, GpuError> {
         for force_fallback_adapter in [false, true] {
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(surface),
+                compatible_surface: surface,
                 force_fallback_adapter,
             }));
             if let Some(adapter) = adapter {
@@ -155,6 +190,32 @@ impl GpuContext {
     ) -> Result<WindowSurface, GpuError> {
         let surface = self.raw_surface(&handles)?;
         WindowSurface::configure_new(self, surface, handles, width, height)
+    }
+
+    /// Superfície que desenha numa textura própria e entrega a `presenter` (widgets transparentes).
+    pub fn create_external_surface(
+        &self,
+        presenter: Box<dyn ExternalPresenter>,
+        width: u32,
+        height: u32,
+    ) -> WindowSurface {
+        WindowSurface {
+            backend: SurfaceBackend::External {
+                presenter,
+                target: None,
+            },
+            config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                format: EXTERNAL_SURFACE_FORMAT,
+                width: width.max(1),
+                height: height.max(1),
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 1,
+                alpha_mode: wgpu::CompositeAlphaMode::PreMultiplied,
+                view_formats: Vec::new(),
+            },
+            stale: true,
+        }
     }
 
     fn raw_surface(&self, handles: &NativeHandles) -> Result<wgpu::Surface<'static>, GpuError> {
@@ -210,10 +271,22 @@ pub enum FrameStatus {
     DeviceLost,
 }
 
+enum SurfaceBackend {
+    /// Swapchain do próprio wgpu (wallpaper: janela filha do WorkerW, alpha opaco).
+    Wgpu {
+        surface: wgpu::Surface<'static>,
+        handles: NativeHandles,
+    },
+    /// Textura própria + `ExternalPresenter` (widgets transparentes, DirectComposition).
+    External {
+        presenter: Box<dyn ExternalPresenter>,
+        target: Option<(wgpu::Texture, wgpu::TextureView)>,
+    },
+}
+
 pub struct WindowSurface {
-    surface: wgpu::Surface<'static>,
+    backend: SurfaceBackend,
     config: wgpu::SurfaceConfiguration,
-    handles: NativeHandles,
     /// Reconfigurar antes do próximo frame (resize, Outdated, suboptimal).
     stale: bool,
 }
@@ -250,14 +323,14 @@ impl WindowSurface {
             width: width.max(1),
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
+            // Double-buffer (2 backbuffers em vez de 3): economiza 1 framebuffer inteiro por monitor.
+            desired_maximum_frame_latency: 1,
             alpha_mode,
             view_formats: Vec::new(),
         };
         let mut this = Self {
-            surface,
+            backend: SurfaceBackend::Wgpu { surface, handles },
             config,
-            handles,
             stale: false,
         };
         if !this.reconfigure(gpu) {
@@ -268,17 +341,55 @@ impl WindowSurface {
 
     /// Aplica `config`. `false` se o driver/janela rejeitou (erro capturado).
     fn reconfigure(&mut self, gpu: &GpuContext) -> bool {
-        gpu.take_uncaptured_error();
-        self.surface.configure(&gpu.device, &self.config);
-        self.stale = false;
-        !gpu.take_uncaptured_error()
+        let (w, h) = (self.config.width, self.config.height);
+        match &mut self.backend {
+            SurfaceBackend::Wgpu { surface, .. } => {
+                gpu.take_uncaptured_error();
+                surface.configure(&gpu.device, &self.config);
+                self.stale = false;
+                !gpu.take_uncaptured_error()
+            }
+            SurfaceBackend::External { presenter, target } => {
+                // Alvo só recriado em resize (regra: render targets fora do caminho por quadro).
+                // O presenter espera a cópia pendente (que lê o alvo antigo) antes de soltá-lo.
+                if !presenter.resize(gpu, w, h) {
+                    return false;
+                }
+                *target = None;
+                gpu.take_uncaptured_error();
+                let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("prismview_widget_target"),
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: EXTERNAL_SURFACE_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                if gpu.take_uncaptured_error() {
+                    return false;
+                }
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                *target = Some((texture, view));
+                self.stale = false;
+                true
+            }
+        }
     }
 
     /// Recria a superfície a partir dos handles (após `SurfaceError::Lost`).
     fn recreate(&mut self, gpu: &GpuContext) -> bool {
-        match gpu.raw_surface(&self.handles) {
-            Ok(surface) => {
-                self.surface = surface; // a antiga é solta aqui
+        let SurfaceBackend::Wgpu { surface, handles } = &mut self.backend else {
+            return self.reconfigure(gpu);
+        };
+        match gpu.raw_surface(handles) {
+            Ok(fresh) => {
+                *surface = fresh; // a antiga é solta aqui
                 self.reconfigure(gpu)
             }
             Err(_) => false,
@@ -291,6 +402,11 @@ impl WindowSurface {
 
     pub fn format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    /// Superfície com alpha por pixel real (widget DirectComposition).
+    pub fn is_transparent(&self) -> bool {
+        matches!(self.backend, SurfaceBackend::External { .. })
     }
 
     /// Registra novo tamanho; a swapchain é refeita no próximo frame. Ignora 0×0 (minimizada).
@@ -318,7 +434,24 @@ impl WindowSurface {
             return FrameStatus::Unavailable;
         }
 
-        let frame = match self.surface.get_current_texture() {
+        if let SurfaceBackend::External { presenter, target } = &mut self.backend {
+            let Some((texture, view)) = target.as_ref() else {
+                return FrameStatus::Unavailable;
+            };
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("prismview_widget_frame"),
+                });
+            record(&mut encoder, view);
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            return presenter.present(gpu, texture);
+        }
+        let SurfaceBackend::Wgpu { surface, .. } = &mut self.backend else {
+            return FrameStatus::Unavailable;
+        };
+
+        let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Outdated) => {
                 return if self.reconfigure(gpu) {
@@ -356,7 +489,6 @@ impl WindowSurface {
         frame.present();
         FrameStatus::Presented
     }
-
     /// Pinta a superfície inteira com `color` (RGBA 0..1) e apresenta.
     pub fn clear(&mut self, gpu: &GpuContext, color: [f32; 4]) -> FrameStatus {
         let clear = wgpu::Color {

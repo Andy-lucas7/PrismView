@@ -560,11 +560,17 @@ impl FxEngine {
         deps.insert(Self::eval_text(&layer.text.text, ctx).deps);
         deps.insert(Self::eval_f32(&layer.text.size_px, ctx).deps);
         deps.insert(Self::eval_f32(&layer.text.stem_stretch.stretch, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.blur_px, ctx).deps);
         deps.insert(Self::eval_f32(&layer.crystal.frost_amount, ctx).deps);
         deps.insert(Self::eval_f32(&layer.crystal.dispersion_rgb, ctx).deps);
         deps.insert(Self::eval_f32(&layer.crystal.refraction, ctx).deps);
         deps.insert(Self::eval_f32(&layer.crystal.bevel_width, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.light_angle_deg, ctx).deps);
         deps.insert(Self::eval_f32(&layer.crystal.fresnel_intensity, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.prismatic_rim_intensity, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.brightness, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.contrast, ctx).deps);
+        deps.insert(Self::eval_f32(&layer.crystal.saturation, ctx).deps);
         deps.insert(Self::eval_string(&layer.crystal.tint_rgba, ctx).deps);
         deps.insert(Self::eval_text(&layer.progress_expr, ctx).deps);
         if layer.parallax.mouse_strength.abs() > 1e-4 || layer.parallax.tilt_max_deg.abs() > 1e-4 {

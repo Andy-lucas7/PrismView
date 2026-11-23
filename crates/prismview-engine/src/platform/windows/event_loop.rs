@@ -24,7 +24,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     MSG, MWMO_INPUTAVAILABLE, PM_REMOVE, QS_ALLINPUT, WM_QUIT,
 };
 
-use super::signals::{SIG_REPAINT, SIG_WAKE};
+use super::signals::{SIG_REPAINT, SIG_TRAY_MENU, SIG_TRAY_OPEN, SIG_WAKE, SIG_WIDGET_CLICK, SIG_WIDGET_MOVED};
 use super::window::{WM_PRISM_EXIT, WM_PRISM_WAKE};
 use super::Win32DesktopHost;
 use crate::platform::DesktopEvent;
@@ -57,6 +57,18 @@ pub trait LoopHandler {
     /// O sistema invalidou uma janela de wallpaper (ex.: deixou de estar coberta);
     /// apresentar ao menos um frame mesmo com a cena estática.
     fn repaint_requested(&mut self, _host: &mut Win32DesktopHost) {}
+
+    /// Clique direito no ícone da bandeja: exibir menu e executar a ação escolhida.
+    fn tray_menu_requested(&mut self, _host: &mut Win32DesktopHost) {}
+
+    /// Duplo clique esquerdo no ícone da bandeja: abrir/focar o PrismView Studio.
+    fn tray_open_requested(&mut self, _host: &mut Win32DesktopHost) {}
+
+    /// Um widget nativo foi arrastado/redimensionado pelo sistema (fim do arrasto, DPI).
+    fn widgets_moved(&mut self, _host: &mut Win32DesktopHost) {}
+
+    /// Clique solto num widget travado: janela + ponto em px do cliente.
+    fn widget_clicked(&mut self, _host: &mut Win32DesktopHost, _window: crate::platform::NativeWindowId, _point: (i32, i32)) {}
 
     /// Fila vazia: renderizar se preciso e decidir como dormir.
     fn about_to_wait(&mut self, host: &mut Win32DesktopHost) -> ControlFlow;
@@ -214,6 +226,20 @@ pub fn run<H: LoopHandler>(host: &mut Win32DesktopHost, handler: &mut H) -> i32 
         }
         if loop_signals & SIG_REPAINT != 0 {
             handler.repaint_requested(host);
+        }
+        if loop_signals & SIG_TRAY_OPEN != 0 {
+            handler.tray_open_requested(host);
+        }
+        if loop_signals & SIG_TRAY_MENU != 0 {
+            handler.tray_menu_requested(host);
+        }
+        if loop_signals & SIG_WIDGET_MOVED != 0 {
+            handler.widgets_moved(host);
+        }
+        if loop_signals & SIG_WIDGET_CLICK != 0 {
+            if let Some((window, x, y)) = host.take_widget_click() {
+                handler.widget_clicked(host, window, (x, y));
+            }
         }
 
         // 3) Render / decisão de sono.

@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, TranslateMessage, UnregisterClassW, GWL_EXSTYLE, HWND_BOTTOM,
     MONITORINFOF_PRIMARY, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOW_STYLE,
-    WM_CLOSE, WM_DISPLAYCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_QUERYENDSESSION, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TRANSPARENT,
 };
 
@@ -594,6 +594,26 @@ unsafe extern "system" fn recovery_wnd_proc(
                     (s.callback)("display_change");
                 }
             });
+            return LRESULT(0);
+        }
+        // Logoff/desligamento: avisa antes das janelas morrerem (widgets continuam fixados).
+        // Se outro app vetar o logoff, WM_ENDSESSION chega com wparam = FALSE e desfazemos.
+        WM_QUERYENDSESSION => {
+            RECOVERY_HOOK.with(|cell| {
+                if let Some(ref s) = *cell.borrow() {
+                    (s.callback)("end_session");
+                }
+            });
+            return LRESULT(1);
+        }
+        WM_ENDSESSION => {
+            if wparam.0 == 0 {
+                RECOVERY_HOOK.with(|cell| {
+                    if let Some(ref s) = *cell.borrow() {
+                        (s.callback)("end_session_cancelled");
+                    }
+                });
+            }
             return LRESULT(0);
         }
         WM_CLOSE => {

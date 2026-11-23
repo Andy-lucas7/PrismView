@@ -401,11 +401,16 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   const [thumbUrl, setThumbUrl] = useState<string | null>(() => (thumbKey ? thumbCache.get(thumbKey) ?? null : null));
   const [thumbSlot, setThumbSlot] = useState(false);
   useEffect(() => {
+    if (!isThumbnail) {
+      setThumbUrl(null);
+      setThumbSlot(false);
+      return;
+    }
     const hit = thumbKey ? thumbCache.get(thumbKey) ?? null : null;
     setThumbUrl(hit);
     setThumbSlot(false);
     if (!hit) setCanvasGen((g) => g + 1);
-  }, [thumbKey]);
+  }, [isThumbnail, thumbKey]);
   useEffect(() => {
     if (!isThumbnail || thumbUrl) return;
     let cancelled = false;
@@ -1595,7 +1600,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
         if (sleepingRef.current) eng.renderer.forceContextLoss();
       }
     };
-  }, [engineOff]);
+  }, [engineOff, canvasGen]);
 
   // Resize WebGL buffer with dynamic renderScale
   useEffect(() => {

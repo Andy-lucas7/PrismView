@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -37,8 +38,8 @@ use super::compositor::TextureId;
 
 // ───────────────────────── Constantes ─────────────────────────
 
-/// Formato da pirâmide (sem banding no blur; filtrável e renderizável em qualquer GPU DX12).
-pub const PYRAMID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Formato da pirâmide (4 B/px; o shader opera em [0, 1] na codificação da tela, sem HDR).
+pub const PYRAMID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Formato do mapa de normais empacotado e dos alvos intermediários de glifo.
 const GLYPH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
@@ -516,13 +517,8 @@ impl BlurPyramid {
             down.iter().map(|t| self.group(device, ring, &t.view)).collect();
         let read_up: Vec<wgpu::BindGroup> =
             up.iter().map(|t| self.group(device, ring, &t.view)).collect();
-        let slots: Vec<ResultSlot> = (0..RESULT_SLOTS)
-            .map(|_| ResultSlot {
-                tex: make_target(device, "prismview_glass_result", sizes[0], PYRAMID_FORMAT),
-                key: None,
-                stamp: 0,
-            })
-            .collect();
+        // Slots de resultado são alocados sob demanda até `RESULT_SLOTS` (cena com 1 vidro = 1 alvo).
+        let slots = Vec::with_capacity(RESULT_SLOTS);
         self.epoch = self.epoch.wrapping_add(1);
         self.targets = Some(Targets {
             src_size: src,
@@ -620,14 +616,28 @@ impl BlurPyramid {
             return Some(BlurHandle { slot: i });
         }
 
-        // Vítima: menor `stamp` entre os slots ainda não usados neste frame.
-        let victim = t
+        // Vítima: reaproveita slot ainda não usado neste frame (LRU); se todos estiverem em uso
+        // neste frame (múltiplos blurs distintos), aloca mais um sob demanda até `RESULT_SLOTS`.
+        let victim = match t
             .slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.stamp < floor)
             .min_by_key(|(_, s)| s.stamp)
-            .map(|(i, _)| i)?;
+            .map(|(i, _)| i)
+        {
+            Some(i) => i,
+            None if t.slots.len() < RESULT_SLOTS => {
+                let idx = t.slots.len();
+                t.slots.push(ResultSlot {
+                    tex: make_target(device, "prismview_glass_result", t.sizes[0], PYRAMID_FORMAT),
+                    key: None,
+                    stamp: 0,
+                });
+                idx
+            }
+            None => return None,
+        };
 
         // Cadeia de descida reaproveitada entre blurs do mesmo conteúdo/frame.
         let chain = (req.content_hash, req.frame_token);
@@ -732,7 +742,7 @@ struct GlyphMaps {
     gauss: wgpu::RenderPipeline,
     pack: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    entries: HashMap<String, GlyphEntry>,
+    entries: HashMap<Arc<str>, GlyphEntry>,
     serial: u64,
     next_uid: u64,
 }
@@ -845,7 +855,7 @@ impl GlyphMaps {
         let bevel = (fin(source.bevel_px, 0.0) * 0.48).round().clamp(2.0, 32.0);
         let bevel_q = bevel as u32;
 
-        if let Some(e) = self.entries.get_mut(&source.key) {
+        if let Some(e) = self.entries.get_mut(source.key.as_ref()) {
             if e.token == source.token && e.size == size && e.bevel_q == bevel_q {
                 e.used = self.serial;
                 return true;
@@ -909,7 +919,7 @@ impl GlyphMaps {
         let uid = self.next_uid;
         self.next_uid += 1;
         self.entries.insert(
-            source.key.clone(),
+            Arc::clone(&source.key),
             GlyphEntry {
                 _texture: out,
                 view: out_view,
@@ -1002,8 +1012,8 @@ impl Default for GlassParams {
 /// Máscara do texto para o modo glifo.
 #[derive(Clone, Debug)]
 pub struct GlyphSource {
-    /// Chave do slot de texto (a mesma do `TextSystem`).
-    pub key: String,
+    /// Chave do slot de texto (a mesma do `TextSystem`), compartilhada sem alocar por quadro.
+    pub key: Arc<str>,
     /// Muda quando o texto/fonte/tamanho/textura muda (invalida o mapa de normais).
     pub token: u64,
     /// Região útil da máscara em px (tamanho do quad do texto).
@@ -1077,8 +1087,18 @@ impl GlassInstance {
                 light.sin(),
                 if glyph { 1.0 } else { 0.0 },
             ],
-            tint: [p.tint[0], p.tint[1], p.tint[2], 1.0],
-            pigment: p.pigment,
+            tint: [
+                fin(p.tint[0], 1.0).clamp(0.0, 1.0),
+                fin(p.tint[1], 1.0).clamp(0.0, 1.0),
+                fin(p.tint[2], 1.0).clamp(0.0, 1.0),
+                1.0,
+            ],
+            pigment: [
+                fin(p.pigment[0], 1.0).clamp(0.0, 1.0),
+                fin(p.pigment[1], 1.0).clamp(0.0, 1.0),
+                fin(p.pigment[2], 1.0).clamp(0.0, 1.0),
+                fin(p.pigment[3], 0.0).clamp(0.0, 1.0),
+            ],
         }
     }
 }

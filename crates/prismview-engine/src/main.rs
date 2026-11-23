@@ -10,6 +10,7 @@ mod ipc_server;
 mod native;
 #[allow(dead_code)]
 mod platform;
+mod widgets;
 
 fn main() {
     std::process::exit(native::run());

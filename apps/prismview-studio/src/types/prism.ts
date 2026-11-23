@@ -183,6 +183,8 @@ export type Scene3DAutoSuggestionKind = "BINDING" | "DYNAMIC_TEXTURE";
 export type Scene3DAutoSuggestionRole =
   | "HEAD"
   | "NECK"
+  /** Spine/torso: subtle cursor follow (low amplitude, soft smoothing) */
+  | "BODY"
   | "EYE"
   | "JAW"
   | "WING"
@@ -318,6 +320,10 @@ export interface SceneLayer {
   clickUrl?: string;
   /** OPEN_APP (caminho do executável/arquivo) */
   clickTarget?: string;
+  /** Import de pacote: alvo OPEN_APP original, desativado até o usuário permitir. */
+  clickTargetPending?: string;
+  /** Import de pacote: ação OPEN_APP aguardando revisão (ver `utils/importReview`). */
+  clickTargetNeedsReview?: boolean;
   clickLabel?: string;
   /** TOGGLE_GLOBAL / SET_GLOBAL / NEXT_GLOBAL_LIST */
   clickGlobal?: string;
@@ -386,6 +392,10 @@ export interface PrismProject {
     posX: number;
     posY: number;
     locked: boolean;
+    /** Widget nativo: fica acima das janelas (HWND_TOPMOST); padrão = no desktop, atrás das janelas */
+    alwaysOnTop?: boolean;
+    /** Cliques atravessam para o desktop (toques voltam pelo motor). Padrão: igual a `locked` */
+    clickThrough?: boolean;
   };
   globals: GlobalVar[];
   layers: SceneLayer[];
@@ -434,6 +444,29 @@ export interface RuntimeState {
   monitor_wallpapers?: Record<string, string>;
   /** Migração automática de wallpaper legado (WebView) falhou; precisa reaplicar no motor nativo. */
   legacy_migration_notice?: string | null;
+}
+
+/** Projeto que não pôde ser lido (`list_projects`). `restored`: o `.bak` entrou no lugar. */
+export interface BrokenProjectDto {
+  file: string;
+  error: string;
+  restored: boolean;
+}
+
+export interface ProjectListDto {
+  projects: PrismProject[];
+  broken: BrokenProjectDto[];
+}
+
+/** `import_prism_archive` sem `replace` quando o id do pacote já existe. */
+export interface ImportConflictDto {
+  conflict: true;
+  existingId: string;
+  existingTitle: string;
+}
+
+export function isImportConflict(v: unknown): v is ImportConflictDto {
+  return typeof v === "object" && v !== null && (v as { conflict?: unknown }).conflict === true;
 }
 
 export interface PickedFileDto {

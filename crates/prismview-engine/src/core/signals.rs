@@ -42,8 +42,11 @@ impl SignalKind {
     /// Clique curto (toque) no fundo da área de trabalho — fora de ícones e de outras janelas.
     /// Separado de `MOUSE` para o loop acordar só em toques, não a cada movimento.
     pub const DESKTOP_TAP: Self = Self(1 << 6);
+    /// Telemetria de GPU (PDH `\GPU Engine` + DXGI VRAM): separada de `TELEMETRY` para que cenas
+    /// que só leem CPU/RAM (`$sys(cpu)$`/`$sys(ram)$`) não carreguem contadores PDH na RAM.
+    pub const GPU_TELEMETRY: Self = Self(1 << 7);
     pub const INPUT: Self = Self(Self::MOUSE.0 | Self::KEYBOARD.0);
-    pub const ALL: Self = Self(0x7F);
+    pub const ALL: Self = Self(0xFF);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {
@@ -674,7 +677,8 @@ impl SignalSource {
             Self::KeyPulse | Self::TypingEnergy => SignalKind::KEYBOARD,
             Self::MouseEnergy | Self::MouseButtons => SignalKind::MOUSE,
             Self::MediaPlaying | Self::MediaProgress => SignalKind::MEDIA,
-            Self::CpuUsage | Self::RamUsage | Self::GpuUsage => SignalKind::TELEMETRY,
+            Self::CpuUsage | Self::RamUsage => SignalKind::TELEMETRY,
+            Self::GpuUsage => SignalKind::TELEMETRY | SignalKind::GPU_TELEMETRY,
             Self::Battery => SignalKind::POWER,
             Self::CursorX | Self::CursorY => SignalKind::MOUSE,
         }

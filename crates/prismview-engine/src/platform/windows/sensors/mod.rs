@@ -139,6 +139,7 @@ impl Win32SystemSensors {
         let s = Arc::clone(&shared);
         let audio = thread::Builder::new()
             .name("prism-sensor-audio".into())
+            .stack_size(256 * 1024)
             .spawn(move || audio::run(s))
             .map_err(|e| spawn_err("audio", e))?;
 
@@ -146,6 +147,7 @@ impl Win32SystemSensors {
         let cfg = config.clone();
         let telemetry = thread::Builder::new()
             .name("prism-sensor-telemetry".into())
+            .stack_size(256 * 1024)
             .spawn(move || telemetry::run(s, cfg))
             .map_err(|e| spawn_err("telemetry", e))?;
 
@@ -154,6 +156,7 @@ impl Win32SystemSensors {
         let cover_dir = config.cover_dir.clone();
         thread::Builder::new()
             .name("prism-sensor-media".into())
+            .stack_size(512 * 1024)
             .spawn(move || media::run(s, ch, cover_dir))
             .map_err(|e| spawn_err("media", e))?;
 
@@ -161,6 +164,7 @@ impl Win32SystemSensors {
         let hw = Arc::clone(&input_hwnd);
         thread::Builder::new()
             .name("prism-sensor-input".into())
+            .stack_size(256 * 1024)
             .spawn(move || input::run(s, hw))
             .map_err(|e| spawn_err("input", e))?;
 

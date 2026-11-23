@@ -60,10 +60,13 @@ import {
   Scene3DInspectInfo,
   Scene3DPickedPart,
   SceneLayer,
+  ImportConflictDto,
+  isImportConflict,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { friendlyError } from "../utils/friendlyError";
+import { collectOpenAppReview } from "../utils/importReview";
 import {
   cloneLayerWithFreshIds,
   collectAllLayerIds,
@@ -102,6 +105,8 @@ interface StudioEditorProps {
   project: PrismProject;
   availableWidgets: PrismProject[];
   telemetry: LiveTelemetry;
+  /** Real target desktop monitor aspect ratio (defaults to 16/9) for 1:1 preview framing. */
+  monitorAspect?: number;
   onChangeProject: (next: PrismProject) => void;
   /** Live transient update path (sliders/canvas drag): skips Hub re-renders and deep 3D normalization. */
   onChangeProjectLive?: (next: PrismProject) => void;
@@ -166,6 +171,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   project,
   availableWidgets,
   telemetry,
+  monitorAspect = 16 / 9,
   onChangeProject,
   onChangeProjectLive,
   onTxStateChange,
@@ -369,6 +375,60 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
   const canvasLogicalW = project.packageType === "WIDGET" ? Math.max(160, project.widget.width) : 1920;
   const canvasLogicalH = project.packageType === "WIDGET" ? Math.max(100, project.widget.height) : 1080;
+
+  // Measure the center stage so the wallpaper/widget frame ALWAYS fits 100% inside both width & height
+  // (zero vertical clipping on 1536×864 / 125% DPI or short windows, matching exact desktop monitor aspect).
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageBounds, setStageBounds] = useState<{ w: number; h: number }>({ w: 960, h: 540 });
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = Math.max(160, el.clientWidth);
+      const h = Math.max(120, el.clientHeight);
+      setStageBounds((prev) =>
+        Math.abs(prev.w - w) > 1 || Math.abs(prev.h - h) > 1 ? { w, h } : prev
+      );
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const stageFrameStyle = useMemo<React.CSSProperties>(() => {
+    const availW = Math.max(160, stageBounds.w - 24);
+    const availH = Math.max(120, stageBounds.h - 16);
+    if (project.packageType === "WIDGET") {
+      const ratio = canvasLogicalW / Math.max(1, canvasLogicalH);
+      const maxW = Math.min(680, canvasLogicalW, availW);
+      let w = maxW;
+      let h = w / ratio;
+      if (h > availH) {
+        h = availH;
+        w = h * ratio;
+      }
+      return {
+        width: `${Math.round(w)}px`,
+        height: `${Math.round(h)}px`,
+        backgroundColor: "#0e1015",
+        backgroundImage:
+          "radial-gradient(circle at 28% 24%, rgba(255,255,255,0.16) 0%, transparent 45%), radial-gradient(circle at 76% 78%, rgba(255,255,255,0.10) 0%, transparent 48%), linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px)",
+        backgroundSize: "100% 100%, 100% 100%, 24px 24px, 24px 24px",
+      };
+    }
+    const aspect = Number.isFinite(monitorAspect) && monitorAspect > 0.2 ? monitorAspect : 16 / 9;
+    let w = Math.min(1024, availW);
+    let h = w / aspect;
+    if (h > availH) {
+      h = availH;
+      w = h * aspect;
+    }
+    return {
+      width: `${Math.round(w)}px`,
+      height: `${Math.round(h)}px`,
+    };
+  }, [stageBounds.w, stageBounds.h, project.packageType, canvasLogicalW, canvasLogicalH, monitorAspect]);
 
   // Keep only IDs that still exist in project.layers (respects explicit empty selection)
   const validSelectedIds = useMemo(
@@ -787,11 +847,18 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     try {
       const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", { kind: "prism" });
       if (!picked) return;
-      const imported = await invokeCmd<PrismProject>("import_prism_archive", {
+      // Mesmo id já na biblioteca: importa como cópia (nunca sobrescreve sem perguntar).
+      const first = await invokeCmd<PrismProject | ImportConflictDto>("import_prism_archive", {
         archivePath: picked.path,
       });
+      const imported = isImportConflict(first)
+        ? await invokeCmd<PrismProject>("import_prism_archive", { archivePath: picked.path, replace: false })
+        : first;
       if (imported?.layers) {
         importWidgetAsGroup(imported);
+        if (collectOpenAppReview(imported.layers).length > 0) {
+          flashHint('Ações "Abrir app" do pacote vieram desativadas: revise o caminho no Inspetor.');
+        }
       }
     } catch (err) {
       flashHint(friendlyError(err, "Não foi possível importar o widget."));
@@ -1884,25 +1951,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
       )}
 
-      {/* CENTER: 1:1 Unified GPU Compositor Canvas (Fixed frame — never reflows on drag) */}
-      <div className="absolute inset-0 flex items-center justify-center pt-20 pb-6 pl-[304px] pr-[380px]">
-        <div
-          className={`relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] ${
-            project.packageType === "WIDGET" ? "max-w-full" : "w-full max-w-5xl aspect-video"
-          }`}
-          style={
-            project.packageType === "WIDGET"
-              ? {
-                  width: `${Math.min(680, canvasLogicalW)}px`,
-                  aspectRatio: `${canvasLogicalW} / ${canvasLogicalH}`,
-                  backgroundColor: "#0e1015",
-                  backgroundImage:
-                    "radial-gradient(circle at 28% 24%, rgba(255,255,255,0.16) 0%, transparent 45%), radial-gradient(circle at 76% 78%, rgba(255,255,255,0.10) 0%, transparent 48%), linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px)",
-                  backgroundSize: "100% 100%, 100% 100%, 24px 24px, 24px 24px",
-                }
-              : undefined
-          }
-        >
+      {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
+      <div className="absolute inset-0 pt-20 pb-6 pl-[304px] pr-[380px]">
+        <div ref={stageRef} className="w-full h-full flex items-center justify-center">
+          <div
+            className="relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] shrink-0"
+            style={stageFrameStyle}
+          >
           <UnifiedCompositor
             project={project}
             telemetry={telemetry}
@@ -2118,6 +2173,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               )}
             </div>
           )}
+          </div>
         </div>
       </div>
 

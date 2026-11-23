@@ -29,6 +29,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Timelike};
@@ -51,7 +53,7 @@ use super::glass::{
     GlyphSource,
 };
 use super::gpu::{FrameStatus, GpuContext, WindowSurface};
-use super::text::{TextAlignment, TextLayout, TextSpec, TextSystem};
+use super::text::{FontResolver, TextAlignment, TextLayout, TextSpec, TextSystem};
 use crate::platform::GpuVideoFrame;
 
 // ───────────────────────── Geometria ─────────────────────────
@@ -182,10 +184,34 @@ struct ImageEntry {
     h: u32,
 }
 
+/// Acorda o loop quando uma imagem termina de decodificar (registrado 1× pelo host).
+pub type ImageWaker = Arc<dyn Fn() + Send + Sync>;
+
+static IMAGE_WAKER: OnceLock<ImageWaker> = OnceLock::new();
+
+/// Registra quem acorda o loop após decodificações em segundo plano (chamar uma vez no início).
+pub fn set_image_waker(waker: ImageWaker) {
+    if IMAGE_WAKER.set(waker).is_err() {
+        eprintln!("[scene2d] image waker já registrado");
+    }
+}
+
+/// Pixels RGBA8 pré-multiplicados prontos para upload.
+struct DecodedImage {
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+}
+
+/// Imagens: decodificadas em threads (nunca no loop de render) e enviadas à GPU no rebuild
+/// seguinte. Enquanto decodifica, a camada não é desenhada.
 #[derive(Default)]
 struct ImageCache {
     loaded: HashMap<String, ImageEntry>,
     failed: HashSet<String>,
+    pending: HashMap<String, mpsc::Receiver<Option<DecodedImage>>>,
+    /// Alguma decodificação terminou desde o último `take_completed`.
+    completed: Arc<AtomicBool>,
 }
 
 impl ImageCache {
@@ -204,28 +230,72 @@ impl ImageCache {
             return None;
         }
         let key = key.into_owned();
-        match Self::load(path, compositor, device, queue) {
+        let Some(rx) = self.pending.get(&key) else {
+            self.spawn_decode(path, key, compositor.max_texture_dim());
+            return None;
+        };
+        let decoded = match rx.try_recv() {
+            Ok(decoded) => decoded,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            // Thread caiu (pânico no decoder): trata como falha.
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.pending.remove(&key);
+        let entry = decoded.and_then(|img| {
+            compositor
+                .create_texture_rgba(device, queue, img.w, img.h, &img.rgba)
+                .map(|id| ImageEntry { id, w: img.w, h: img.h })
+        });
+        match entry {
             Some(entry) => {
                 self.loaded.insert(key, entry);
                 Some(entry)
             }
             None => {
+                eprintln!("[scene2d] imagem não carregou: {}", path.display());
                 self.failed.insert(key);
                 None
             }
         }
     }
 
-    /// Decodifica (CPU, uma única vez), limita ao máximo do device, pré-multiplica e envia.
-    fn load(
-        path: &Path,
-        compositor: &mut Compositor2D,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Option<ImageEntry> {
-        let mut img = image::open(path).ok()?.into_rgba8();
+    fn spawn_decode(&mut self, path: &Path, key: String, max_dim: u32) {
+        let (tx, rx) = mpsc::channel();
+        let completed = Arc::clone(&self.completed);
+        let path = path.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("prismview-image-decode".into())
+            .spawn(move || {
+                let decoded = Self::decode(&path, max_dim);
+                let delivered = tx.send(decoded).is_ok();
+                completed.store(true, Ordering::Release);
+                if delivered {
+                    if let Some(wake) = IMAGE_WAKER.get() {
+                        wake();
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                self.pending.insert(key, rx);
+            }
+            Err(err) => {
+                eprintln!("[scene2d] thread de imagem: {err}");
+                self.failed.insert(key);
+            }
+        }
+    }
+
+    /// Decodifica (CPU, fora do loop), limita ao máximo do device e pré-multiplica.
+    fn decode(path: &Path, max: u32) -> Option<DecodedImage> {
+        let mut img = match image::open(path) {
+            Ok(img) => img.into_rgba8(),
+            Err(err) => {
+                eprintln!("[scene2d] imagem {}: {err}", path.display());
+                return None;
+            }
+        };
         let (w, h) = img.dimensions();
-        let max = compositor.max_texture_dim();
         if w > max || h > max {
             let k = max as f32 / w.max(h) as f32;
             let nw = ((w as f32 * k) as u32).max(1);
@@ -241,8 +311,12 @@ impl ImageCache {
                 }
             }
         }
-        let id = compositor.create_texture_rgba(device, queue, w, h, img.as_raw())?;
-        Some(ImageEntry { id, w, h })
+        Some(DecodedImage { w, h, rgba: img.into_raw() })
+    }
+
+    /// `true` uma vez por lote de decodificações concluídas (o rebuild as envia à GPU).
+    fn take_completed(&self) -> bool {
+        !self.pending.is_empty() && self.completed.swap(false, Ordering::AcqRel)
     }
 
     fn release_all(&mut self, compositor: &mut Compositor2D) {
@@ -250,13 +324,16 @@ impl ImageCache {
             compositor.release_texture(entry.id);
         }
         self.failed.clear();
+        // Threads em curso terminam sozinhas (o envio falha com o receptor descartado).
+        self.pending.clear();
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TextBinding {
     id: TextureId,
     gen: u64,
+    key: Arc<str>,
 }
 
 // ───────────────────────── SceneRenderer ─────────────────────────
@@ -644,6 +721,11 @@ impl SceneRenderer {
         self.version += 1;
     }
 
+    pub fn set_font_resolver(&mut self, resolver: FontResolver) {
+        self.text.set_font_resolver(resolver);
+        self.version += 1;
+    }
+
     pub fn register_font_dir(&mut self, dir: &Path) {
         self.text.register_font_dir(dir);
         self.version += 1;
@@ -666,6 +748,17 @@ impl SceneRenderer {
         self.scene.is_some()
     }
 
+    /// Imagens decodificadas em segundo plano ficaram prontas: invalida a lista (o rebuild faz o
+    /// upload). Chamar 1× por iteração do loop; `true` = redesenhar.
+    pub fn poll_images(&mut self) -> bool {
+        if self.images.take_completed() {
+            self.version += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     fn reset_resources(&mut self) {
         self.images.release_all(&mut self.compositor);
         self.svgs.release_all(&mut self.compositor);
@@ -673,6 +766,7 @@ impl SceneRenderer {
             self.compositor.release_texture(binding.id);
         }
         self.text.clear();
+        self.glass.release();
     }
 
     pub fn set_scene(&mut self, scene: PrismScene, ctx: &EvalContext) {
@@ -690,6 +784,8 @@ impl SceneRenderer {
     fn index_scene(&mut self, scene: &PrismScene) {
         fn walk(
             layers: &[LayerNode],
+            scene: &PrismScene,
+            asset_root: Option<&Path>,
             table: &mut Vec<TouchAction>,
             index: &mut HashMap<String, u32>,
             fonts: &mut Vec<(String, PathBuf)>,
@@ -700,15 +796,26 @@ impl SceneRenderer {
                     table.push(l.touch.clone());
                 }
                 if l.kind == LayerKind::Text && !l.text.font_path.trim().is_empty() {
-                    fonts.push((l.text.font_id.clone(), PathBuf::from(l.text.font_path.trim())));
+                    if let Some(resolved) =
+                        resolve_asset_path(scene, asset_root, l.text.font_path.trim())
+                    {
+                        fonts.push((l.text.font_id.clone(), resolved));
+                    }
                 }
-                walk(&l.children, table, index, fonts);
+                walk(&l.children, scene, asset_root, table, index, fonts);
             }
         }
         self.touch_table.clear();
         self.touch_index.clear();
         let mut fonts = Vec::new();
-        walk(&scene.layers, &mut self.touch_table, &mut self.touch_index, &mut fonts);
+        walk(
+            &scene.layers,
+            scene,
+            self.asset_root.as_deref(),
+            &mut self.touch_table,
+            &mut self.touch_index,
+            &mut fonts,
+        );
         for (font_id, path) in fonts {
             if path.is_file() && !self.text.register_font_alias(&font_id, &path) {
                 eprintln!("[prismview-engine] fonte ilegível: {}", path.display());
@@ -890,15 +997,16 @@ impl SceneRenderer {
             frame.build();
         }
 
-        // Libera slots/bindings de texto desta saída que a cena já não usa.
-        let mut suffix = String::with_capacity(canvas_key.len() + 1);
-        suffix.push('@');
-        suffix.push_str(canvas_key);
-        self.text.sweep(serial, |key| key.ends_with(&suffix));
+        // Libera slots/bindings de texto desta saída que a cena já não usa (sem alocar).
+        self.key_scratch.clear();
+        self.key_scratch.push('@');
+        self.key_scratch.push_str(canvas_key);
+        let suffix = self.key_scratch.as_str();
+        self.text.sweep(serial, |key| key.ends_with(suffix));
         let text = &self.text;
         let compositor = &mut self.compositor;
         self.text_bindings.retain(|key, binding| {
-            if !key.ends_with(&suffix) || text.has_slot(key) {
+            if !key.ends_with(suffix) || text.has_slot(key) {
                 true
             } else {
                 compositor.release_texture(binding.id);
@@ -910,10 +1018,12 @@ impl SceneRenderer {
 
 // ───────────────────────── Construção do frame ─────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct TextDraw {
     layout: TextLayout,
     tex: Option<TextureId>,
+    content_hash: u64,
+    slot_key: Option<Arc<str>>,
 }
 
 struct FillStyle {
@@ -960,7 +1070,7 @@ impl Frame<'_> {
         };
         let scene = self.scene;
         for layer in &scene.layers {
-            self.layer(layer, &root, Affine::IDENTITY, 1.0, None);
+            self.layer(layer, &root, Affine::IDENTITY, 1.0, None, false);
         }
     }
 
@@ -1033,40 +1143,56 @@ impl Frame<'_> {
         )
     }
 
-    /// Mapeia `OpticalCrystalParams` para os parâmetros do shader (px físicos). Hipóteses de
-    /// mapeamento onde o schema não é 1:1 com o TS: dispersão `×400` → `chromaticAberration`
-    /// (0,006 → 2,4 px), `fresnel_intensity` → especular, `prismatic_rim_intensity` → borda,
-    /// `grain` → ruído; `Adaptive`/`ClassicBlur` = só blur + véu (sem lente/dispersão/especular).
-    fn glass_params(&self, layer: &LayerNode, opacity: f32, radius: f32) -> GlassParams {
+    /// Mapeia `OpticalCrystalParams` para os parâmetros do shader (px físicos), em paridade 1:1
+    /// com `OpticalGlassSurface.tsx` / `opticalGlassWebGL.ts`:
+    /// - No modo `Glyph`, `pigment` recebe a cor + alpha reais do texto (`layer.color`), garantindo
+    ///   cor e opacidade fiéis mesmo com `frost == 0`.
+    /// - `brightness`, `contrast`, `saturation`, `light_angle_deg`, `refraction`, `bevel_width`,
+    ///   dispersão (`×400`), especular (`fresnel_intensity`) e borda (`prismatic_rim_intensity`).
+    fn glass_params(
+        &self,
+        layer: &LayerNode,
+        mode: GlassMode,
+        opacity: f32,
+        radius: f32,
+    ) -> GlassParams {
         let c = &layer.crystal;
         let ui = self.ui;
         let tint = self.color(&c.tint_rgba);
         let g = self.fx.fx(layer.id.as_str()).map(|f| f.glass).unwrap_or_default();
+        let pigment = if mode == GlassMode::Glyph {
+            self.color(&layer.color)
+        } else {
+            [1.0, 1.0, 1.0, 0.0]
+        };
         let mut p = GlassParams {
-            blur_px: ((self.f(&c.blur_px) + g.blur_px) * ui).max(0.0),
+            blur_px: ((self.f(&c.blur_px) + g.blur_px) * ui).clamp(0.0, 80.0 * ui),
             frost: (self.f(&c.frost_amount) + g.frost).clamp(0.0, 0.94),
             tint: [tint[0], tint[1], tint[2]],
-            noise: c.grain.max(0.0),
-            saturation: self.f(&c.saturation).max(0.0),
-            opacity,
+            noise: c.grain.clamp(0.0, 0.4),
+            brightness: self.f(&c.brightness).clamp(0.5, 1.8),
+            contrast: self.f(&c.contrast).clamp(0.6, 1.8),
+            saturation: self.f(&c.saturation).clamp(0.0, 2.6),
+            opacity: opacity.clamp(0.0, 1.0),
             radius_px: radius,
-            bevel_px: (self.f(&c.bevel_width) * ui).max(0.0),
+            bevel_px: self.f(&c.bevel_width).clamp(4.0, 80.0) * ui,
             light_angle_deg: self.f(&c.light_angle_deg),
+            pigment,
             ..GlassParams::default()
         };
         if layer.fill == FillMode::OpticalCrystal {
-            p.refraction_px = (self.f(&c.refraction) + g.refraction) * ui;
-            p.chroma_px = ((self.f(&c.dispersion_rgb) + g.dispersion) * 400.0).max(0.0);
-            p.specular = (self.f(&c.fresnel_intensity) + g.specular).max(0.0);
-            p.border = (self.f(&c.prismatic_rim_intensity) + g.rim).max(0.0);
-        } else {
-            // Mantém o véu: o alpha do tint vira parte da opacidade do véu.
-            p.frost = (p.frost + tint[3] * 0.5).clamp(0.0, 0.94);
+            p.refraction_px = (self.f(&c.refraction) + g.refraction).clamp(0.0, 60.0) * ui.max(0.5);
+            p.chroma_px = ((self.f(&c.dispersion_rgb) + g.dispersion) * 400.0).clamp(0.0, 6.0);
+            p.specular = (self.f(&c.fresnel_intensity) + g.specular).clamp(0.0, 1.0);
+            p.border = (self.f(&c.prismatic_rim_intensity) + g.rim).clamp(0.0, 0.8);
+        } else if p.frost <= 0.001 && tint[3] > 0.001 {
+            // `Adaptive`/`ClassicBlur` legado sem `frost_amount`: aproveita o alpha do tint.
+            p.frost = (tint[3] * 0.5).clamp(0.0, 0.94);
         }
         p
     }
 
-    /// Enfileira um vidro-placa. `false` se não há backdrop de mídia (cai no preenchimento).
+    /// Enfileira um vidro-placa ou glifo. `false` se não há backdrop de mídia (cai no preenchimento).
     #[allow(clippy::too_many_arguments)]
     fn push_glass(
         &mut self,
@@ -1083,7 +1209,7 @@ impl Frame<'_> {
         let Some(backdrop) = self.backdrop else {
             return false;
         };
-        let params = self.glass_params(layer, opacity, radius);
+        let params = self.glass_params(layer, mode, opacity, radius);
         let Some(glass) = self.canvas.glass.as_mut() else {
             return false;
         };
@@ -1196,6 +1322,7 @@ impl Frame<'_> {
         self.scratch.push_str(self.canvas_key);
 
         let content = FxEngine::eval_text(&layer.text.text, self.ctx).value;
+        let content_hash = hash_str(&content);
         let size_px = (self.f(&layer.text.size_px) * self.ui).max(1.0);
         let spec = TextSpec {
             text: &content,
@@ -1203,6 +1330,7 @@ impl Frame<'_> {
             size_px,
             weight: layer.text.weight,
             line_spacing: layer.text.line_spacing,
+            letter_spacing_em: layer.text.letter_spacing_em,
             align: match layer.text.align {
                 TextAlign::Start => TextAlignment::Start,
                 TextAlign::Center => TextAlignment::Center,
@@ -1212,28 +1340,40 @@ impl Frame<'_> {
         let layout = self.text.update(self.device, self.scratch.as_str(), &spec);
 
         let mut tex = None;
+        let mut slot_key = None;
         if !layout.empty {
-            let existing = self.bindings.get(self.scratch.as_str()).copied();
+            let existing = self.bindings.get(self.scratch.as_str());
             match existing {
-                Some(b) if b.gen == layout.tex_gen => tex = Some(b.id),
-                _ => {
+                Some(b) if b.gen == layout.tex_gen => {
+                    tex = Some(b.id);
+                    slot_key = Some(Arc::clone(&b.key));
+                }
+                other => {
+                    let prev_id = other.map(|b| b.id);
+                    let reused_key = other.map(|b| Arc::clone(&b.key));
                     if let Some(view) = self.text.texture_view(self.scratch.as_str()) {
-                        let id =
-                            self.compositor
-                                .bind_view(self.device, existing.map(|b| b.id), view);
+                        let id = self.compositor.bind_view(self.device, prev_id, view);
+                        let key = reused_key.unwrap_or_else(|| Arc::from(self.scratch.as_str()));
                         self.bindings.insert(
                             self.scratch.clone(),
                             TextBinding {
                                 id,
                                 gen: layout.tex_gen,
+                                key: Arc::clone(&key),
                             },
                         );
                         tex = Some(id);
+                        slot_key = Some(key);
                     }
                 }
             }
         }
-        TextDraw { layout, tex }
+        TextDraw {
+            layout,
+            tex,
+            content_hash,
+            slot_key,
+        }
     }
 
     // ── Camadas ──
@@ -1245,12 +1385,14 @@ impl Frame<'_> {
         parent_xf: Affine,
         inherited_opacity: f32,
         forced_center: Option<[f32; 2]>,
+        parent_moving: bool,
     ) {
         if !self.is_visible(layer) {
             return;
         }
         // Base (estática/FX) + delta dos bindings: o delta é recalculado por quadro, sem deriva.
         let fx = self.fx.fx(layer.id.as_str()).unwrap_or_default();
+        let moving = parent_moving || self.fx.is_layer_animating(layer.id.as_str());
         let opacity = (self.f(&layer.opacity) + fx.opacity).clamp(0.0, 1.0) * inherited_opacity;
         if opacity <= 0.003 {
             return;
@@ -1265,13 +1407,29 @@ impl Frame<'_> {
         let size = match layer.kind {
             LayerKind::Text => {
                 let draw = self.layout_text(layer);
-                text_draw = Some(draw);
-                Size {
+                let sz = Size {
                     w: draw.layout.width,
                     h: draw.layout.height,
-                }
+                };
+                text_draw = Some(draw);
+                sz
             }
             LayerKind::Stack => self.stack_size(layer),
+            LayerKind::Shape
+                if layer.id.ends_with("__pill")
+                    && layer.children.len() == 1
+                    && layer.children[0].kind == LayerKind::Text =>
+            {
+                let child = &layer.children[0];
+                let draw = self.layout_text(child);
+                let font_px = (self.f(&child.text.size_px) * ui).max(1.0);
+                let pad_x = (font_px * 0.34).max(12.0 * ui);
+                let pad_y = (font_px * 0.16).max(6.0 * ui);
+                Size {
+                    w: draw.layout.width + pad_x * 2.0,
+                    h: draw.layout.height + pad_y * 2.0,
+                }
+            }
             _ if layer.fill_parent => Size {
                 w: parent.w.max(0.0),
                 h: parent.h.max(0.0),
@@ -1315,7 +1473,7 @@ impl Frame<'_> {
         let z = self.next_z();
         let blend = map_blend(layer.blend);
         match layer.kind {
-            LayerKind::Text => self.draw_text(layer, text_draw, &xf, z, blend, opacity),
+            LayerKind::Text => self.draw_text(layer, text_draw, &xf, z, blend, opacity, moving),
             LayerKind::Shape => self.draw_shape(layer, size, &xf, z, blend, opacity),
             LayerKind::Image => self.draw_image(layer, size, &xf, z, blend, opacity),
             LayerKind::Scene3d => self.draw_scene3d(size, &xf, z, blend, opacity, layer.fill_parent),
@@ -1329,7 +1487,7 @@ impl Frame<'_> {
             return;
         }
         if layer.kind == LayerKind::Stack {
-            self.stack_children(layer, size, &xf, opacity);
+            self.stack_children(layer, size, &xf, opacity, moving);
         } else {
             let pb = ParentBox {
                 left: -size.w * 0.5,
@@ -1338,12 +1496,19 @@ impl Frame<'_> {
                 h: size.h,
             };
             for child in &layer.children {
-                self.layer(child, &pb, xf, opacity, None);
+                self.layer(child, &pb, xf, opacity, None, moving);
             }
         }
     }
 
-    fn stack_children(&mut self, layer: &LayerNode, size: Size, xf: &Affine, opacity: f32) {
+    fn stack_children(
+        &mut self,
+        layer: &LayerNode,
+        size: Size,
+        xf: &Affine,
+        opacity: f32,
+        moving: bool,
+    ) {
         let spacing = layer.stack_spacing_px * self.ui;
         let horizontal = layer.stack_dir == StackDir::Horizontal;
         let pb = ParentBox {
@@ -1363,7 +1528,7 @@ impl Frame<'_> {
             } else {
                 ([0.0, cursor + s.h * 0.5], s.h)
             };
-            self.layer(child, &pb, *xf, opacity, Some(center));
+            self.layer(child, &pb, *xf, opacity, Some(center), moving);
             cursor += advance + spacing;
         }
     }
@@ -1401,12 +1566,29 @@ impl Frame<'_> {
                 gradient: None,
                 hollow: true,
             },
-            // Vidro óptico/blur: Fase 2. Até lá, preenchimento translúcido com o tint do cristal.
-            FillMode::Adaptive | FillMode::ClassicBlur | FillMode::OpticalCrystal => FillStyle {
-                color: with_alpha(self.color(&layer.crystal.tint_rgba), opacity),
-                gradient: None,
-                hollow: false,
-            },
+            // Fallback sem backdrop de mídia: texto preserva sua cor/alpha reais; placa usa o tint/frost.
+            FillMode::Adaptive | FillMode::ClassicBlur | FillMode::OpticalCrystal => {
+                let fallback = if layer.kind == LayerKind::Text {
+                    let c = self.color(&layer.color);
+                    if c[3] > 0.003 {
+                        c
+                    } else {
+                        self.color(&layer.crystal.tint_rgba)
+                    }
+                } else {
+                    let mut c = self.color(&layer.crystal.tint_rgba);
+                    let frost = self.f(&layer.crystal.frost_amount).clamp(0.0, 0.94);
+                    if frost > 0.002 {
+                        c[3] = frost;
+                    }
+                    c
+                };
+                FillStyle {
+                    color: with_alpha(fallback, opacity),
+                    gradient: None,
+                    hollow: false,
+                }
+            }
         }
     }
 
@@ -1440,6 +1622,7 @@ impl Frame<'_> {
 
     // ── Desenho por tipo ──
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_text(
         &mut self,
         layer: &LayerNode,
@@ -1448,6 +1631,7 @@ impl Frame<'_> {
         z: u32,
         blend: BlendKind,
         opacity: f32,
+        moving: bool,
     ) {
         let Some(draw) = draw else {
             return;
@@ -1455,45 +1639,58 @@ impl Frame<'_> {
         let (Some(tex), false) = (draw.tex, draw.layout.empty) else {
             return;
         };
-        let scale = xf.scale();
+        let stretch_y = self.f(&layer.text.stem_stretch.stretch).clamp(1.0, 2.8);
+        let text_xf = if (stretch_y - 1.0).abs() > 1e-3 {
+            Affine {
+                m: [xf.m[0], xf.m[1], xf.m[2] * stretch_y, xf.m[3] * stretch_y],
+                t: xf.t,
+            }
+        } else {
+            *xf
+        };
+        let scale = text_xf.scale();
         let half = [draw.layout.quad_width * 0.5, draw.layout.quad_height * 0.5];
-        let mut center = xf.t;
-        // Sem rotação/escala: alinha o canto do quad à grade de pixels (texto nítido, 1:1).
-        if xf.is_identity_linear() {
+        let mut center = text_xf.t;
+        let glass_glyph = Self::is_glass(layer) && self.backdrop.is_some();
+        // Sem rotação/escala e em repouso (fora de vidro/parallax): alinha à grade de pixels (1:1).
+        // Em glifos de vidro ou durante parallax, mantém subpixel contínuo para movimento liso 60+ FPS.
+        if !glass_glyph && !moving && text_xf.is_identity_linear() {
             center[0] = (center[0] - half[0]).round() + half[0];
             center[1] = (center[1] - half[1]).round() + half[1];
         }
         let uv = [0.0, 0.0, draw.layout.uv_max[0], draw.layout.uv_max[1]];
 
         // Vidro nos glifos: normais geradas na GPU a partir da máscara do slot de texto.
-        if Self::is_glass(layer) && self.backdrop.is_some() {
-            let content = FxEngine::eval_text(&layer.text.text, self.ctx).value;
-            let mut token = hash_combine(hash_str(&content), hash_str(&layer.text.font_id));
-            token = hash_combine(token, u64::from(draw.layout.quad_width.to_bits()));
-            token = hash_combine(token, u64::from(draw.layout.quad_height.to_bits()));
-            token = hash_combine(token, u64::from(layer.text.weight));
-            token = hash_combine(token, draw.layout.tex_gen);
-            let source = GlyphSource {
-                key: format!("{}@{}", layer.id, self.canvas_key),
-                token,
-                size: (
-                    draw.layout.quad_width.ceil().max(1.0) as u32,
-                    draw.layout.quad_height.ceil().max(1.0) as u32,
-                ),
-                bevel_px: (self.f(&layer.crystal.bevel_width) * self.ui).max(0.0),
-            };
-            if self.push_glass(
-                layer,
-                GlassMode::Glyph,
-                half,
-                xf,
-                center,
-                z,
-                opacity,
-                0.0,
-                Some(source),
-            ) {
-                return;
+        if glass_glyph {
+            if let Some(slot_key) = draw.slot_key {
+                let mut token = hash_combine(draw.content_hash, hash_str(&layer.text.font_id));
+                token = hash_combine(token, u64::from(draw.layout.quad_width.to_bits()));
+                token = hash_combine(token, u64::from(draw.layout.quad_height.to_bits()));
+                token = hash_combine(token, u64::from(layer.text.weight));
+                token = hash_combine(token, u64::from(layer.text.letter_spacing_em.to_bits()));
+                token = hash_combine(token, draw.layout.tex_gen);
+                let source = GlyphSource {
+                    key: slot_key,
+                    token,
+                    size: (
+                        draw.layout.quad_width.ceil().max(1.0) as u32,
+                        draw.layout.quad_height.ceil().max(1.0) as u32,
+                    ),
+                    bevel_px: self.f(&layer.crystal.bevel_width).clamp(4.0, 80.0) * self.ui,
+                };
+                if self.push_glass(
+                    layer,
+                    GlassMode::Glyph,
+                    half,
+                    &text_xf,
+                    center,
+                    z,
+                    opacity,
+                    0.0,
+                    Some(source),
+                ) {
+                    return;
+                }
             }
         }
 
@@ -1506,7 +1703,7 @@ impl Frame<'_> {
                     center[0] + layer.shadow.dx_px * ui,
                     center[1] + layer.shadow.dy_px * ui,
                 ];
-                let inst = QuadInstance::new(c, half, xf.m, scale)
+                let inst = QuadInstance::new(c, half, text_xf.m, scale)
                     .kind(QuadKind::Mask)
                     .color(color)
                     .uv(uv);
@@ -1515,7 +1712,7 @@ impl Frame<'_> {
         }
 
         let fill = self.fill_style(layer, opacity);
-        let mut inst = QuadInstance::new(center, half, xf.m, scale)
+        let mut inst = QuadInstance::new(center, half, text_xf.m, scale)
             .kind(QuadKind::Mask)
             .color(fill.color)
             .uv(uv);

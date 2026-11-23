@@ -258,6 +258,10 @@ pub struct OpticalCrystalParams {
     pub fresnel_intensity: StaticOrFx<f32>,
     #[serde(default = "default_prismatic_rim")]
     pub prismatic_rim_intensity: StaticOrFx<f32>,
+    #[serde(default = "default_one_fx")]
+    pub brightness: StaticOrFx<f32>,
+    #[serde(default = "default_one_fx")]
+    pub contrast: StaticOrFx<f32>,
     #[serde(default = "default_saturation")]
     pub saturation: StaticOrFx<f32>,
     #[serde(default = "default_tint")]
@@ -323,6 +327,8 @@ impl Default for OpticalCrystalParams {
             light_angle_deg: default_light_angle(),
             fresnel_intensity: default_fresnel(),
             prismatic_rim_intensity: default_prismatic_rim(),
+            brightness: default_one_fx(),
+            contrast: default_one_fx(),
             saturation: default_saturation(),
             tint_rgba: default_tint(),
             grain: default_grain(),
@@ -1238,7 +1244,150 @@ pub enum IpcRequest {
     LoadSceneFile {
         path: String,
     },
+    /// Etapa 6: mostra ou oculta o ícone da engine na bandeja do sistema em tempo real.
+    SetTrayVisible {
+        visible: bool,
+    },
+    /// Entrega 3: remove só o wallpaper (janelas WorkerW + `active_scene.json`); widgets nativos
+    /// continuam no ar. O motor sai sozinho se não sobrar nada para desenhar.
+    ClearWallpaper,
+    /// Entrega 3: cria/atualiza um widget nativo (janela DirectComposition transparente no mesmo
+    /// processo, mesmo device/sensores). `scene_path` = `PrismScene` JSON em disco (recomendado:
+    /// sem limite de pipe e relido no login); `scene` inline é aceito para cenas pequenas.
+    /// Coordenadas/tamanho em px físicos do desktop virtual.
+    UpsertWidget {
+        id: String,
+        #[serde(default)]
+        scene_path: String,
+        #[serde(default)]
+        scene: Option<Box<PrismScene>>,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        #[serde(default)]
+        always_on_top: bool,
+        #[serde(default)]
+        locked: bool,
+        #[serde(default)]
+        click_through: bool,
+    },
+    RemoveWidget {
+        id: String,
+    },
+    UpdateWidgetBounds {
+        id: String,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
+    /// Campos ausentes mantêm o valor atual.
+    SetWidgetFlags {
+        id: String,
+        #[serde(default)]
+        always_on_top: Option<bool>,
+        #[serde(default)]
+        locked: Option<bool>,
+        #[serde(default)]
+        click_through: Option<bool>,
+    },
+    /// Estado atual dos widgets nativos (posição após arrasto incluída) → `IpcResponse::Widgets`.
+    ListWidgets,
     Shutdown,
+}
+
+/// Menor/maior lado aceito para um widget nativo (px físicos).
+pub const NATIVE_WIDGET_MIN_SIDE: u32 = 16;
+pub const NATIVE_WIDGET_MAX_SIDE: u32 = 8192;
+/// Versão do `active_widgets.json`.
+pub const ACTIVE_WIDGETS_VERSION: u32 = 1;
+
+/// Widget nativo ativo (persistido em `%APPDATA%\PrismView\native\active_widgets.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWidgetSpec {
+    pub id: String,
+    #[serde(default)]
+    pub scene_path: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub always_on_top: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub click_through: bool,
+}
+
+impl NativeWidgetSpec {
+    /// Id utilizável como nome de arquivo/janela (sem separadores de caminho nem controle).
+    pub fn is_valid_id(id: &str) -> bool {
+        !id.trim().is_empty()
+            && id.len() <= 128
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') )
+            && id != "."
+            && id != ".."
+    }
+
+    /// Normaliza tamanho (16..=8192) e devolve `None` se o id é inválido.
+    pub fn sanitized(mut self) -> Option<Self> {
+        if !Self::is_valid_id(&self.id) {
+            return None;
+        }
+        self.width = self.width.clamp(NATIVE_WIDGET_MIN_SIDE, NATIVE_WIDGET_MAX_SIDE);
+        self.height = self.height.clamp(NATIVE_WIDGET_MIN_SIDE, NATIVE_WIDGET_MAX_SIDE);
+        Some(self)
+    }
+}
+
+/// Conteúdo de `active_widgets.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveWidgetsFile {
+    #[serde(default = "active_widgets_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub widgets: Vec<NativeWidgetSpec>,
+}
+
+fn active_widgets_version() -> u32 {
+    ACTIVE_WIDGETS_VERSION
+}
+
+impl Default for ActiveWidgetsFile {
+    fn default() -> Self {
+        Self {
+            version: ACTIVE_WIDGETS_VERSION,
+            widgets: Vec::new(),
+        }
+    }
+}
+
+impl ActiveWidgetsFile {
+    /// Parse tolerante: JSON inválido = lista vazia; entradas inválidas e ids repetidos
+    /// (o último vence) são descartados.
+    pub fn parse(raw: &str) -> Self {
+        let parsed: Self = serde_json::from_str(raw).unwrap_or_default();
+        let mut out: Vec<NativeWidgetSpec> = Vec::with_capacity(parsed.widgets.len());
+        for w in parsed.widgets.into_iter().filter_map(NativeWidgetSpec::sanitized) {
+            if let Some(slot) = out.iter_mut().find(|o| o.id == w.id) {
+                *slot = w;
+            } else {
+                out.push(w);
+            }
+        }
+        Self {
+            version: ACTIVE_WIDGETS_VERSION,
+            widgets: out,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{\"version\":1,\"widgets\":[]}".to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -1262,5 +1411,80 @@ pub enum IpcResponse {
     Ok,
     Pong { protocol_version: u32 },
     Status { engine: EngineStatus },
+    Widgets { widgets: Vec<NativeWidgetSpec> },
     Error { message: String },
+}
+
+#[cfg(test)]
+mod native_widget_tests {
+    use super::*;
+
+    #[test]
+    fn upsert_widget_roundtrip_and_studio_shape() {
+        // Formato que o Studio (`native_engine.rs`, serde_json::json!) envia.
+        let raw = r#"{"cmd":"UPSERT_WIDGET","id":"w-1","scene_path":"C:\\x\\w-1.json",
+            "x":-1910,"y":40,"width":420,"height":300,"always_on_top":true,"locked":false}"#;
+        let req: IpcRequest = serde_json::from_str(raw).expect("parse");
+        match &req {
+            IpcRequest::UpsertWidget { id, x, width, always_on_top, click_through, scene, .. } => {
+                assert_eq!(id, "w-1");
+                assert_eq!(*x, -1910);
+                assert_eq!(*width, 420);
+                assert!(*always_on_top);
+                assert!(!*click_through);
+                assert!(scene.is_none());
+            }
+            other => panic!("variante errada: {other:?}"),
+        }
+        let back: IpcRequest = serde_json::from_str(&serde_json::to_string(&req).expect("ser")).expect("re");
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn widget_flags_partial_and_list_response() {
+        let req: IpcRequest =
+            serde_json::from_str(r#"{"cmd":"SET_WIDGET_FLAGS","id":"a","locked":true}"#).expect("parse");
+        assert_eq!(
+            req,
+            IpcRequest::SetWidgetFlags { id: "a".into(), always_on_top: None, locked: Some(true), click_through: None }
+        );
+        for raw in [r#"{"cmd":"REMOVE_WIDGET","id":"a"}"#, r#"{"cmd":"LIST_WIDGETS"}"#, r#"{"cmd":"CLEAR_WALLPAPER"}"#] {
+            assert!(serde_json::from_str::<IpcRequest>(raw).is_ok(), "{raw}");
+        }
+        let resp = IpcResponse::Widgets {
+            widgets: vec![NativeWidgetSpec {
+                id: "a".into(),
+                scene_path: String::new(),
+                x: 1,
+                y: 2,
+                width: 30,
+                height: 40,
+                always_on_top: false,
+                locked: true,
+                click_through: false,
+            }],
+        };
+        let json = serde_json::to_value(&resp).expect("ser");
+        assert_eq!(json["status"], "WIDGETS");
+        assert_eq!(json["widgets"][0]["locked"], true);
+    }
+
+    #[test]
+    fn active_widgets_file_is_tolerant() {
+        assert!(ActiveWidgetsFile::parse("lixo").widgets.is_empty());
+        let raw = r#"{"widgets":[
+            {"id":"ok","x":0,"y":0,"width":2,"height":99999},
+            {"id":"../evil","x":0,"y":0,"width":100,"height":100},
+            {"id":"ok","x":5,"y":6,"width":100,"height":100,"locked":true}
+        ]}"#;
+        let file = ActiveWidgetsFile::parse(raw);
+        assert_eq!(file.version, ACTIVE_WIDGETS_VERSION);
+        assert_eq!(file.widgets.len(), 1);
+        assert_eq!(file.widgets[0].x, 5);
+        assert!(file.widgets[0].locked);
+        let again = ActiveWidgetsFile::parse(&file.to_json());
+        assert_eq!(again, file);
+        let clamp = ActiveWidgetsFile::parse(r#"{"widgets":[{"id":"c","x":0,"y":0,"width":2,"height":99999}]}"#);
+        assert_eq!((clamp.widgets[0].width, clamp.widgets[0].height), (NATIVE_WIDGET_MIN_SIDE, NATIVE_WIDGET_MAX_SIDE));
+    }
 }

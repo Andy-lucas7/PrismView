@@ -21,16 +21,19 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SystemParametersInfoW, GA_PARENT, GWL_EXSTYLE, GWL_STYLE, HMENU, HTTRANSPARENT,
     HWND_TOP, LWA_ALPHA, MA_NOACTIVATE, SPI_GETDESKWALLPAPER, SPI_SETDESKWALLPAPER,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_HIDE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST,
-    WM_PAINT, WM_SETTINGCHANGE, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_CAPTION,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_APPWINDOW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WTS_SESSION_LOCK,
-    WTS_SESSION_UNLOCK,
+    SW_HIDE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_APP, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
+    WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER,
+    WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use super::monitors::Win32Monitor;
-use super::signals::{self, SIG_REPAINT, SIG_WAKE, TIMER_MONITORS, TIMER_SHELL};
+use super::signals::{
+    self, SIG_REPAINT, SIG_TASKBAR_CREATED, SIG_TRAY_MENU, SIG_TRAY_OPEN, SIG_WAKE, TIMER_MONITORS,
+    TIMER_SHELL,
+};
 use super::util::{last_os_error, os_error};
 use super::workerw::{DesktopLayer, ShellLayout};
 use crate::platform::PlatformResult;
@@ -49,6 +52,8 @@ fn controller_class() -> PCWSTR {
 pub(crate) const WM_PRISM_WAKE: u32 = WM_APP + 0x40;
 /// Pede o fim do loop (`PostQuitMessage` na thread do host).
 pub(crate) const WM_PRISM_EXIT: u32 = WM_APP + 0x41;
+/// Callback de eventos do ícone de bandeja (`Shell_NotifyIconW`).
+pub(crate) const WM_PRISM_TRAY: u32 = WM_APP + 0x42;
 
 const MAX_PATH_W: usize = 260;
 
@@ -329,10 +334,20 @@ unsafe extern "system" fn controller_wndproc(
             PostQuitMessage(0);
             return LRESULT(0);
         }
+        WM_PRISM_TRAY => {
+            let event = (lparam.0 as u32) & 0xFFFF;
+            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
+                signals::raise(SIG_TRAY_MENU);
+            } else if event == WM_LBUTTONDBLCLK {
+                signals::raise(SIG_TRAY_OPEN);
+            }
+            return LRESULT(0);
+        }
         _ => {
             let taskbar_created = signals::taskbar_created_msg();
             if taskbar_created != 0 && msg == taskbar_created {
-                // Explorer reiniciou: espera assentar e redescobre o WorkerW.
+                // Explorer reiniciou: restaura o ícone de bandeja e redescobre o WorkerW.
+                signals::raise(SIG_TASKBAR_CREATED);
                 signals::schedule(TIMER_SHELL);
                 return LRESULT(0);
             }

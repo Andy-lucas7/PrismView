@@ -28,6 +28,7 @@ pub mod graph;
 pub mod instance;
 pub mod lighting;
 pub mod renderer;
+pub mod sculptures;
 
 pub use config::{
     Scene3dBackgroundMode, Scene3dCamera, Scene3dConfig, Scene3dEnvPreset, Scene3dObject,

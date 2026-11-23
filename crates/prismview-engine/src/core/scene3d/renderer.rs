@@ -17,11 +17,11 @@
 //! depois de avançar os clipes (desfaz → anima → reaplica, ver `core::bindings`). Hover/clique em
 //! malha usam `pick` (raio × AABB de mundo de cada draw, sem alocar).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
@@ -30,16 +30,20 @@ use crate::engine_core::assets::Aabb;
 use crate::engine_core::bindings::{BindingSolver3d, InstanceAccess, PickHit};
 use crate::engine_core::signals::{SignalKind, SignalSnapshot};
 
-use super::config::{Scene3dBackgroundMode, Scene3dConfig, Scene3dEnvPreset, Scene3dObject, Scene3dObjectKind};
+use super::config::{
+    Scene3dBackgroundMode, Scene3dConfig, Scene3dDynamicTexture, Scene3dDynamicTextureSource, Scene3dEnvPreset,
+    Scene3dObject, Scene3dObjectKind,
+};
 use super::culling::Frustum;
 use super::environment::{load_hdri, EnvBaker, EnvSource, EnvironmentMaps, EquirectImage};
-use super::gpu_model::{vertex_layouts, GpuModel, ModelUploadContext, ATTR_STRIDE};
+use super::gpu_model::{vertex_layouts, GpuMaterial, GpuModel, ModelUploadContext, ATTR_STRIDE};
 use super::graph::SceneGraph;
 use super::instance::{DeformKernel, ModelInstance};
 use super::lighting::{
     day_night_background, linear_to_srgb, parse_hex_srgb, preset_background, LightRig, ProceduralEnv, MAX_DIR_LIGHTS,
     MAX_POINT_LIGHTS,
 };
+use super::sculptures::{build_showcase_asset, ShowcaseVariant};
 use crate::engine_core::assets::{AssetHash, AssetLoader, LoadEvent, LoaderConfig, ModelAsset, Ticket};
 use crate::engine_core::gpu::GpuContext;
 
@@ -51,6 +55,9 @@ const NEAR_PLANE: f32 = 0.05;
 /// O ciclo dia/noite muda devagar: reavaliar a cada 30 s basta.
 const DAY_NIGHT_PERIOD: f32 = 30.0;
 const DRAW_STRIDE: u64 = std::mem::size_of::<DrawGpu>() as u64;
+/// Limite de tamanho em disco e resolução máxima para texturas dinâmicas (`MEDIA_COVER`/`CUSTOM_IMAGE`).
+const MAX_DYNAMIC_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DYNAMIC_IMAGE_DIM: u32 = 2048;
 
 // ───────────────────────── Uniforms ─────────────────────────
 
@@ -226,6 +233,56 @@ impl Scene3dShared {
 
 // ───────────────────────── Estado por objeto ─────────────────────────
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DynamicImageKey {
+    path: PathBuf,
+    len: u64,
+    modified_ns: u128,
+}
+
+impl DynamicImageKey {
+    fn from_path(path: PathBuf) -> Option<Self> {
+        let meta = std::fs::metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DYNAMIC_IMAGE_BYTES {
+            return None;
+        }
+        let modified_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        Some(Self {
+            path,
+            len: meta.len(),
+            modified_ns,
+        })
+    }
+}
+
+struct DecodedDynamicImage {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+type DynamicTexResult = (DynamicImageKey, Result<DecodedDynamicImage, String>);
+
+enum DynamicTexSlot {
+    Loading,
+    Ready {
+        _texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        vram_bytes: u64,
+    },
+    Failed,
+}
+
+struct SlotDynamicRule {
+    rule: Scene3dDynamicTexture,
+    /// Chave resolvida em `set_config` para regras `CUSTOM_IMAGE`.
+    custom_key: Option<DynamicImageKey>,
+}
+
 struct ObjectSlot {
     id: String,
     src: String,
@@ -235,6 +292,108 @@ struct ObjectSlot {
     error: Option<String>,
     /// Giro acumulado de `autoRotateSpeed` (rad).
     spin: f32,
+    /// Regras tipadas de `dynamicTextures` deste objeto.
+    dynamic_rules: Vec<SlotDynamicRule>,
+    /// Overrides de material na GPU (indexados pelo índice de material do `GpuModel`).
+    /// Vazio quando nenhuma textura dinâmica está ativa no objeto.
+    material_overrides: Vec<Option<GpuMaterial>>,
+}
+
+impl ObjectSlot {
+    #[inline]
+    fn material<'a>(&'a self, instance: &'a ModelInstance, material_idx: u32) -> Option<&'a GpuMaterial> {
+        let idx = material_idx as usize;
+        self.material_overrides
+            .get(idx)
+            .and_then(Option::as_ref)
+            .or_else(|| instance.model.materials.get(idx))
+    }
+}
+
+fn decode_dynamic_image(path: &Path, max_dim: u32) -> Result<DecodedDynamicImage, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
+    if meta.len() == 0 {
+        return Err("arquivo vazio".to_owned());
+    }
+    if meta.len() > MAX_DYNAMIC_IMAGE_BYTES {
+        return Err("imagem excede o limite de 16 MiB".to_owned());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("leitura: {e}"))?;
+    let mut img = image::load_from_memory(&bytes).map_err(|e| format!("decodificação: {e}"))?;
+    if img.width() == 0 || img.height() == 0 {
+        return Err("dimensões inválidas".to_owned());
+    }
+    if img.width() > max_dim || img.height() > max_dim {
+        img = img.resize(max_dim, max_dim, image::imageops::FilterType::Triangle);
+    }
+    let rgba = img.to_rgba8();
+    Ok(DecodedDynamicImage {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
+}
+
+fn rebuild_slot_overrides(
+    device: &wgpu::Device,
+    upload: &ModelUploadContext,
+    slot: &mut ObjectSlot,
+    media_cover_key: Option<&DynamicImageKey>,
+    cache: &HashMap<DynamicImageKey, DynamicTexSlot>,
+) -> bool {
+    let had_overrides = !slot.material_overrides.is_empty();
+    slot.material_overrides.clear();
+    if slot.dynamic_rules.is_empty() {
+        return had_overrides;
+    }
+    let Some(instance) = slot.instance.as_ref() else {
+        return had_overrides;
+    };
+    let model = &instance.model;
+    let mat_count = model.materials.len();
+    if mat_count == 0 {
+        return had_overrides;
+    }
+
+    let mut matched: Vec<Option<(&wgpu::TextureView, bool)>> = vec![None; mat_count];
+    let mut any_match = false;
+    // Wildcard ("", "*") primeiro; nomes específicos depois para sempre terem prioridade.
+    for pass_named in [false, true] {
+        for entry in &slot.dynamic_rules {
+            if entry.rule.is_wildcard() == pass_named {
+                continue;
+            }
+            let key = match entry.rule.source {
+                Scene3dDynamicTextureSource::MediaCover => media_cover_key,
+                Scene3dDynamicTextureSource::CustomImage => entry.custom_key.as_ref(),
+            };
+            let Some(DynamicTexSlot::Ready { view, .. }) = key.and_then(|k| cache.get(k)) else {
+                continue;
+            };
+            for (mi, target) in matched.iter_mut().enumerate() {
+                let mat_name = model.rig.material_names.get(mi).and_then(Option::as_deref);
+                if entry.rule.matches_material(mat_name) {
+                    *target = Some((view, entry.rule.emissive_map));
+                    any_match = true;
+                }
+            }
+        }
+    }
+
+    if !any_match {
+        return had_overrides;
+    }
+
+    slot.material_overrides = matched
+        .into_iter()
+        .enumerate()
+        .map(|(mi, m)| {
+            let (view, emissive_map) = m?;
+            let base = model.material_data.get(mi)?;
+            Some(upload.build_material_override(device, base, &model.texture_views, view, emissive_map))
+        })
+        .collect();
+    true
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +492,8 @@ pub struct Scene3dRenderer {
 
     orbit: [f32; 2],
     pointer: Option<[f32; 2]>,
+    /// Cursor para olhar/órbita (widget: cursor da tela inteira mapeado; `None` = usa `pointer`).
+    look_pointer: Option<[f32; 2]>,
     dirty: bool,
     animating: bool,
     stats: Scene3dStats,
@@ -342,6 +503,14 @@ pub struct Scene3dRenderer {
     signals: SignalSnapshot,
     /// Cursor da última consulta de hover (re-pick só se mudou).
     hover_pointer: Option<[f32; 2]>,
+
+    // Texturas dinâmicas (`MEDIA_COVER` e `CUSTOM_IMAGE`).
+    media_cover_raw: String,
+    media_cover_key: Option<DynamicImageKey>,
+    dynamic_textures: HashMap<DynamicImageKey, DynamicTexSlot>,
+    dynamic_tex_tx: Sender<DynamicTexResult>,
+    dynamic_tex_rx: Receiver<DynamicTexResult>,
+    max_dynamic_tex_dim: u32,
 }
 
 /// Visão das instâncias para o `BindingSolver3d` (campos disjuntos do renderer).
@@ -403,7 +572,10 @@ impl Scene3dRenderer {
             mapped_at_creation: false,
         });
 
-        let mut this = Self {
+        let (dynamic_tex_tx, dynamic_tex_rx) = mpsc::channel();
+        let max_dynamic_tex_dim = device.limits().max_texture_dimension_2d.min(MAX_DYNAMIC_IMAGE_DIM);
+
+        let this = Self {
             shared,
             sample_count,
             pipelines,
@@ -440,12 +612,19 @@ impl Scene3dRenderer {
             blended: Vec::with_capacity(16),
             orbit: [0.0; 2],
             pointer: None,
+            look_pointer: None,
             dirty: true,
             animating: false,
             stats: Scene3dStats::default(),
             solver: BindingSolver3d::new(),
             signals: SignalSnapshot::default(),
             hover_pointer: None,
+            media_cover_raw: String::new(),
+            media_cover_key: None,
+            dynamic_textures: HashMap::new(),
+            dynamic_tex_tx,
+            dynamic_tex_rx,
+            max_dynamic_tex_dim,
         };
         this.write_tonemap(gpu.queue());
         this
@@ -483,6 +662,29 @@ impl Scene3dRenderer {
     /// Cursor normalizado (0..1) para a órbita por parallax; `None` = sem cursor (volta ao centro).
     pub fn set_pointer(&mut self, pointer: Option<[f32; 2]>) {
         self.pointer = pointer.filter(|p| p[0].is_finite() && p[1].is_finite());
+        self.look_pointer = None;
+    }
+
+    /// Widgets: `hover` = cursor local (só dentro da caixa, para hover/pick); `look` = cursor da
+    /// tela inteira mapeado em 0..1 (o personagem olha para o mouse mesmo fora do widget).
+    pub fn set_pointers(&mut self, hover: Option<[f32; 2]>, look: Option<[f32; 2]>) {
+        let ok = |p: &[f32; 2]| p[0].is_finite() && p[1].is_finite();
+        self.pointer = hover.filter(ok);
+        self.look_pointer = look.filter(ok);
+    }
+
+    /// Há bindings `FORMULA` (o host reavalia quando o contexto FX muda).
+    pub fn has_formulas(&self) -> bool {
+        self.solver.has_formulas()
+    }
+
+    /// Reavalia as fórmulas dos bindings (`eval`: expressão → número). `true` = pede quadro.
+    pub fn update_formulas(&mut self, eval: impl FnMut(&str) -> Option<f32>) -> bool {
+        let changed = self.solver.update_formulas(eval);
+        if changed {
+            self.dirty = true;
+        }
+        changed
     }
 
     /// Aplica um novo `Scene3dConfig`. Objetos com o mesmo `id` + `modelSrc` mantêm a instância
@@ -498,17 +700,23 @@ impl Scene3dRenderer {
         }
         let mut slots = Vec::with_capacity(objects.len());
         for obj in &objects {
+            let slot_key = if obj.kind == Scene3dObjectKind::Showcase {
+                ShowcaseVariant::parse(obj.showcase_variant.as_deref()).key()
+            } else {
+                obj.model_src.as_str()
+            };
             let reused = previous
                 .remove(&obj.id)
-                .filter(|s| s.src == obj.model_src && s.kind == obj.kind);
+                .filter(|s| s.src == slot_key && s.kind == obj.kind);
             let slot = match reused {
                 Some(mut slot) => {
                     if let Some(instance) = &mut slot.instance {
                         instance.set_playback(&obj.playback);
                     }
+                    slot.dynamic_rules = self.resolve_dynamic_rules(obj);
                     slot
                 }
-                None => self.new_slot(obj, loader),
+                None => self.new_slot(gpu, obj, loader),
             };
             slots.push(slot);
         }
@@ -523,6 +731,7 @@ impl Scene3dRenderer {
         self.hover_pointer = None;
 
         self.config = config;
+        self.sync_dynamic_textures(gpu);
         if self.config.auto_day_night {
             // Avalia já (hora fixa do Estúdio ou relógio local); o `update` reavalia a cada 30 s.
             let hour = self.day_night_hour();
@@ -540,7 +749,42 @@ impl Scene3dRenderer {
         self.dirty = true;
     }
 
-    fn new_slot(&self, obj: &Scene3dObject, loader: &mut AssetLoader) -> ObjectSlot {
+    fn resolve_dynamic_rules(&self, obj: &Scene3dObject) -> Vec<SlotDynamicRule> {
+        obj.parsed_dynamic_textures()
+            .into_iter()
+            .map(|rule| {
+                let custom_key = if rule.source == Scene3dDynamicTextureSource::CustomImage {
+                    rule.custom_src
+                        .as_deref()
+                        .and_then(|raw| self.resolve_path(raw))
+                        .and_then(DynamicImageKey::from_path)
+                } else {
+                    None
+                };
+                SlotDynamicRule { rule, custom_key }
+            })
+            .collect()
+    }
+
+    fn new_slot(&self, gpu: &GpuContext, obj: &Scene3dObject, loader: &mut AssetLoader) -> ObjectSlot {
+        let dynamic_rules = self.resolve_dynamic_rules(obj);
+        if obj.kind == Scene3dObjectKind::Showcase {
+            let variant = ShowcaseVariant::parse(obj.showcase_variant.as_deref());
+            let asset = build_showcase_asset(variant);
+            let model = self.shared.model(gpu, &asset);
+            let instance = ModelInstance::new(gpu.device(), &self.shared.deform, model, &obj.playback);
+            return ObjectSlot {
+                id: obj.id.clone(),
+                src: variant.key().to_owned(),
+                kind: obj.kind,
+                ticket: None,
+                instance: Some(instance),
+                error: None,
+                spin: 0.0,
+                dynamic_rules,
+                material_overrides: Vec::new(),
+            };
+        }
         let mut slot = ObjectSlot {
             id: obj.id.clone(),
             src: obj.model_src.clone(),
@@ -549,11 +793,9 @@ impl Scene3dRenderer {
             instance: None,
             error: None,
             spin: 0.0,
+            dynamic_rules,
+            material_overrides: Vec::new(),
         };
-        if obj.kind == Scene3dObjectKind::Showcase {
-            slot.error = Some("escultura procedural (SHOWCASE) ainda não existe no motor nativo".into());
-            return slot;
-        }
         match self.resolve_path(&obj.model_src) {
             Some(path) => slot.ticket = Some(loader.request(path)),
             None => slot.error = Some(format!("modelSrc inválido: `{}`", obj.model_src)),
@@ -595,6 +837,13 @@ impl Scene3dRenderer {
                     slot.instance = Some(ModelInstance::new(gpu.device(), &shared.deform, model, &obj.playback));
                     slot.ticket = None;
                     slot.error = None;
+                    rebuild_slot_overrides(
+                        gpu.device(),
+                        &shared.upload,
+                        slot,
+                        self.media_cover_key.as_ref(),
+                        &self.dynamic_textures,
+                    );
                     matched = true;
                 }
                 if matched {
@@ -705,6 +954,139 @@ impl Scene3dRenderer {
         self.dirty = true;
     }
 
+    /// Atualiza a capa da mídia ativa (`MEDIA_COVER`). Só decodifica/sobe na GPU se o arquivo
+    /// ou sua assinatura `(len, mtime)` mudou; devolve `true` se a cena precisa redesenhar já.
+    pub fn set_media_cover(&mut self, gpu: &GpuContext, cover_path: &str) -> bool {
+        let trimmed = cover_path.trim();
+        let next_key = if trimmed.is_empty() {
+            None
+        } else {
+            self.resolve_path(trimmed).and_then(DynamicImageKey::from_path)
+        };
+        if next_key == self.media_cover_key && trimmed == self.media_cover_raw {
+            return false;
+        }
+        self.media_cover_raw.clear();
+        self.media_cover_raw.push_str(trimmed);
+        self.media_cover_key = next_key;
+        if !self.config.uses_media_cover() {
+            return false;
+        }
+        let changed = self.sync_dynamic_textures(gpu);
+        if changed {
+            self.dirty = true;
+        }
+        changed
+    }
+
+    /// Garante que todas as texturas dinâmicas referenciadas estão carregando ou prontas, descarta
+    /// capas/imagens antigas do cache (mantendo a VRAM constante) e reconstrói overrides.
+    fn sync_dynamic_textures(&mut self, gpu: &GpuContext) -> bool {
+        let mut wanted: HashSet<DynamicImageKey> = HashSet::new();
+        for slot in &self.slots {
+            for entry in &slot.dynamic_rules {
+                let key = match entry.rule.source {
+                    Scene3dDynamicTextureSource::MediaCover => self.media_cover_key.clone(),
+                    Scene3dDynamicTextureSource::CustomImage => entry.custom_key.clone(),
+                };
+                if let Some(k) = key {
+                    wanted.insert(k);
+                }
+            }
+        }
+        self.dynamic_textures.retain(|k, _| wanted.contains(k));
+
+        for key in wanted {
+            if self.dynamic_textures.contains_key(&key) {
+                continue;
+            }
+            self.dynamic_textures.insert(key.clone(), DynamicTexSlot::Loading);
+            let thread_key = key.clone();
+            let tx = self.dynamic_tex_tx.clone();
+            let waker = self.waker.clone();
+            let max_dim = self.max_dynamic_tex_dim;
+            let spawned = std::thread::Builder::new()
+                .name("prismview-dyntex".into())
+                .spawn(move || {
+                    let result = decode_dynamic_image(&thread_key.path, max_dim);
+                    let _ = tx.send((thread_key, result));
+                    if let Some(wake) = waker {
+                        wake();
+                    }
+                });
+            if spawned.is_err() {
+                self.dynamic_textures.remove(&key);
+            }
+        }
+
+        let mut any_changed = false;
+        let device = gpu.device();
+        for slot in &mut self.slots {
+            any_changed |= rebuild_slot_overrides(
+                device,
+                &self.shared.upload,
+                slot,
+                self.media_cover_key.as_ref(),
+                &self.dynamic_textures,
+            );
+        }
+        any_changed
+    }
+
+    fn poll_dynamic_textures(&mut self, gpu: &GpuContext) {
+        let mut any_ready = false;
+        loop {
+            match self.dynamic_tex_rx.try_recv() {
+                Ok((key, result)) => {
+                    if !self.dynamic_textures.contains_key(&key) {
+                        continue; // capa/cena antiga já descartada
+                    }
+                    match result {
+                        Ok(decoded) => {
+                            if let Some((texture, view, vram_bytes)) = self.shared.upload.upload_rgba_srgb(
+                                gpu.device(),
+                                gpu.queue(),
+                                decoded.width,
+                                decoded.height,
+                                &decoded.rgba,
+                            ) {
+                                self.dynamic_textures.insert(
+                                    key,
+                                    DynamicTexSlot::Ready {
+                                        _texture: texture,
+                                        view,
+                                        vram_bytes,
+                                    },
+                                );
+                                any_ready = true;
+                            } else {
+                                self.dynamic_textures.insert(key, DynamicTexSlot::Failed);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[prismview-engine] textura dinâmica {}: {err}", key.path.display());
+                            self.dynamic_textures.insert(key, DynamicTexSlot::Failed);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        if any_ready {
+            let device = gpu.device();
+            for slot in &mut self.slots {
+                rebuild_slot_overrides(
+                    device,
+                    &self.shared.upload,
+                    slot,
+                    self.media_cover_key.as_ref(),
+                    &self.dynamic_textures,
+                );
+            }
+            self.dirty = true;
+        }
+    }
+
     fn poll_hdri(&mut self, gpu: &GpuContext) {
         let Some(rx) = &self.hdri_rx else {
             return;
@@ -767,6 +1149,7 @@ impl Scene3dRenderer {
     pub fn update(&mut self, gpu: &GpuContext, dt: f32) -> bool {
         let dt = if dt.is_finite() { dt.clamp(0.0, 0.25) } else { 0.0 };
         self.poll_hdri(gpu);
+        self.poll_dynamic_textures(gpu);
 
         if self.config.auto_day_night {
             self.day_night_timer -= dt;
@@ -812,7 +1195,8 @@ impl Scene3dRenderer {
         // Órbita por cursor com amortecimento exponencial (mesma fórmula do Estúdio).
         let cam = &self.config.camera;
         let use_cursor = cam.orbit_parallax_x.abs() > 1e-3 || cam.orbit_parallax_y.abs() > 1e-3;
-        let (cx, cy) = match (use_cursor, self.pointer) {
+        let look = self.look_pointer.or(self.pointer);
+        let (cx, cy) = match (use_cursor, look) {
             (true, Some(p)) => ((p[0] - 0.5) * 2.0, (p[1] - 0.5) * 2.0),
             _ => (0.0, 0.0),
         };
@@ -846,7 +1230,7 @@ impl Scene3dRenderer {
                 slots: &mut self.slots,
                 objects: &self.objects,
             };
-            if self.solver.solve(&mut access, &self.signals, self.pointer, dt) {
+            if self.solver.solve(&mut access, &self.signals, look, dt) {
                 self.dirty = true;
             }
             animating |= self.solver.is_animating();
@@ -866,9 +1250,14 @@ impl Scene3dRenderer {
         self.signals = *snap;
     }
 
-    /// Sinais que os bindings desta cena consomem (para `SignalBus::set_demand`).
+    /// Sinais que os bindings e texturas dinâmicas desta cena consomem (para `SignalBus::set_demand`).
     pub fn signal_demand(&self) -> SignalKind {
-        self.solver.demand()
+        let media = if self.config.uses_media_cover() {
+            SignalKind::MEDIA
+        } else {
+            SignalKind::NONE
+        };
+        self.solver.demand() | media
     }
 
     /// Clique normalizado (0..1 sobre a camada) para bindings `CLICK_MESH`. `true` se disparou.
@@ -1183,7 +1572,14 @@ impl Scene3dRenderer {
         self.opaque.clear();
         self.blended.clear();
         let mut culled = 0u32;
-        let mut vram = 0u64;
+        let mut vram: u64 = self
+            .dynamic_textures
+            .values()
+            .map(|entry| match entry {
+                DynamicTexSlot::Ready { vram_bytes, .. } => *vram_bytes,
+                DynamicTexSlot::Loading | DynamicTexSlot::Failed => 0,
+            })
+            .sum();
         let mut instances = 0u32;
         let capacity = self.draw_staging.capacity().min(self.draw_capacity);
         for (oi, slot) in self.slots.iter().enumerate() {
@@ -1215,7 +1611,7 @@ impl Scene3dRenderer {
                 if self.draw_staging.len() >= capacity {
                     break;
                 }
-                let Some(material) = instance.model.materials.get(prim.material as usize) else {
+                let Some(material) = slot.material(instance, prim.material) else {
                     continue;
                 };
                 let m3 = Mat3::from_mat4(model);
@@ -1304,7 +1700,10 @@ impl Scene3dRenderer {
             pass.set_bind_group(1, &self.draw_bind, &[]);
             let mut current_variant = u8::MAX;
             for cmd in self.opaque.iter().chain(self.blended.iter()) {
-                let Some(instance) = self.slots.get(cmd.object as usize).and_then(|s| s.instance.as_ref()) else {
+                let Some(slot) = self.slots.get(cmd.object as usize) else {
+                    continue;
+                };
+                let Some(instance) = slot.instance.as_ref() else {
                     continue;
                 };
                 let Some(draw) = instance.draws.get(cmd.draw as usize) else {
@@ -1313,7 +1712,7 @@ impl Scene3dRenderer {
                 let Some(prim) = instance.primitive(draw) else {
                     continue;
                 };
-                let Some(material) = instance.model.materials.get(prim.material as usize) else {
+                let Some(material) = slot.material(instance, prim.material) else {
                     continue;
                 };
                 if cmd.variant != current_variant {
@@ -1513,4 +1912,37 @@ fn local_hour() -> f32 {
     use chrono::Timelike;
     let now = chrono::Local::now();
     now.hour() as f32 + now.minute() as f32 / 60.0 + now.second() as f32 / 3600.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_and_caps_dynamic_image_and_tracks_file_changes() {
+        let dir = std::env::temp_dir().join(format!("prismview_dyntex_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cover.png");
+
+        let img = image::RgbaImage::from_pixel(16, 8, image::Rgba([220, 40, 90, 255]));
+        img.save(&path).expect("salva png de teste");
+
+        let key1 = DynamicImageKey::from_path(path.clone()).expect("key inicial");
+        let decoded = decode_dynamic_image(&path, 8).expect("decodifica e reduz");
+        assert_eq!(decoded.width, 8);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(decoded.rgba.len(), 8 * 4 * 4);
+
+        let img2 = image::RgbaImage::from_pixel(24, 24, image::Rgba([10, 200, 120, 255]));
+        img2.save(&path).expect("sobrescreve png");
+        let key2 = DynamicImageKey::from_path(path.clone()).expect("key atualizada");
+        assert_ne!(key1, key2);
+
+        let empty_path = dir.join("empty.png");
+        std::fs::write(&empty_path, b"").expect("arquivo vazio");
+        assert!(DynamicImageKey::from_path(empty_path.clone()).is_none());
+        assert!(decode_dynamic_image(&empty_path, 64).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

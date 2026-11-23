@@ -60,6 +60,7 @@ import {
 } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
 import { Scene3DOutliner } from "./Scene3DOutliner";
+import { Scene3DQuickActions } from "./Scene3DQuickActions";
 import type { Scene3DEditorApi } from "./Scene3DLayer";
 import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
@@ -210,6 +211,25 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   const [selectedDynTexId, setSelectedDynTexId] = useState<string | null>(null);
   const bindingsSectionRef = useRef<HTMLDivElement | null>(null);
   const dynTexSectionRef = useRef<HTMLDivElement | null>(null);
+  // Modo Pro do inspetor 3D: preferência em localStorage; abre sozinho ao focar binding/textura ou na Sala 3D
+  const [show3dPro, setShow3dProState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("prismview.inspector3dPro.v1") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setShow3dPro = (v: boolean) => {
+    setShow3dProState(v);
+    try {
+      localStorage.setItem("prismview.inspector3dPro.v1", v ? "1" : "0");
+    } catch {
+      /* storage indisponível */
+    }
+  };
+  useEffect(() => {
+    if (selectedBindingId || selectedDynTexId || room3dMode) setShow3dProState(true);
+  }, [selectedBindingId, selectedDynTexId, room3dMode]);
 
   useEffect(() => {
     if (!selectedBindingId) return;
@@ -1362,6 +1382,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 const activeDynTex = activeObj.dynamicTextures ?? [];
                 const activeSuggestions: Scene3DAutoSuggestion[] =
                   scene3dInfo?.byObject?.[activeObj.id]?.suggestions ?? [];
+                const quickNodeNames = Array.from(
+                  new Set([...(activeObjInfo?.boneNames ?? []), ...(activeObjInfo?.meshNames ?? [])])
+                );
 
                 return (
                   <div className="space-y-3">
@@ -1487,6 +1510,56 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       </div>
                     </div>
 
+                    {/* Modo Fácil: Ações Rápidas (mesmo estado que o Modo Pro abaixo) */}
+                    <Scene3DQuickActions
+                      objectId={activeObj.id}
+                      primaryObjectId={objs[0]?.id ?? activeObj.id}
+                      isGlb={activeObj.kind === "GLB" && Boolean(activeObj.modelSrc)}
+                      suggestions={activeSuggestions}
+                      materialNames={activeObjInfo?.materialNames ?? []}
+                      nodeNames={quickNodeNames}
+                      bindings={s3d.bindings ?? []}
+                      dynamicTextures={activeDynTex}
+                      pickedPart={pickedPart3d}
+                      onPatchBindings={(fn, commit) =>
+                        fn(s3d.bindings) !== s3d.bindings &&
+                        patch3d((c) => {
+                          const next = fn(c.bindings);
+                          return next === c.bindings ? c : { ...c, bindings: next };
+                        }, commit)
+                      }
+                      onPatchDynTex={(fn, commit) =>
+                        fn(activeObj.dynamicTextures) !== activeObj.dynamicTextures &&
+                        patchActiveObj((o) => {
+                          const next = fn(o.dynamicTextures);
+                          return next === o.dynamicTextures ? o : { ...o, dynamicTextures: next };
+                        }, commit)
+                      }
+                      onPickCustomImage={
+                        onPickDynamicTexImage
+                          ? (texId) => onPickDynamicTexImage(activeObj.id, texId)
+                          : undefined
+                      }
+                      onPickModel={() => onPickFile("model3d")}
+                      onBeginTx={onBeginTx}
+                      onCommitTx={onCommitTx}
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => setShow3dPro(!show3dPro)}
+                      className="w-full flex items-center gap-2 pt-2 border-t border-white/10 text-[11px] font-medium text-[#A1A1AA] hover:text-white transition"
+                      aria-expanded={show3dPro}
+                    >
+                      <span className="flex-1 text-left">
+                        Modo Pro{" "}
+                        <span className="text-[10px] font-normal text-[#71717A]">
+                          · ossos, transform, clips, luz, câmera, bindings ({(s3d.bindings ?? []).length})
+                        </span>
+                      </span>
+                      <span className="text-[10px]">{show3dPro ? "▾" : "▸"}</span>
+                    </button>
+                    {show3dPro && (<>
                     {/* Selected Object File & Blender GLB Replace */}
                     <div className="space-y-2 pt-2 border-t border-white/10">
                       <button
@@ -2014,6 +2087,19 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                                 title={sug.detail}
                                 onClick={() => {
                                   if (sug.kind === "BINDING" && sug.binding) {
+                                    // Idempotente: se já existe binding equivalente (ex.: criado pelas Ações Rápidas), só seleciona
+                                    const sb = sug.binding;
+                                    const twin = (s3d.bindings ?? []).find(
+                                      (x) =>
+                                        (x.objectId || objs[0]?.id) === activeObj.id &&
+                                        x.source === sb.source &&
+                                        x.targetType === sb.targetType &&
+                                        x.targetName === sb.targetName
+                                    );
+                                    if (twin) {
+                                      onSelectBindingId?.(twin.id);
+                                      return;
+                                    }
                                     const b: ReactiveBinding3D = {
                                       ...sug.binding,
                                       id: `b3d-${Math.random().toString(36).slice(2, 9)}`,
@@ -2749,6 +2835,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         Econômico o teto vira 30 FPS e no Ultra, 15 FPS.
                       </p>
                     </div>
+                    </>)}
                   </div>
                 );
               })()}

@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use prism_core::fx::{EvalContext, SystemTelemetry};
 use prism_core::schema::{
-    DirtyFlags, EngineStatus, IpcRequest, IpcResponse, PrismScene, TouchActionType, MANIFEST_VERSION,
+    DirtyFlags, EngineStatus, IpcRequest, IpcResponse, PrismScene, MANIFEST_VERSION,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
@@ -58,13 +58,20 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    run as run_loop, shell_open, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
-    SensorsConfig, Win32DesktopHost, Win32SystemSensors,
+    acquire_single_instance, open_studio, parse_tray_enabled, resolve_font_files, run as run_loop,
+    trim_working_set, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
+    SensorsConfig, TrayAction, Win32DesktopHost, Win32SystemSensors,
 };
 use crate::platform::{
-    DesktopEvent, DesktopVisibility, HardwareVideoDecoder, NativeWindowId, SystemSensors,
+    DesktopEvent, DesktopHost, DesktopVisibility, HardwareVideoDecoder, NativeWindowId,
+    SystemSensors,
 };
 use crate::ipc_server::{self, IpcEnvelope};
+use crate::widgets::{
+    apply_touch_action, combined_demand, load_active_widgets, local_point, monitor_for, parse_formula_number,
+    save_active_widgets, widget_scene_path, Bounds, Scene3dDeps, WidgetRuntime, WIDGET_SCENES_DIR,
+};
+use prism_core::schema::NativeWidgetSpec;
 
 /// Cor padrão do `CLEAR_DESKTOP` sem argumento: preto opaco.
 const DEFAULT_CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -76,16 +83,25 @@ const MAX_RETRY_STREAK: u32 = 60;
 const REBUILD_DELAY: Duration = Duration::from_millis(250);
 /// Rebuilds automáticos seguidos sem sucesso; depois espera um evento do sistema.
 const MAX_REBUILD_ATTEMPTS: u32 = 20;
-/// Cadência enquanto molas de bindings ainda se movem.
-const BINDING_FRAME: Duration = Duration::from_millis(16);
+/// Fallback de cadência caso o driver não bloqueie em `PresentMode::Fifo` (evita spin 100% CPU).
+const FAST_PRESENT_FALLBACK: Duration = Duration::from_millis(4);
+/// Limiar mínimo de duração de um present para considerá-lo sincronizado por VSync.
+const VSYNC_PRESENT_MIN: Duration = Duration::from_millis(2);
+/// Quantos presents sub-2ms seguidos tolerar (ex.: 1º quadro após acordar do repouso) antes de
+/// aplicar `FAST_PRESENT_FALLBACK`.
+const MAX_FAST_PRESENT_STREAK: u8 = 2;
 /// Cena persistida pelo Studio (`LoadSceneFile`); relida ao iniciar sem o Studio.
 const ACTIVE_SCENE_FILE: &str = "active_scene.json";
 /// Preferência de energia persistida pelo motor (`SetPowerPreference`).
 const POWER_PREFERENCE_FILE: &str = "power_preference.txt";
+/// Preferência de exibição da engine na bandeja do sistema (`SetTrayVisible`).
+const TRAY_ENABLED_FILE: &str = "tray_enabled.txt";
 /// Limite defensivo do JSON da cena.
 const MAX_SCENE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// `output_generation` ainda não registrada no compositor.
 const SCENE3D_UNBOUND: u64 = u64::MAX;
+/// Intervalo mínimo entre quadros de widgets com molas em movimento (sem bloqueio de VSync).
+const WIDGET_MIN_FRAME: Duration = Duration::from_micros(8_333);
 
 /// Decoder de um arquivo de vídeo da cena.
 struct VideoSlot {
@@ -153,6 +169,23 @@ struct NativeApp {
     media_version_seen: u64,
     /// RAM total (GB) amostrada 1× no início (`rm(ram_total_gb)`, `rm(ram_gb)` = total × %).
     ram_total_gb: f32,
+    /// `true` após carga de cena: reduz working set uma vez depois de apresentar o 1º quadro.
+    needs_mem_trim: bool,
+    /// Presents seguidos abaixo de `VSYNC_PRESENT_MIN` (proteção anti-spin sem VSync).
+    fast_present_streak: u8,
+    /// Exibe o ícone da engine na bandeja do sistema enquanto executa (padrão: `true`).
+    tray_visible: bool,
+    /// Marca que a visibilidade ou o tooltip da bandeja precisa ser sincronizado no `host`.
+    tray_sync_needed: bool,
+    /// Entrega 3: widgets nativos (mesmo device/3D/sensores do wallpaper).
+    widgets: Vec<WidgetRuntime>,
+    /// O wallpaper (janelas WorkerW) deve existir: há cena aplicada ou `ClearDesktop` explícito.
+    /// Só widgets no ar ⇒ nenhuma janela de wallpaper (o fundo do Windows continua visível).
+    wallpaper_wanted: bool,
+    /// Segundo do relógio em que as fórmulas dos bindings 3D foram avaliadas pela última vez.
+    formulas_sec: i64,
+    /// Dependências FX das fórmulas dos bindings 3D (decidem a demanda de sensores e o tique de 1 s).
+    formula_deps: DirtyFlags,
 }
 
 /// Ponto de entrada do modo nativo. Retorna o código de saída do processo.
@@ -161,9 +194,24 @@ pub fn run() -> i32 {
     // em vez de cobrir o wallpaper do sistema com a cor de clear.
     let at_login = std::env::args().skip(1).any(|a| a == "--login");
     let has_scene = NativeApp::state_dir().is_some_and(|dir| dir.join(ACTIVE_SCENE_FILE).is_file());
-    if at_login && !has_scene {
+    let has_widgets = NativeApp::state_dir().is_some_and(|dir| !load_active_widgets(&dir).is_empty());
+    if at_login && !has_scene && !has_widgets {
         return 0;
     }
+
+    // Um motor por sessão: login + Studio subindo juntos, ou PING perdido, não podem gerar dois
+    // processos na GPU/WorkerW. Mantido vivo até `run` retornar.
+    let _single_instance = match acquire_single_instance() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            eprintln!("[prismview-engine] outro motor já está em execução; saindo");
+            return 0;
+        }
+        Err(err) => {
+            eprintln!("[prismview-engine] instância única: {err}");
+            return 1;
+        }
+    };
 
     // `host` declarado antes de `app`: `app` (superfícies wgpu) cai primeiro e só então
     // o host destrói as janelas.
@@ -176,13 +224,21 @@ pub fn run() -> i32 {
     };
 
     let proxy = host.proxy();
+    crate::engine_core::scene2d::set_image_waker(Arc::new(move || {
+        proxy.wake();
+    }));
     let (tx, rx) = mpsc::channel();
-    ipc_server::spawn_named_pipe_server(
+    if let Err(err) = ipc_server::spawn_named_pipe_server(
         move || {
-            let _ = proxy.wake();
+            proxy.wake();
         },
         tx,
-    );
+    ) {
+        // Pipe já criado por outro processo (squatting, ou motor antigo sem o mutex ainda no ar):
+        // sair em vez de rodar um segundo motor que o Studio não controla.
+        eprintln!("[prismview-engine] IPC: {err}");
+        return 1;
+    }
 
     let mut app = NativeApp::new(rx);
     app.proxy = Some(host.proxy());
@@ -192,7 +248,10 @@ pub fn run() -> i32 {
         Err(err) => eprintln!("[prismview-engine] sensores: {err}"),
     }
     app.restore_persisted_state();
+    host.set_tray_visible(app.tray_visible);
+    host.set_tray_paused(app.paused);
     app.rebuild_outputs(&mut host);
+    app.restore_widgets(&host);
     run_loop(&mut host, &mut app)
 }
 
@@ -246,6 +305,14 @@ impl NativeApp {
             media_text: MediaText::default(),
             media_version_seen: u64::MAX,
             ram_total_gb: SystemTelemetry::sample_live().ram_total_gb,
+            needs_mem_trim: false,
+            fast_present_streak: 0,
+            tray_visible: true,
+            tray_sync_needed: false,
+            widgets: Vec::new(),
+            wallpaper_wanted: false,
+            formulas_sec: i64::MIN,
+            formula_deps: DirtyFlags::NONE,
         }
     }
 
@@ -269,9 +336,37 @@ impl NativeApp {
             self.drop_scene3d();
             return;
         };
+        let Some(shared) = self.ensure_scene3d_infra() else {
+            return;
+        };
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
+        let proxy = self.proxy;
+        if self.scene3d.is_none() {
+            let mut scene3d = Scene3dRenderer::new(shared, gpu, Scene3dOptions::default());
+            scene3d.set_render_scale_cap(self.governor.caps().render_scale_cap);
+            if let Some(proxy) = proxy {
+                scene3d.set_waker(Some(Arc::new(move || {
+                    let _ = proxy.wake();
+                })));
+            }
+            self.scene3d = Some(scene3d);
+            self.scene3d_bound_gen = SCENE3D_UNBOUND;
+        }
+        if let (Some(scene3d), Some(loader)) = (self.scene3d.as_mut(), self.loader.as_mut()) {
+            scene3d.set_config(gpu, config, loader);
+            scene3d.set_media_cover(gpu, &self.ctx.media.cover_path);
+        }
+        self.scene3d_last_update = None;
+        self.scene3d_next_at = None;
+        self.dirty = true;
+    }
+
+    /// `Scene3dShared` (pipelines/PMREM por device) + `AssetLoader` únicos, criados sob demanda e
+    /// compartilhados por wallpaper e widgets.
+    fn ensure_scene3d_infra(&mut self) -> Option<Arc<Scene3dShared>> {
+        let gpu = self.gpu.as_ref()?;
         let shared = match self.scene3d_shared.as_ref() {
             Some(shared) => Arc::clone(shared),
             None => {
@@ -288,23 +383,34 @@ impl NativeApp {
                 }
             }));
         }
-        if self.scene3d.is_none() {
-            let mut scene3d = Scene3dRenderer::new(shared, gpu, Scene3dOptions::default());
-            scene3d.set_render_scale_cap(self.governor.caps().render_scale_cap);
-            if let Some(proxy) = proxy {
-                scene3d.set_waker(Some(Arc::new(move || {
-                    let _ = proxy.wake();
-                })));
+        Some(shared)
+    }
+
+    fn waker(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let proxy = self.proxy?;
+        Some(Arc::new(move || {
+            let _ = proxy.wake();
+        }))
+    }
+
+    /// Eventos do loader (1 por iteração) para o 3D do wallpaper e de todos os widgets.
+    fn poll_loader(&mut self) {
+        let (Some(gpu), Some(loader)) = (self.gpu.as_ref(), self.loader.as_mut()) else {
+            return;
+        };
+        loader.poll(&mut self.load_events);
+        for event in &self.load_events {
+            if let LoadEvent::Failed { path, error, .. } = event {
+                eprintln!("[prismview-engine] 3d {}: {error}", path.display());
             }
-            self.scene3d = Some(scene3d);
-            self.scene3d_bound_gen = SCENE3D_UNBOUND;
+            if let Some(scene3d) = self.scene3d.as_mut() {
+                scene3d.handle_load_event(gpu, event);
+            }
+            for w in &mut self.widgets {
+                w.handle_load_event(gpu, event);
+            }
         }
-        if let (Some(scene3d), Some(loader)) = (self.scene3d.as_mut(), self.loader.as_mut()) {
-            scene3d.set_config(gpu, config, loader);
-        }
-        self.scene3d_last_update = None;
-        self.scene3d_next_at = None;
-        self.dirty = true;
+        self.load_events.clear();
     }
 
     /// Descarta o renderer 3D (cena sem 3D) e o bind da saída no compositor.
@@ -341,14 +447,6 @@ impl NativeApp {
         let placement = self.scene3d_placement(host);
         let gpu = self.gpu.as_ref()?;
         let scene3d = self.scene3d.as_mut()?;
-
-        if let Some(loader) = self.loader.as_mut() {
-            loader.poll(&mut self.load_events);
-            for event in &self.load_events {
-                scene3d.handle_load_event(gpu, event);
-            }
-            self.load_events.clear();
-        }
 
         // Pausado/congelado: tempo da cena parado; nada é desenhado.
         if !self.governor.animations_allowed() {
@@ -416,6 +514,18 @@ impl NativeApp {
         std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("PrismView").join("native"))
     }
 
+    /// Arquivos de cena vindos do IPC: só dentro de `%APPDATA%\PrismView\native\` (o Studio grava
+    /// ali); qualquer outro caminho é recusado.
+    fn read_allowed_scene_file(raw: &str) -> Result<PrismScene, String> {
+        let dir = Self::state_dir().ok_or_else(|| "scene_path_denied: APPDATA ausente".to_string())?;
+        let dir = std::fs::canonicalize(&dir).map_err(|e| format!("scene_path_denied: {e}"))?;
+        let path = std::fs::canonicalize(raw).map_err(|e| format!("scene_file: {e}"))?;
+        if !path.starts_with(&dir) {
+            return Err(format!("scene_path_denied: {raw}"));
+        }
+        Self::read_scene_file(&path)
+    }
+
     /// Lê um `PrismScene` JSON do disco (tamanho limitado).
     fn read_scene_file(path: &std::path::Path) -> Result<PrismScene, String> {
         let meta = std::fs::metadata(path).map_err(|e| format!("scene_file: {e}"))?;
@@ -437,10 +547,16 @@ impl NativeApp {
                 self.preference = preference;
             }
         }
+        if let Ok(raw) = std::fs::read_to_string(dir.join(TRAY_ENABLED_FILE)) {
+            self.tray_visible = parse_tray_enabled(&raw);
+        }
         let scene_path = dir.join(ACTIVE_SCENE_FILE);
         if scene_path.is_file() {
             match Self::read_scene_file(&scene_path) {
-                Ok(scene) => self.scene = Some(scene),
+                Ok(scene) => {
+                    self.scene = Some(scene);
+                    self.wallpaper_wanted = true;
+                }
                 Err(err) => eprintln!("[prismview-engine] cena persistida: {err}"),
             }
         }
@@ -448,12 +564,14 @@ impl NativeApp {
 
     /// Troca a cena ativa (IPC `LoadScene`/`LoadSceneFile`). Recarga imediata: o `SceneRenderer`
     /// é reaproveitado (device, pipelines, fontes); só a cena e os recursos dela são trocados.
-    fn load_scene(&mut self, scene: PrismScene) -> IpcResponse {
-        if self.gpu.is_none() || self.outputs.is_empty() {
-            return IpcResponse::Error {
-                message: "gpu_unavailable".to_string(),
-            };
+    fn load_scene(&mut self, host: &mut Win32DesktopHost, scene: PrismScene) -> IpcResponse {
+        if !self.wallpaper_wanted || self.outputs.is_empty() {
+            // Motor estava só com widgets: cria as janelas de wallpaper agora.
+            self.wallpaper_wanted = true;
+            self.rebuild_outputs(host);
         }
+        // A cena é SEMPRE aceita: sem GPU/saídas agora (Explorer reiniciando, monitor religando,
+        // device perdido), `rebuild_outputs` → `ensure_renderer` aplica `self.scene` depois.
         self.ctx.now = Local::now();
         self.ctx.globals = scene.globals_map();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -463,6 +581,7 @@ impl NativeApp {
         self.refresh_scene3d();
         self.refresh_videos();
         self.dirty = true;
+        self.needs_mem_trim = true;
         self.retry_at = None;
         self.governor.invalidate_frozen();
         IpcResponse::Ok
@@ -482,6 +601,14 @@ impl NativeApp {
                 DesktopVisibility::Locked => {}
             }
         }
+        for w in &self.widgets {
+            if Self::widget_visible(host, w) {
+                any_visible = true;
+                all_locked = false;
+            } else if !self.session_locked(host) {
+                all_locked = false;
+            }
+        }
         let power = self
             .sensors
             .as_ref()
@@ -498,6 +625,253 @@ impl NativeApp {
         }
     }
 
+    /// Sessão bloqueada / usuário ausente (qualquer monitor reporta `Locked`).
+    fn session_locked(&self, host: &Win32DesktopHost) -> bool {
+        host.monitors()
+            .first()
+            .is_some_and(|m| host.monitor_visibility(&m.info.id) == DesktopVisibility::Locked)
+    }
+
+    /// Widget "sempre no topo" só pausa com a sessão bloqueada; widget no desktop pausa quando o
+    /// monitor dele está coberto (janela maximizada / tela cheia), como o wallpaper.
+    fn widget_visible(host: &Win32DesktopHost, w: &WidgetRuntime) -> bool {
+        let monitor = w.monitor.as_ref().map(|m| m.0.as_str());
+        let vis = match monitor {
+            Some(id) => host.monitor_visibility(id),
+            None => host
+                .monitors()
+                .first()
+                .map_or(DesktopVisibility::Visible, |m| host.monitor_visibility(&m.info.id)),
+        };
+        match vis {
+            DesktopVisibility::Visible => true,
+            DesktopVisibility::Covered => w.spec.always_on_top,
+            DesktopVisibility::Locked => false,
+        }
+    }
+
+    fn monitor_bounds(host: &Win32DesktopHost) -> Vec<(String, Bounds)> {
+        host.monitors()
+            .iter()
+            .map(|m| (m.info.id.clone(), (m.info.x, m.info.y, m.info.width, m.info.height)))
+            .collect()
+    }
+
+    fn refresh_widget_monitors(&mut self, host: &Win32DesktopHost) {
+        let monitors = Self::monitor_bounds(host);
+        for w in &mut self.widgets {
+            w.monitor = monitor_for(w.bounds(), monitors.iter().map(|(id, b)| (id.as_str(), *b)))
+                .map(|(id, b)| (id.to_string(), b));
+        }
+    }
+
+    // ── Widgets nativos ──
+
+    fn ensure_gpu(&mut self) -> bool {
+        if self.gpu.is_some() {
+            return true;
+        }
+        match GpuContext::new_headless() {
+            Ok(gpu) => {
+                self.gpu = Some(gpu);
+                true
+            }
+            Err(err) => {
+                eprintln!("[prismview-engine] gpu (widgets): {err}");
+                false
+            }
+        }
+    }
+
+    fn persist_widgets(&self) {
+        let Some(dir) = Self::state_dir() else {
+            return;
+        };
+        let specs: Vec<NativeWidgetSpec> = self.widgets.iter().map(|w| w.spec.clone()).collect();
+        if let Err(err) = save_active_widgets(&dir, &specs) {
+            eprintln!("[prismview-engine] active_widgets.json: {err}");
+        }
+    }
+
+    /// Recria os widgets de `active_widgets.json` (início, login, device perdido).
+    fn restore_widgets(&mut self, host: &Win32DesktopHost) {
+        let Some(dir) = Self::state_dir() else {
+            return;
+        };
+        for spec in load_active_widgets(&dir) {
+            if self.widgets.iter().any(|w| w.spec.id == spec.id) {
+                continue;
+            }
+            let path = if spec.scene_path.trim().is_empty() {
+                widget_scene_path(&dir, &spec.id)
+            } else {
+                PathBuf::from(&spec.scene_path)
+            };
+            match Self::read_scene_file(&path) {
+                Ok(scene) => {
+                    if let Err(err) = self.upsert_widget(host, spec, scene) {
+                        eprintln!("[prismview-engine] widget persistido: {err}");
+                    }
+                }
+                Err(err) => eprintln!("[prismview-engine] widget {}: {err}", spec.id),
+            }
+        }
+    }
+
+    /// Cria ou atualiza um widget (idempotente por `id`). Não persiste (o chamador decide).
+    fn upsert_widget(&mut self, host: &Win32DesktopHost, spec: NativeWidgetSpec, scene: PrismScene) -> Result<(), String> {
+        let spec = spec.sanitized().ok_or("invalid_widget_id")?;
+        if !self.ensure_gpu() {
+            return Err("gpu_unavailable".into());
+        }
+        let post = self.governor.caps().post_processing;
+        let font_dirs = Self::font_dirs();
+        self.ctx.now = Local::now();
+        let index = match self.widgets.iter().position(|w| w.spec.id == spec.id) {
+            Some(i) => {
+                let w = &mut self.widgets[i];
+                w.set_scene(scene, &mut self.ctx);
+                if w.bounds() != (spec.x, spec.y, spec.width, spec.height) {
+                    w.set_bounds(spec.x, spec.y, spec.width, spec.height);
+                }
+                if (w.spec.always_on_top, w.spec.locked, w.spec.click_through)
+                    != (spec.always_on_top, spec.locked, spec.click_through)
+                {
+                    w.set_flags(spec.always_on_top, spec.locked, spec.click_through);
+                }
+                w.spec.scene_path = spec.scene_path;
+                i
+            }
+            None => {
+                let Some(gpu) = self.gpu.as_ref() else {
+                    return Err("gpu_unavailable".into());
+                };
+                let runtime = WidgetRuntime::new(host, gpu, spec, scene, &font_dirs, post, &mut self.ctx)?;
+                self.widgets.push(runtime);
+                self.widgets.len() - 1
+            }
+        };
+        self.refresh_widget_scene3d(index);
+        self.refresh_widget_monitors(host);
+        self.formulas_sec = i64::MIN;
+        self.needs_mem_trim = true;
+        self.governor.invalidate_frozen();
+        Ok(())
+    }
+
+    fn refresh_widget_scene3d(&mut self, index: usize) {
+        let has3d = self
+            .widgets
+            .get(index)
+            .is_some_and(|w| w.scene().layers.iter().any(Self::layer_has_scene3d));
+        let shared = if has3d { self.ensure_scene3d_infra() } else { None };
+        let waker = self.waker();
+        let cap = self.governor.caps().render_scale_cap;
+        let (Some(gpu), Some(w)) = (self.gpu.as_ref(), self.widgets.get_mut(index)) else {
+            return;
+        };
+        let deps = match (shared.as_ref(), self.loader.as_mut()) {
+            (Some(shared), Some(loader)) => Some(Scene3dDeps {
+                shared,
+                loader,
+                waker,
+                render_scale_cap: cap,
+            }),
+            _ => None,
+        };
+        w.refresh_scene3d(gpu, deps, &self.ctx.media.cover_path);
+    }
+
+    fn layer_has_scene3d(layer: &prism_core::schema::LayerNode) -> bool {
+        (layer.kind == prism_core::schema::LayerKind::Scene3d && layer.scene3d.is_some())
+            || layer.children.iter().any(Self::layer_has_scene3d)
+    }
+
+    fn remove_widget(&mut self, id: &str) -> bool {
+        let Some(index) = self.widgets.iter().position(|w| w.spec.id == id) else {
+            return false;
+        };
+        let runtime = self.widgets.remove(index);
+        // Cena escrita pelo Studio em `native/widgets/`: apaga junto (fora dali não é nossa).
+        if let Some(dir) = Self::state_dir() {
+            let own = dir.join(WIDGET_SCENES_DIR);
+            let path = PathBuf::from(&runtime.spec.scene_path);
+            if path.starts_with(&own) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        drop(runtime); // superfície (espera a GPU) → janela
+        self.needs_mem_trim = true;
+        trim_working_set();
+        true
+    }
+
+    /// Nada para desenhar: sem wallpaper e sem widgets ⇒ o motor encerra (Windows volta ao normal).
+    fn exit_if_idle(&mut self) {
+        if !self.wallpaper_wanted && self.widgets.is_empty() {
+            self.exit = true;
+        }
+    }
+
+    /// Remove só o wallpaper (janelas + cena + `active_scene.json`); widgets seguem no ar.
+    fn clear_wallpaper(&mut self, host: &mut Win32DesktopHost) {
+        self.drop_scene3d();
+        self.close_videos();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_scene();
+        }
+        self.scene = None;
+        self.wallpaper_wanted = false;
+        self.outputs.clear();
+        host.detach_all_wallpapers();
+        if let Some(dir) = Self::state_dir() {
+            let _ = std::fs::remove_file(dir.join(ACTIVE_SCENE_FILE));
+        }
+        trim_working_set();
+        self.exit_if_idle();
+    }
+
+    /// Avalia as fórmulas FX dos bindings 3D (wallpaper + widgets). Barato e raro: ≤ 1×/s ou
+    /// quando mídia/telemetria/globais mudam (nunca por quadro).
+    fn update_formulas(&mut self) {
+        let mut deps = DirtyFlags::NONE;
+        if let Some(scene3d) = self.scene3d.as_mut() {
+            if scene3d.has_formulas() {
+                let ctx = &self.ctx;
+                let changed = scene3d.update_formulas(|expr| {
+                    let out = prism_core::fx::FxEngine::eval_expr(expr, ctx);
+                    deps.insert(out.deps);
+                    parse_formula_number(&out.value)
+                });
+                if changed {
+                    self.scene3d_next_at = None;
+                }
+            }
+        }
+        for w in &mut self.widgets {
+            if w.has_formulas() {
+                deps.insert(w.update_formulas(&mut self.ctx));
+            }
+        }
+        self.formula_deps = deps;
+    }
+
+    /// Sensores que as fórmulas dos bindings 3D leem (mídia/telemetria).
+    fn formula_demand(&self) -> SignalKind {
+        let mut d = SignalKind::NONE;
+        if self.formula_deps.intersects(DirtyFlags::MEDIA) {
+            d |= SignalKind::MEDIA;
+        }
+        if self.formula_deps.intersects(DirtyFlags::SYSTEM_METRICS) {
+            d |= SignalKind::TELEMETRY | SignalKind::POWER;
+        }
+        d
+    }
+
+    fn has_formulas(&self) -> bool {
+        self.scene3d.as_ref().is_some_and(Scene3dRenderer::has_formulas) || self.widgets.iter().any(WidgetRuntime::has_formulas)
+    }
+
     /// Aplica a decisão do governador: pós-processamento, hibernação de VRAM, redesenho.
     fn apply_power(&mut self, update: GovernorUpdate) {
         if update.caps_changed {
@@ -507,6 +881,10 @@ impl NativeApp {
             }
             if let Some(scene3d) = self.scene3d.as_mut() {
                 scene3d.set_render_scale_cap(caps.render_scale_cap);
+            }
+            for w in &mut self.widgets {
+                w.set_post_processing(caps.post_processing);
+                w.set_render_scale_cap(caps.render_scale_cap);
             }
             self.scene3d_next_at = None;
         }
@@ -520,16 +898,23 @@ impl NativeApp {
             if let Some(scene3d) = self.scene3d.as_mut() {
                 scene3d.release_targets();
             }
+            for w in &mut self.widgets {
+                w.hibernate();
+            }
             self.scene3d_bound_gen = SCENE3D_UNBOUND;
+            trim_working_set();
         }
         if update.needs_redraw() {
             self.dirty = true;
+            for w in &mut self.widgets {
+                w.dirty = true;
+            }
         }
     }
 
     /// Declara ao bus o que a cena consome (produtores fora da demanda dormem) e o que acorda o
     /// loop. `set_demand` só notifica os sensores quando muda: barato a cada iteração.
-    fn sync_signal_demand(&mut self) {
+    fn sync_signal_demand(&mut self, host: &Win32DesktopHost) {
         let Some(bus) = self.sensors.as_ref().map(|s| Arc::clone(s.bus())) else {
             return;
         };
@@ -545,7 +930,19 @@ impl NativeApp {
                 let cursor = if s.wants_cursor() { SignalKind::MOUSE } else { SignalKind::NONE };
                 s.signal_demand() | cursor
             });
-            demand_2d | demand_3d
+            // Wallpaper OR widgets visíveis: um único bus/sensores para todos.
+            let all = combined_demand(
+                demand_2d | demand_3d | self.formula_demand(),
+                self.widgets.iter().map(|w| (Self::widget_visible(host, w), w.signal_demand())),
+            );
+            // `POWER` entra abaixo de qualquer jeito; fora daqui só conta se a cena o lê.
+            let scene_power = (demand_2d | demand_3d).contains(SignalKind::POWER)
+                || self.widgets.iter().any(|w| w.signal_demand().contains(SignalKind::POWER));
+            if scene_power {
+                all
+            } else {
+                SignalKind(all.0 & !SignalKind::POWER.0)
+            }
         } else {
             SignalKind::NONE
         };
@@ -556,7 +953,7 @@ impl NativeApp {
     }
 
     /// Lê o bus, avança os bindings 2D/vidro e trata toques no desktop. Sem alocação.
-    fn process_signals(&mut self, now: Instant) {
+    fn process_signals(&mut self, host: &Win32DesktopHost, now: Instant) {
         let Some(bus) = self.sensors.as_ref().map(|s| Arc::clone(s.bus())) else {
             return;
         };
@@ -564,11 +961,25 @@ impl NativeApp {
             self.last_signals_at = None;
             return;
         }
-        let dt = self
-            .last_signals_at
-            .map_or(1.0 / 60.0, |at| now.saturating_duration_since(at).as_secs_f32());
+        // Limita `dt` após acordar do repouso (`> 100ms` vira passo limpo de 1/60s) para que o
+        // primeiro movimento do mouse saia suavemente sem teleporte das molas.
+        let dt = self.last_signals_at.map_or(1.0 / 60.0, |at| {
+            let secs = now.saturating_duration_since(at).as_secs_f32();
+            if secs > 0.1 {
+                1.0 / 60.0
+            } else {
+                secs.clamp(0.0005, 0.05)
+            }
+        });
         self.last_signals_at = Some(now);
         self.signal_reader.update(&bus, now, &mut self.snapshot);
+        if self.scene_demand.contains(SignalKind::MOUSE) {
+            // Amostra a posição exata do cursor no instante do quadro (1×/frame apenas acordado),
+            // eliminando atraso de polling e perda do ponto final de movimentos rápidos.
+            if let Ok(pos) = host.cursor_position() {
+                self.snapshot.cursor = pos;
+            }
+        }
         self.snapshot.cursor_norm = Self::cursor_norm(&self.outputs, self.snapshot.cursor);
         self.sync_fx_context(&bus);
 
@@ -587,6 +998,27 @@ impl NativeApp {
         if let Some(scene3d) = self.scene3d.as_mut() {
             scene3d.set_signals(&self.snapshot);
             scene3d.set_pointer(pointer);
+        }
+
+        // Widgets: mesmos sinais do quadro; cursor global (olhar em qualquer lugar da tela).
+        let cursor = self.scene_demand.contains(SignalKind::MOUSE).then_some(self.snapshot.cursor);
+        for w in &mut self.widgets {
+            if Self::widget_visible(host, w) {
+                w.apply_signals(&self.snapshot, dt, cursor);
+            }
+        }
+
+        // Toque observado no desktop: widget click-through sob o ponto vence o wallpaper.
+        if let Some(tap) = self.snapshot.desktop_tap {
+            if let Some(index) = self
+                .widgets
+                .iter()
+                .rposition(|w| w.spec.click_through && local_point(tap, w.bounds()).is_some())
+            {
+                let local = local_point(tap, self.widgets[index].bounds()).unwrap_or([0.0, 0.0]);
+                self.widget_tap(index, local);
+                return;
+            }
         }
 
         // Toque no fundo do desktop → região tocável da saída daquele monitor → SMTC; sem
@@ -629,6 +1061,27 @@ impl NativeApp {
         }
     }
 
+    /// Toque num widget (px locais): mídia → SMTC; ação custom → globais/URL/app do widget.
+    fn widget_tap(&mut self, index: usize, local: [f32; 2]) {
+        let Some(w) = self.widgets.get_mut(index) else {
+            return;
+        };
+        let Some(action) = w.tap(local) else {
+            return;
+        };
+        match (action, action.media_command()) {
+            (_, Some(command)) => {
+                if let Some(sensors) = self.sensors.as_mut() {
+                    if let Err(err) = sensors.media_control(command) {
+                        eprintln!("[prismview-engine] mídia (widget): {err}");
+                    }
+                }
+            }
+            (DesktopAction::Custom(i), None) => w.run_touch_action(i),
+            _ => {}
+        }
+    }
+
     // ── Vídeo ──
 
     /// (Re)abre um decoder por vídeo da cena atual. Raro (troca de cena / device novo): aloca.
@@ -658,8 +1111,15 @@ impl NativeApp {
                 continue;
             }
             decoder.set_looping(true);
-            match decoder.open(&path) {
-                Ok(_) => self.videos.push(VideoSlot {
+            if let Some(proxy) = self.proxy {
+                decoder.set_waker(Arc::new(move || {
+                    proxy.wake();
+                }));
+            }
+            // Não bloqueia o loop (vídeo 4K/HEVC pode levar segundos no MF): o anel é importado
+            // no `advance()` quando o worker responder.
+            match decoder.open_async(&path) {
+                Ok(()) => self.videos.push(VideoSlot {
                     path,
                     decoder,
                     paused: false,
@@ -792,6 +1252,11 @@ impl NativeApp {
                 changed.insert(DirtyFlags::MEDIA);
                 refresh_deps = true;
             }
+            if let (Some(gpu), Some(scene3d)) = (self.gpu.as_ref(), self.scene3d.as_mut()) {
+                if scene3d.set_media_cover(gpu, &self.ctx.media.cover_path) {
+                    self.dirty = true;
+                }
+            }
         }
 
         if changed.is_empty() {
@@ -806,6 +1271,13 @@ impl NativeApp {
                 self.dirty = true;
             }
         }
+        if let Some(gpu) = self.gpu.as_ref() {
+            for w in &mut self.widgets {
+                w.mark_fx_changed(gpu, changed, refresh_deps, &mut self.ctx);
+            }
+        }
+        // Fórmulas dos bindings 3D leem o mesmo contexto: reavaliar neste quadro.
+        self.formulas_sec = i64::MIN;
     }
 
     /// Executa uma ação de toque não-mídia da cena.
@@ -818,50 +1290,10 @@ impl NativeApp {
         else {
             return;
         };
-        let key = action.global_name.trim().to_lowercase();
-        let new_value = match action.action_type {
-            TouchActionType::OpenUrl => {
-                if let Err(err) = shell_open(&action.url, true) {
-                    eprintln!("[prismview-engine] abrir URL: {err}");
-                }
-                None
-            }
-            TouchActionType::OpenApp => {
-                if let Err(err) = shell_open(&action.target_exec, false) {
-                    eprintln!("[prismview-engine] abrir app: {err}");
-                }
-                None
-            }
-            TouchActionType::ToggleGlobal if !key.is_empty() => {
-                let cur = self.ctx.globals.get(&key).map(|v| v.trim().to_ascii_lowercase());
-                let on = matches!(cur.as_deref(), Some(v) if !v.is_empty() && v != "0" && v != "false");
-                Some(if on { "0" } else { "1" }.to_string())
-            }
-            TouchActionType::SetGlobal if !key.is_empty() => Some(action.global_value.clone()),
-            TouchActionType::NextGlobalList if !key.is_empty() => {
-                let options = self
-                    .scene
-                    .as_ref()
-                    .and_then(|s| s.globals.iter().find(|g| g.name.to_lowercase() == key))
-                    .map(|g| g.options.clone())
-                    .unwrap_or_default();
-                if options.is_empty() {
-                    None
-                } else {
-                    let cur = self.ctx.globals.get(&key).cloned().unwrap_or_default();
-                    let at = options.iter().position(|o| *o == cur).map_or(0, |i| (i + 1) % options.len());
-                    Some(options[at].clone())
-                }
-            }
-            _ => None,
-        };
-        let Some(value) = new_value else {
+        if !apply_touch_action(&action, &mut self.ctx.globals, self.scene.as_mut()) {
             return;
-        };
-        self.ctx.globals.insert(key.clone(), value.clone());
-        if let Some(scene) = self.scene.as_mut() {
-            scene.set_global(&key, value);
         }
+        self.formulas_sec = i64::MIN;
         if let Some(renderer) = self.renderer.as_mut() {
             if renderer.mark_dirty(DirtyFlags::GLOBALS) {
                 self.dirty = true;
@@ -874,6 +1306,9 @@ impl NativeApp {
         // Ordem: superfícies/canvases → renderer → device.
         self.outputs.clear();
         if with_gpu {
+            // Widgets (superfícies DComp + 3D próprio) caem antes do device; voltam de
+            // `active_widgets.json` no próximo `rebuild_outputs`.
+            self.widgets.clear();
             // Decoders importam texturas no device: caem antes dele.
             self.close_videos();
             // 3D antes do device: renderer → recursos compartilhados → loader (config do device).
@@ -888,11 +1323,21 @@ impl NativeApp {
         }
     }
 
-    /// Pastas de fontes do projeto (`%APPDATA%\PrismView\fonts`).
+    /// Pastas de fontes do projeto (`%APPDATA%\PrismView\fonts` + `fonts/` ao lado do executável).
     fn font_dirs() -> Vec<PathBuf> {
-        std::env::var_os("APPDATA")
-            .map(|appdata| vec![PathBuf::from(appdata).join("PrismView").join("fonts")])
-            .unwrap_or_default()
+        let mut dirs = Vec::with_capacity(2);
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("PrismView").join("fonts"));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let bundled = parent.join("fonts");
+                if !dirs.iter().any(|d| d == &bundled) {
+                    dirs.push(bundled);
+                }
+            }
+        }
+        dirs
     }
 
     /// Cria o `SceneRenderer` (se ainda não existe) com o formato da swapchain.
@@ -905,6 +1350,7 @@ impl NativeApp {
         };
         let mut renderer = SceneRenderer::new(gpu, format);
         renderer.set_post_processing(self.governor.caps().post_processing);
+        renderer.set_font_resolver(Box::new(resolve_font_files));
         for dir in Self::font_dirs() {
             if dir.is_dir() {
                 renderer.register_font_dir(&dir);
@@ -914,6 +1360,7 @@ impl NativeApp {
             self.ctx.now = Local::now();
             self.ctx.globals = scene.globals_map();
             renderer.set_scene(scene, &self.ctx);
+            self.needs_mem_trim = true;
         }
         self.renderer = Some(renderer);
         self.refresh_scene3d();
@@ -925,6 +1372,19 @@ impl NativeApp {
     fn rebuild_outputs(&mut self, host: &mut Win32DesktopHost) {
         self.release_gpu_resources(false);
         self.rebuild_at = None;
+
+        if !self.wallpaper_wanted {
+            // Só widgets: nenhuma janela no WorkerW (o fundo do Windows segue visível).
+            host.detach_all_wallpapers();
+            if self.widgets.is_empty() && self.ensure_gpu() {
+                self.restore_widgets(host);
+            }
+            self.refresh_widget_monitors(host);
+            self.rebuild_attempts = 0;
+            self.retry_at = None;
+            self.governor.invalidate_frozen();
+            return;
+        }
 
         let monitors: Vec<(String, u32, u32, f32, (i32, i32))> = host
             .monitors()
@@ -984,6 +1444,11 @@ impl NativeApp {
         } else {
             self.rebuild_attempts = 0;
         }
+        // Device recriado (perda de device): widgets voltam do estado persistido.
+        if self.widgets.is_empty() && self.gpu.is_some() {
+            self.restore_widgets(host);
+        }
+        self.refresh_widget_monitors(host);
         self.dirty = true;
         self.governor.invalidate_frozen();
         self.retry_at = None;
@@ -1067,7 +1532,48 @@ impl NativeApp {
         presented
     }
 
-    fn handle_ipc(&mut self, request: IpcRequest) -> IpcResponse {
+    /// Desenha os widgets visíveis com mudança. `true` se algum apresentou.
+    fn render_widgets(&mut self, host: &Win32DesktopHost, now: Instant) -> bool {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+        let mut presented = false;
+        let mut device_lost = false;
+        let mut broken: Option<usize> = None;
+        for (i, w) in self.widgets.iter_mut().enumerate() {
+            if !w.dirty || w.retry_at.is_some_and(|at| now < at) || !Self::widget_visible(host, w) {
+                continue;
+            }
+            w.dirty = false;
+            w.retry_at = None;
+            match w.render(gpu, &mut self.ctx) {
+                FrameStatus::Presented => {
+                    self.frames += 1;
+                    presented = true;
+                }
+                FrameStatus::Retry => {
+                    w.dirty = true;
+                    w.retry_at = Some(now + RETRY_INTERVAL);
+                }
+                FrameStatus::Unavailable => broken = Some(i),
+                FrameStatus::DeviceLost => device_lost = true,
+            }
+        }
+        if device_lost {
+            self.release_gpu_resources(true);
+            self.rebuild_attempts = 0;
+            self.schedule_rebuild();
+        } else if let Some(i) = broken {
+            // Janela/cadeia inutilizável: recria só este widget a partir do estado persistido.
+            let id = self.widgets[i].spec.id.clone();
+            self.widgets.remove(i);
+            eprintln!("[prismview-engine] widget {id}: superfície perdida, recriando");
+            self.restore_widgets(host);
+        }
+        presented
+    }
+
+    fn handle_ipc(&mut self, host: &mut Win32DesktopHost, request: IpcRequest) -> IpcResponse {
         match request {
             IpcRequest::Ping => IpcResponse::Pong {
                 protocol_version: MANIFEST_VERSION,
@@ -1081,7 +1587,7 @@ impl NativeApp {
                         .pause_reason()
                         .map(|reason| reason.as_str().to_string()),
                     active_wallpaper_id: self.scene.as_ref().map(|s| s.id.clone()),
-                    pinned_widget_ids: Vec::new(),
+                    pinned_widget_ids: self.widgets.iter().map(|w| w.spec.id.clone()).collect(),
                     active_monitor_count: u32::try_from(self.outputs.len()).unwrap_or(u32::MAX),
                     rendered_frames: self.frames,
                     gpu_adapter: self
@@ -1091,17 +1597,17 @@ impl NativeApp {
                     power_state: self.governor.state().as_str().to_string(),
                 },
             },
-            IpcRequest::LoadScene { scene, .. } => self.load_scene(*scene),
-            IpcRequest::LoadSceneFile { path } => match Self::read_scene_file(std::path::Path::new(&path)) {
-                Ok(scene) => self.load_scene(scene),
+            IpcRequest::LoadScene { scene, .. } => self.load_scene(host, *scene),
+            IpcRequest::LoadSceneFile { path } => match Self::read_allowed_scene_file(&path) {
+                Ok(scene) => self.load_scene(host, scene),
                 Err(message) => IpcResponse::Error { message },
             },
             IpcRequest::ClearDesktop { color } => {
-                if self.gpu.is_none() || self.outputs.is_empty() {
-                    return IpcResponse::Error {
-                        message: "gpu_unavailable".to_string(),
-                    };
+                if !self.wallpaper_wanted || self.outputs.is_empty() {
+                    self.wallpaper_wanted = true;
+                    self.rebuild_outputs(host);
                 }
+                // Estado limpo mesmo sem GPU: o próximo rebuild já nasce sem a cena antiga.
                 self.drop_scene3d();
                 self.close_videos();
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -1116,8 +1622,18 @@ impl NativeApp {
             }
             IpcRequest::SetPaused { paused } => {
                 self.paused = paused;
+                self.tray_sync_needed = true;
                 if !paused {
                     self.dirty = true;
+                }
+                IpcResponse::Ok
+            }
+            IpcRequest::SetTrayVisible { visible } => {
+                self.tray_visible = visible;
+                self.tray_sync_needed = true;
+                if let Some(dir) = Self::state_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(TRAY_ENABLED_FILE), if visible { "1" } else { "0" });
                 }
                 IpcResponse::Ok
             }
@@ -1134,6 +1650,82 @@ impl NativeApp {
                 None => IpcResponse::Error {
                     message: format!("invalid_power_preference: {preference}"),
                 },
+            },
+            IpcRequest::ClearWallpaper => {
+                self.clear_wallpaper(host);
+                IpcResponse::Ok
+            }
+            IpcRequest::UpsertWidget {
+                id,
+                scene_path,
+                scene,
+                x,
+                y,
+                width,
+                height,
+                always_on_top,
+                locked,
+                click_through,
+            } => {
+                let scene = match scene {
+                    Some(scene) => *scene,
+                    None => match Self::read_allowed_scene_file(&scene_path) {
+                        Ok(scene) => scene,
+                        Err(message) => return IpcResponse::Error { message },
+                    },
+                };
+                let spec = NativeWidgetSpec {
+                    id,
+                    scene_path,
+                    x,
+                    y,
+                    width,
+                    height,
+                    always_on_top,
+                    locked,
+                    click_through,
+                };
+                match self.upsert_widget(host, spec, scene) {
+                    Ok(()) => {
+                        self.persist_widgets();
+                        IpcResponse::Ok
+                    }
+                    Err(message) => IpcResponse::Error { message },
+                }
+            }
+            IpcRequest::RemoveWidget { id } => {
+                if self.remove_widget(&id) {
+                    self.persist_widgets();
+                }
+                self.exit_if_idle();
+                IpcResponse::Ok
+            }
+            IpcRequest::UpdateWidgetBounds { id, x, y, width, height } => {
+                let Some(w) = self.widgets.iter_mut().find(|w| w.spec.id == id) else {
+                    return IpcResponse::Error { message: "widget_not_found".into() };
+                };
+                let width = width.clamp(prism_core::schema::NATIVE_WIDGET_MIN_SIDE, prism_core::schema::NATIVE_WIDGET_MAX_SIDE);
+                let height = height.clamp(prism_core::schema::NATIVE_WIDGET_MIN_SIDE, prism_core::schema::NATIVE_WIDGET_MAX_SIDE);
+                w.set_bounds(x, y, width, height);
+                self.refresh_widget_monitors(host);
+                self.persist_widgets();
+                IpcResponse::Ok
+            }
+            IpcRequest::SetWidgetFlags { id, always_on_top, locked, click_through } => {
+                let Some(w) = self.widgets.iter_mut().find(|w| w.spec.id == id) else {
+                    return IpcResponse::Error { message: "widget_not_found".into() };
+                };
+                w.set_flags(
+                    always_on_top.unwrap_or(w.spec.always_on_top),
+                    locked.unwrap_or(w.spec.locked),
+                    click_through.unwrap_or(w.spec.click_through),
+                );
+                w.dirty = true;
+                self.persist_widgets();
+                IpcResponse::Ok
+            }
+            IpcRequest::ListWidgets => IpcResponse::Widgets {
+                widgets: self.widgets.iter().map(|w| w.spec.clone()).collect(),
             },
             IpcRequest::Shutdown => {
                 self.exit = true;
@@ -1155,24 +1747,105 @@ impl LoopHandler for NativeApp {
             }
             DesktopEvent::VisibilityChanged(_) => {
                 self.dirty = true;
+                for w in &mut self.widgets {
+                    w.dirty = true;
+                }
                 self.governor.invalidate_frozen();
             }
         }
     }
 
-    fn woken(&mut self, _host: &mut Win32DesktopHost) {
+    fn woken(&mut self, host: &mut Win32DesktopHost) {
         while let Ok(envelope) = self.ipc_rx.try_recv() {
-            let response = self.handle_ipc(envelope.req);
-            let _ = envelope.reply.send(response);
+            let IpcEnvelope { req, reply } = envelope;
+            match req {
+                // Responde logo após validar/parsear: vídeo, imagens e 3D carregam depois sem
+                // segurar o Studio (antes: `engine_timeout` com a cena aparecendo segundos depois).
+                IpcRequest::LoadSceneFile { path } => match Self::read_allowed_scene_file(&path) {
+                    Ok(scene) => {
+                        let _ = reply.send(IpcResponse::Ok);
+                        self.load_scene(host, scene);
+                    }
+                    Err(message) => {
+                        eprintln!("[prismview-engine] LOAD_SCENE_FILE: {message}");
+                        let _ = reply.send(IpcResponse::Error { message });
+                    }
+                },
+                req => {
+                    let response = self.handle_ipc(host, req);
+                    let _ = reply.send(response);
+                }
+            }
         }
     }
 
     fn repaint_requested(&mut self, _host: &mut Win32DesktopHost) {
         self.dirty = true;
+        for w in &mut self.widgets {
+            w.dirty = true;
+        }
         self.governor.invalidate_frozen();
     }
 
+    fn tray_open_requested(&mut self, _host: &mut Win32DesktopHost) {
+        if let Err(err) = open_studio() {
+            eprintln!("[prismview-engine] bandeja (abrir studio): {err}");
+        }
+    }
+
+    fn tray_menu_requested(&mut self, host: &mut Win32DesktopHost) {
+        let Some(action) = host.show_tray_menu(self.paused) else {
+            return;
+        };
+        match action {
+            TrayAction::OpenStudio => {
+                if let Err(err) = open_studio() {
+                    eprintln!("[prismview-engine] bandeja (abrir studio): {err}");
+                }
+            }
+            TrayAction::TogglePause => {
+                self.paused = !self.paused;
+                host.set_tray_paused(self.paused);
+                if !self.paused {
+                    self.dirty = true;
+                    self.governor.invalidate_frozen();
+                }
+            }
+            TrayAction::RemoveWallpaper => {
+                // Widgets nativos continuam; sem eles o motor encerra (`exit_if_idle`).
+                self.clear_wallpaper(host);
+            }
+            TrayAction::QuitEngine => {
+                self.exit = true;
+            }
+        }
+    }
+
+    fn widgets_moved(&mut self, host: &mut Win32DesktopHost) {
+        let mut changed = false;
+        for w in &mut self.widgets {
+            changed |= w.sync_bounds_from_window();
+        }
+        if changed {
+            self.refresh_widget_monitors(host);
+            self.persist_widgets();
+            self.governor.invalidate_frozen();
+        }
+    }
+
+    fn widget_clicked(&mut self, _host: &mut Win32DesktopHost, window: NativeWindowId, point: (i32, i32)) {
+        if let Some(index) = self.widgets.iter().position(|w| w.window_id() == window) {
+            self.widget_tap(index, [point.0 as f32, point.1 as f32]);
+            self.governor.invalidate_frozen();
+        }
+    }
+
     fn about_to_wait(&mut self, host: &mut Win32DesktopHost) -> ControlFlow {
+        if self.tray_sync_needed {
+            self.tray_sync_needed = false;
+            host.set_tray_visible(self.tray_visible);
+            host.set_tray_paused(self.paused);
+        }
         if self.exit {
             return ControlFlow::Exit;
         }
@@ -1188,8 +1861,8 @@ impl LoopHandler for NativeApp {
         self.apply_power(update);
 
         // Sinais (Fase 4): demanda da cena atual → bus; bindings + toques no desktop.
-        self.sync_signal_demand();
-        self.process_signals(now);
+        self.sync_signal_demand(host);
+        self.process_signals(host, now);
 
         // Relógio da cena: só invalida (e acorda) quando `$df(..)$` muda de fato.
         // Pausado/congelado: o relógio fica parado (retoma na volta, sem acumular trabalho).
@@ -1201,23 +1874,68 @@ impl LoopHandler for NativeApp {
                     self.dirty = true;
                 }
             }
+            for w in &mut self.widgets {
+                w.advance_clock(&self.ctx);
+            }
+            // Fórmulas dos bindings 3D (osso/clipe por hora, mídia, CPU...): ≤ 1×/s.
+            let sec = self.ctx.now.timestamp();
+            if sec != self.formulas_sec && self.has_formulas() {
+                self.formulas_sec = sec;
+                self.update_formulas();
+            }
+        }
+
+        // Modelos que terminaram de carregar → 3D do wallpaper e dos widgets.
+        self.poll_loader();
+        // Imagens decodificadas em segundo plano → rebuild 2D (upload) no próximo quadro.
+        if self.renderer.as_mut().is_some_and(SceneRenderer::poll_images) {
+            self.dirty = true;
+        }
+        for w in &mut self.widgets {
+            w.poll_images();
         }
 
         // 3D: carrega/anima/renderiza a textura antes do passe 2D que a compõe.
         let scene3d_at = self.step_scene3d(host, now);
         // Vídeo: troca o frame exibido (zero-copy) antes do passe 2D.
         let video_at = self.step_videos(now);
+        let widget_interval = self.governor.frame_interval();
+        let mut widget3d_at: Option<Instant> = None;
+        if let Some(gpu) = self.gpu.as_ref() {
+            for w in &mut self.widgets {
+                let visible = Self::widget_visible(host, w);
+                if let Some(at) = w.step_scene3d(gpu, now, animate && visible, widget_interval) {
+                    widget3d_at = Some(widget3d_at.map_or(at, |cur: Instant| cur.min(at)));
+                }
+            }
+        }
 
         // Teto de FPS / pausa / quadro congelado.
         let mut throttle_at = None;
+        let mut presented = false;
         let due = self.retry_at.map_or(true, |at| now >= at);
-        if self.dirty && due {
+        let widgets_dirty = self.widgets.iter().any(|w| w.dirty);
+        if (self.dirty && due) || widgets_dirty {
             match self.governor.frame_gate(now) {
                 FrameGate::Now => {
-                    self.dirty = false;
-                    self.retry_at = None;
-                    if self.render(host) {
-                        self.governor.frame_presented(Instant::now());
+                    let mut drew = false;
+                    if self.dirty && due {
+                        self.dirty = false;
+                        self.retry_at = None;
+                        drew |= self.render(host);
+                    }
+                    if widgets_dirty {
+                        drew |= self.render_widgets(host, now);
+                    }
+                    if drew {
+                        presented = true;
+                        // Ancora o FrameGate ao início do quadro (`now`), não após o bloqueio do
+                        // VSync, garantindo 30 FPS reais em Eco e 15 FPS reais em Ultra.
+                        self.governor.frame_presented(now);
+                        if self.needs_mem_trim {
+                            self.needs_mem_trim = false;
+                            trim_working_set();
+                        }
                     }
                 }
                 FrameGate::At(at) => throttle_at = Some(at),
@@ -1226,28 +1944,60 @@ impl LoopHandler for NativeApp {
             }
         }
 
+        let any_visible = self
+            .outputs
+            .iter()
+            .any(|o| host.monitor_visibility(&o.monitor_id) == DesktopVisibility::Visible);
+
         // Próximo tique do relógio, só com animação permitida e algum monitor visível.
-        let clock_at = if animate {
-            let any_visible = self
-                .outputs
-                .iter()
-                .any(|o| host.monitor_visibility(&o.monitor_id) == DesktopVisibility::Visible);
-            if any_visible {
-                self.renderer
-                    .as_ref()
-                    .and_then(|r| r.next_wake(&self.ctx.now))
-                    .map(|d| Instant::now() + d)
-            } else {
-                None
-            }
+        let clock_at = if animate && any_visible {
+            self.renderer
+                .as_ref()
+                .and_then(|r| r.next_wake(&self.ctx.now))
+                .map(|d| Instant::now() + d)
         } else {
             None
         };
-        // Molas dos bindings ainda se movendo: mais um quadro na cadência do governador
-        // (parado = dorme até o próximo sinal).
-        let binding_at = (animate
-            && self.renderer.as_ref().is_some_and(SceneRenderer::bindings_animating))
-        .then(|| Instant::now() + BINDING_FRAME.max(self.governor.frame_interval()));
+        // Molas dos bindings ainda se movendo: no modo Normal (sem cap), usa `ControlFlow::Poll`
+        // ritmado nativamente pelo VSync (`PresentMode::Fifo`) sem dormir +16ms extras após o
+        // present (60/120/144/240 Hz lisos); quando assenta, volta a `ControlFlow::Wait` (0% CPU).
+        let bindings_moving = animate
+            && any_visible
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(SceneRenderer::bindings_animating);
+        let frame_interval = self.governor.frame_interval();
+        let mut binding_poll = false;
+        let binding_at = if bindings_moving {
+            if frame_interval.is_zero() {
+                if presented {
+                    if Instant::now().saturating_duration_since(now) < VSYNC_PRESENT_MIN {
+                        self.fast_present_streak = self.fast_present_streak.saturating_add(1);
+                    } else {
+                        self.fast_present_streak = 0;
+                    }
+                    if self.fast_present_streak <= MAX_FAST_PRESENT_STREAK
+                        && self.retry_at.is_none()
+                        && self.rebuild_at.is_none()
+                        && throttle_at.is_none()
+                    {
+                        binding_poll = true;
+                        None
+                    } else {
+                        Some(now + FAST_PRESENT_FALLBACK)
+                    }
+                } else {
+                    Some(now + FAST_PRESENT_FALLBACK)
+                }
+            } else {
+                self.fast_present_streak = 0;
+                Some(now + frame_interval)
+            }
+        } else {
+            self.fast_present_streak = 0;
+            None
+        };
         let governor_at = self.governor.next_deadline(now);
         // Caixa 3D recém-construída por este render e 3D ainda sem quadro: volta já.
         let scene3d_at = scene3d_at.or_else(|| {
@@ -1256,6 +2006,38 @@ impl LoopHandler for NativeApp {
                 && self.scene3d_placement(host).is_some();
             pending.then(Instant::now)
         });
+        // Widgets: relógio, molas 2D, 3D pendente e retentativas (só os visíveis acordam o loop).
+        let mut widget_at: Option<Instant> = widget3d_at;
+        let mut push = |at: Instant| widget_at = Some(widget_at.map_or(at, |cur| cur.min(at)));
+        if animate {
+            let after_present = Instant::now();
+            for w in &self.widgets {
+                if !Self::widget_visible(host, w) {
+                    continue;
+                }
+                if let Some(d) = w.next_clock_wake(&self.ctx) {
+                    push(after_present + d);
+                }
+                if w.bindings_animating() {
+                    // Widgets não bloqueiam no VSync (cadeia DComp): ritmo próprio ≥ 1/120 s.
+                    push(now + frame_interval.max(WIDGET_MIN_FRAME));
+                }
+                if w.scene3d_pending() {
+                    push(after_present);
+                }
+                if let Some(at) = w.retry_at {
+                    push(at);
+                }
+            }
+            // Fórmulas que dependem do relógio: próximo segundo cheio.
+            if self.has_formulas() && self.formula_deps.intersects(DirtyFlags::TIME_SECOND.union(DirtyFlags::TIME_MINUTE)) {
+                let ms = 1000u64.saturating_sub(u64::from(self.ctx.now.timestamp_subsec_millis()));
+                push(after_present + Duration::from_millis(ms.max(1)));
+            }
+        }
+        if binding_poll {
+            return ControlFlow::Poll;
+        }
         let next = [
             self.retry_at,
             self.rebuild_at,
@@ -1265,6 +2047,7 @@ impl LoopHandler for NativeApp {
             governor_at,
             scene3d_at,
             video_at,
+            widget_at,
         ]
         .into_iter()
         .flatten()
@@ -1275,8 +2058,12 @@ impl LoopHandler for NativeApp {
         }
     }
 
-    fn exiting(&mut self, _host: &mut Win32DesktopHost) {
-        // Superfícies e device antes de o host destruir as janelas.
+    fn exiting(&mut self, host: &mut Win32DesktopHost) {
+        // Remove o ícone da bandeja (NIM_DELETE) antes de liberar superfícies/device.
+        host.set_tray_visible(false);
+        // Widgets (cadeias DComp esperam a GPU) → superfícies → device, antes de o host
+        // destruir as janelas: nenhuma janela órfã fica no desktop.
+        self.widgets.clear();
         self.release_gpu_resources(true);
     }
 }

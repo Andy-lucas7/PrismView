@@ -100,7 +100,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   }
 
   const lines = text.split("\n");
-  const lineH = Math.ceil(fontSize * 1.12);
+  const lineH = Math.ceil(fontSize * 1.06);
   const pad = Math.max(12, Math.ceil(fontSize * 0.14));
 
   const fontDecl = `${params.fontWeight} ${fontSize}px ${params.fontStack}`;

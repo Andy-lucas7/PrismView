@@ -1,3 +1,4 @@
+mod atomic_fs;
 mod desktop_host;
 mod native_engine;
 mod native_scene;
@@ -138,6 +139,9 @@ struct AppRuntimeState {
     manual_paused: bool,
     desktop_visible: bool,
     allow_exit: bool,
+    /// Logoff/desligamento ou saída do app em curso: janelas de widget destruídas agora NÃO
+    /// significam "desafixar" (senão a sessão seria salva sem widgets).
+    shutting_down: bool,
     legacy_migration_notice: Option<String>,
 }
 
@@ -185,6 +189,7 @@ const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
 const KEY_READ: u32 = 0x0002_0019;
 const KEY_SET_VALUE: u32 = 0x0000_0002;
 const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
 const ERROR_SUCCESS: i32 = 0;
 const ERROR_FILE_NOT_FOUND: i32 = 2;
 const ERROR_NO_MORE_ITEMS: i32 = 259;
@@ -288,7 +293,7 @@ fn collect_fonts_from_hive(hive: isize, out: &mut HashSet<String>) {
         if res == ERROR_NO_MORE_ITEMS {
             break;
         }
-        if res == ERROR_SUCCESS && val_type == REG_SZ {
+        if res == ERROR_SUCCESS && (val_type == REG_SZ || val_type == REG_EXPAND_SZ) {
             let raw = String::from_utf16_lossy(&name_buf[..name_len as usize]);
             if let Some(clean) = normalize_registry_font_family(&raw) {
                 out.insert(clean);
@@ -556,28 +561,131 @@ static ASSET_SCOPE: OnceLock<tauri::scope::fs::Scope> = OnceLock::new();
 fn allow_asset_file(path: &Path) {
     if let Some(scope) = ASSET_SCOPE.get() {
         let _ = scope.allow_file(path);
+        // .gltf text files reference sibling .bin buffers and textures in the same directory.
+        if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gltf"))
+        {
+            if let Some(dir) = path.parent() {
+                let _ = scope.allow_directory(dir, false);
+            }
+        }
     }
 }
 
-/// Libera no asset protocol os caminhos absolutos de arquivos existentes citados no projeto.
-fn allow_project_media(value: &Value) {
-    match value {
-        Value::String(s) if s.len() < 1024 => {
-            let p = Path::new(s);
-            if p.is_absolute() && p.is_file() {
-                allow_asset_file(p);
+/// Extensões de mídia/fonte/modelo que podem entrar no escopo do asset protocol.
+const ASSET_SCOPE_EXTENSIONS: &[&str] = &[
+    "mp4", "webm", "mkv", "mov", "png", "jpg", "jpeg", "webp", "gif", "svg", "ttf", "otf",
+    "woff", "woff2", "glb", "gltf", "hdr", "ktx2",
+];
+
+fn allow_media_path(raw: &str) {
+    if raw.len() >= 1024 {
+        return;
+    }
+    let p = Path::new(raw);
+    let ext_ok = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ASSET_SCOPE_EXTENSIONS.iter().any(|ok| e.eq_ignore_ascii_case(ok)));
+    if ext_ok && p.is_absolute() && p.is_file() {
+        allow_asset_file(p);
+    }
+}
+
+fn allow_dynamic_textures_media(list: Option<&Value>) {
+    for item in list.and_then(|v| v.as_array()).into_iter().flatten() {
+        if let Some(src) = item.get("customSrc").and_then(|v| v.as_str()) {
+            allow_media_path(src);
+        }
+    }
+}
+
+fn allow_layers_media(layers: &[Value]) {
+    for layer in layers {
+        for ptr in [
+            "/video/src",
+            "/image/src",
+            "/text/fontPath",
+            "/scene3d/modelSrc",
+            "/scene3d/envMapSrc",
+        ] {
+            if let Some(src) = layer.pointer(ptr).and_then(|v| v.as_str()) {
+                allow_media_path(src);
             }
         }
-        Value::Array(items) => items.iter().for_each(allow_project_media),
-        Value::Object(map) => map.values().for_each(allow_project_media),
-        _ => {}
+        if let Some(svg) = layer.get("svg").and_then(|v| v.as_object()) {
+            for (key, val) in svg {
+                if key.ends_with("Src") {
+                    if let Some(src) = val.as_str() {
+                        allow_media_path(src);
+                    }
+                }
+            }
+        }
+        allow_dynamic_textures_media(layer.pointer("/scene3d/dynamicTextures"));
+        for obj in layer
+            .pointer("/scene3d/objects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(src) = obj.get("modelSrc").and_then(|v| v.as_str()) {
+                allow_media_path(src);
+            }
+            allow_dynamic_textures_media(obj.get("dynamicTextures"));
+        }
+        if let Some(children) = layer.get("children").and_then(|v| v.as_array()) {
+            allow_layers_media(children);
+        }
+    }
+}
+
+/// Libera no asset protocol só os campos de mídia conhecidos do projeto (vídeo, imagem, fonte,
+/// modelos 3D, texturas, SVG) com extensões de mídia. Outras strings nunca entram no escopo.
+fn allow_project_media(project: &Value) {
+    if let Some(layers) = project.get("layers").and_then(|v| v.as_array()) {
+        allow_layers_media(layers);
+    }
+}
+
+fn projects_dir() -> PathBuf {
+    prismview_root_dir().join("projects")
+}
+
+/// Destino de quarentena de um projeto ilegível: `projects/_corrompidos/<nome>-<ts>.json`.
+fn project_quarantine_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("projeto");
+    projects_dir()
+        .join("_corrompidos")
+        .join(format!("{stem}-{}.json", atomic_fs::unix_secs()))
+}
+
+#[derive(Serialize)]
+struct BrokenProjectDto {
+    file: String,
+    error: String,
+    /// `true` quando o `.bak` foi restaurado no lugar (o projeto aparece na lista).
+    restored: bool,
+}
+
+/// Lê um projeto do disco com recuperação (quarentena + `.bak`). `Err` = não aproveitável.
+fn read_project_file(path: &Path) -> Result<(Value, Option<String>), String> {
+    match atomic_fs::load_json_recovering(path, &project_quarantine_path(path)) {
+        atomic_fs::JsonLoad::Ok(v) => Ok((v, None)),
+        atomic_fs::JsonLoad::Restored { value, error } => Ok((value, Some(error))),
+        atomic_fs::JsonLoad::Missing => Err("arquivo não encontrado".to_string()),
+        atomic_fs::JsonLoad::Broken { error } => Err(error),
+        atomic_fs::JsonLoad::Unreadable { error, .. } => Err(error),
     }
 }
 
 fn load_project_from_disk(project_id: &str) -> Option<Value> {
-    let p = project_path(project_id);
-    let raw = fs::read_to_string(p).ok()?;
-    let val = serde_json::from_str::<Value>(&raw).ok()?;
+    let (val, _) = read_project_file(&project_path(project_id)).ok()?;
     allow_project_media(&val);
     Some(val)
 }
@@ -627,17 +735,46 @@ fn save_session_from_state(st: &AppRuntimeState) {
         pinned_widget_ids,
         paused: st.manual_paused,
     };
-    if let Ok(json) = serde_json::to_string_pretty(&session) {
-        let _ = fs::write(session_path(), json);
+    match serde_json::to_string_pretty(&session) {
+        Ok(json) => {
+            if let Err(e) = atomic_fs::write_atomic(&session_path(), json.as_bytes(), true) {
+                eprintln!("[prismview-studio] salvar sessão: {e}");
+            }
+        }
+        Err(e) => eprintln!("[prismview-studio] serializar sessão: {e}"),
     }
     if is_autostart_enabled_inner() {
         sync_studio_login_entry(!st.pinned_widgets.is_empty());
     }
 }
 
+/// Lê `session.json`. Conteúdo inválido vira `session.corrupt-<ts>.json` e o `.bak` é usado.
 fn load_persisted_session() -> Option<PersistedSession> {
-    let raw = fs::read_to_string(session_path()).ok()?;
-    serde_json::from_str::<PersistedSession>(&raw).ok()
+    let path = session_path();
+    let quarantine = prismview_root_dir().join(format!("session.corrupt-{}.json", atomic_fs::unix_secs()));
+    let value = match atomic_fs::load_json_recovering(&path, &quarantine) {
+        atomic_fs::JsonLoad::Ok(v) => v,
+        atomic_fs::JsonLoad::Missing => return None,
+        atomic_fs::JsonLoad::Restored { value, error } => {
+            eprintln!("[prismview-studio] session.json inválido ({error}); restaurado do .bak");
+            value
+        }
+        atomic_fs::JsonLoad::Broken { error } => {
+            eprintln!("[prismview-studio] session.json inválido ({error}) e sem .bak");
+            return None;
+        }
+        atomic_fs::JsonLoad::Unreadable { error, backup } => {
+            eprintln!("[prismview-studio] ler session.json: {error}");
+            backup?
+        }
+    };
+    match serde_json::from_value::<PersistedSession>(value) {
+        Ok(session) => Some(session),
+        Err(e) => {
+            eprintln!("[prismview-studio] session.json fora do formato: {e}");
+            None
+        }
+    }
 }
 
 fn extract_import_uuid_from_path(raw: &str, imports_prefix_lower: &str) -> Option<String> {
@@ -830,7 +967,7 @@ fn build_runtime_state(st: &AppRuntimeState) -> RuntimeStateDto {
                 .and_then(|m| monitor_wallpapers.get(&m.id).cloned())
         });
     RuntimeStateDto {
-        paused: st.manual_paused || !st.desktop_visible,
+        paused: st.manual_paused,
         desktop_visible: st.desktop_visible,
         active_wallpaper_id,
         pinned_widget_ids: st.pinned_widgets.keys().cloned().collect(),
@@ -1101,24 +1238,39 @@ fn remap_imported_layers(layers: &mut [Value], extract_root: &Path) {
 }
 
 #[tauri::command]
-async fn list_projects() -> Result<Vec<Value>, String> {
+async fn list_projects() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let dir = prismview_root_dir().join("projects");
-        let mut out = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Ok(raw) = fs::read_to_string(&p) {
-                        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
-                            allow_project_media(&val);
-                            out.push(val);
-                        }
+        let dir = projects_dir();
+        let mut projects = Vec::new();
+        let mut broken = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(serde_json::json!({ "projects": projects, "broken": broken }))
+            }
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() || p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let file = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match read_project_file(&p) {
+                Ok((val, restored_from)) => {
+                    if let Some(error) = restored_from {
+                        broken.push(BrokenProjectDto { file, error, restored: true });
                     }
+                    allow_project_media(&val);
+                    projects.push(val);
                 }
+                Err(error) => broken.push(BrokenProjectDto { file, error, restored: false }),
             }
         }
-        Ok(out)
+        Ok(serde_json::json!({ "projects": projects, "broken": broken }))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1130,7 +1282,7 @@ fn save_project_inner(project: Value) -> Result<Value, String> {
         .and_then(|v| v.as_str())
         .ok_or("Projeto sem id")?;
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
-    fs::write(project_path(id), json).map_err(|e| e.to_string())?;
+    atomic_fs::write_atomic(&project_path(id), json.as_bytes(), true)?;
     Ok(project)
 }
 
@@ -1214,6 +1366,7 @@ async fn delete_project(
         if p.is_file() {
             fs::remove_file(&p).map_err(|e| e.to_string())?;
         }
+        atomic_fs::discard_temp(&atomic_fs::backup_path(&p));
 
         cleanup_unreferenced_import_uuids(&candidate_uuids);
         Ok(())
@@ -1898,13 +2051,19 @@ fn widget_window_ready(
 }
 
 #[tauri::command]
-fn set_engine_paused(
+async fn set_engine_paused(
     app: AppHandle,
     state: tauri::State<'_, SharedState>,
     paused: bool,
 ) -> Result<RuntimeStateDto, String> {
-    apply_manual_pause_inner(&app, state.inner(), paused)?;
-    get_runtime_state(state)
+    let state_arc = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_manual_pause_inner(&app, &state_arc, paused)?;
+        let st = state_arc.lock().map_err(|e| e.to_string())?;
+        Ok(build_runtime_state(&st))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Coordena o ícone de bandeja do Studio (`studio_tray`) com o ícone nativo do `prismview-engine`
@@ -2077,7 +2236,30 @@ pub(crate) fn export_prism_archive_sync(
         .map(str::to_string)
         .unwrap_or(default_file_name);
 
-    let file = File::create(&dest).map_err(|e| e.to_string())?;
+    // Grava num temporário ao lado e só troca no fim: o `.prism` anterior fica íntegro se o
+    // Studio fechar no meio do zip.
+    let tmp = atomic_fs::temp_path_for(&dest);
+    match write_prism_zip(&tmp, &mut project, is_widget, &title) {
+        Ok(()) => atomic_fs::commit_temp(&tmp, &dest)?,
+        Err(e) => {
+            atomic_fs::discard_temp(&tmp);
+            return Err(e);
+        }
+    }
+
+    Ok(ExportPackageResult {
+        archive_path: dest.to_string_lossy().to_string(),
+        file_name,
+    })
+}
+
+fn write_prism_zip(
+    path: &Path,
+    project: &mut Value,
+    is_widget: bool,
+    title: &str,
+) -> Result<(), String> {
+    let file = File::create(path).map_err(|e| e.to_string())?;
     let mut zip = ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -2102,7 +2284,7 @@ pub(crate) fn export_prism_archive_sync(
     )
     .map_err(|e| e.to_string())?;
 
-    let payload = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
+    let payload = serde_json::to_string_pretty(&*project).map_err(|e| e.to_string())?;
     zip.start_file("project.json", opts)
         .map_err(|e| e.to_string())?;
     zip.write_all(payload.as_bytes())
@@ -2113,12 +2295,8 @@ pub(crate) fn export_prism_archive_sync(
         zip.write_all(payload.as_bytes())
             .map_err(|e| e.to_string())?;
     }
-    zip.finish().map_err(|e| e.to_string())?;
-
-    Ok(ExportPackageResult {
-        archive_path: dest.to_string_lossy().to_string(),
-        file_name,
-    })
+    let file = zip.finish().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2135,8 +2313,37 @@ const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ZIP_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_PROJECT_JSON_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Desativa `clickAction == "OPEN_APP"` vindas de um pacote: o alvo vai para
+/// `clickTargetPending` e a camada fica marcada com `clickTargetNeedsReview` até o usuário
+/// permitir no diálogo pós-import. Devolve quantas camadas foram marcadas.
+fn quarantine_open_app_actions(layers: &mut [Value]) -> usize {
+    let mut flagged = 0;
+    for layer in layers.iter_mut() {
+        if let Some(obj) = layer.as_object_mut() {
+            if obj.get("clickAction").and_then(|v| v.as_str()) == Some("OPEN_APP") {
+                let target = obj
+                    .get("clickTarget")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                obj.insert("clickTarget".to_string(), Value::String(String::new()));
+                obj.insert("clickTargetPending".to_string(), Value::String(target));
+                obj.insert("clickTargetNeedsReview".to_string(), Value::Bool(true));
+                flagged += 1;
+            }
+            if let Some(children) = obj.get_mut("children").and_then(|v| v.as_array_mut()) {
+                flagged += quarantine_open_app_actions(children);
+            }
+        }
+    }
+    flagged
+}
+
 #[tauri::command]
-async fn import_prism_archive(archive_path: String) -> Result<Value, String> {
+async fn import_prism_archive(
+    archive_path: String,
+    replace: Option<bool>,
+) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = Path::new(&archive_path);
         let file = File::open(p).map_err(|e| e.to_string())?;
@@ -2173,6 +2380,47 @@ async fn import_prism_archive(archive_path: String) -> Result<Value, String> {
             .filter(|s| !s.trim().is_empty())
             .ok_or("Pacote .prism inválido: id do projeto ausente")?
             .to_string();
+
+        // Mesmo id já existe: nunca sobrescrever sem o usuário escolher. `replace` ausente →
+        // o front recebe o conflito e pergunta; `false` → importa como cópia com id novo.
+        let proj_id = if project_path(&proj_id).is_file() {
+            match replace {
+                None => {
+                    let existing_title = load_project_from_disk(&proj_id)
+                        .and_then(|v| v.get("title").and_then(|t| t.as_str()).map(str::to_string))
+                        .unwrap_or_default();
+                    return Ok(serde_json::json!({
+                        "conflict": true,
+                        "existingId": proj_id,
+                        "existingTitle": existing_title,
+                    }));
+                }
+                Some(true) => proj_id,
+                Some(false) => {
+                    let new_id = Uuid::new_v4().to_string();
+                    if let Some(obj) = val.as_object_mut() {
+                        let title = obj
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("Projeto")
+                            .to_string();
+                        obj.insert("id".to_string(), Value::String(new_id.clone()));
+                        obj.insert(
+                            "title".to_string(),
+                            Value::String(format!("{title} (importado)")),
+                        );
+                    }
+                    new_id
+                }
+            }
+        } else {
+            proj_id
+        };
+
+        // Ações "abrir programa" de pacotes de terceiros entram desativadas até o usuário revisar.
+        if let Some(layers) = val.get_mut("layers").and_then(|v| v.as_array_mut()) {
+            quarantine_open_app_actions(layers);
+        }
 
         let import_uuid = Uuid::new_v4().to_string();
         let extract_dir = prismview_root_dir().join("imports").join(&import_uuid);
@@ -2830,6 +3078,10 @@ pub fn run() {
     let stop_for_run = Arc::clone(&stop_flag);
 
     let app = tauri::Builder::default()
+        // Instância única: o 2º clique no atalho só foca o Studio existente (registrar primeiro).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            open_or_focus_studio(app);
+        }))
         .manage(shared_state)
         .manage(native_engine::new_state())
         .setup(move |app| {
@@ -2903,6 +3155,7 @@ pub fn run() {
                         flush_dirty_widget_saves(&st_menu, true);
                         if let Ok(mut st) = st_menu.lock() {
                             st.allow_exit = true;
+                            st.shutting_down = true;
                         }
                         app.exit(0);
                     }
@@ -3033,9 +3286,15 @@ pub fn run() {
             let state_for_recovery = Arc::clone(&state_for_setup);
             desktop_host::spawn_desktop_recovery_listener(
                 Arc::clone(&stop_for_setup),
-                move |_reason| {
+                move |reason| {
                     if let Ok(mut st) = state_for_recovery.lock() {
-                        st.pending_recovery_at = Some(Instant::now());
+                        if reason == "end_session" {
+                            st.shutting_down = true;
+                        } else if reason == "end_session_cancelled" {
+                            st.shutting_down = st.allow_exit;
+                        } else {
+                            st.pending_recovery_at = Some(Instant::now());
+                        }
                     }
                 },
             );
@@ -3048,7 +3307,10 @@ pub fn run() {
             if let WindowEvent::Destroyed = event {
                 if let Ok(mut st) = state_for_events.lock() {
                     st.ready_windows.remove(&label);
-                    if let Some(wid) = st.widget_labels.remove(&label) {
+                    if st.shutting_down {
+                        // Logoff/saída: a janela morre mas o widget continua fixado na sessão.
+                        st.widget_labels.remove(&label);
+                    } else if let Some(wid) = st.widget_labels.remove(&label) {
                         st.dirty_widget_saves.remove(&wid);
                         st.pinned_widgets.remove(&wid);
                         refresh_parallax_targets(&mut st);
@@ -3121,8 +3383,11 @@ pub fn run() {
             flush_dirty_widget_saves(&state_for_run, true);
             let (should_stay_resident, gsmtc_opt) = state_for_run
                 .lock()
-                .map(|st| {
+                .map(|mut st| {
                     let stay = !st.allow_exit && !st.pinned_widgets.is_empty();
+                    if !stay {
+                        st.shutting_down = true;
+                    }
                     (stay, st.gsmtc.clone())
                 })
                 .unwrap_or((false, None));
@@ -3141,6 +3406,21 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_open_app_actions_are_disabled_for_review() {
+        let mut layers = vec![serde_json::json!({
+            "id": "g",
+            "clickAction": "OPEN_URL",
+            "children": [{ "id": "a", "clickAction": "OPEN_APP", "clickTarget": "\\\\evil\\s\\a.exe" }]
+        })];
+        assert_eq!(quarantine_open_app_actions(&mut layers), 1);
+        let child = &layers[0]["children"][0];
+        assert_eq!(child["clickTarget"], "");
+        assert_eq!(child["clickTargetPending"], "\\\\evil\\s\\a.exe");
+        assert_eq!(child["clickTargetNeedsReview"], true);
+        assert!(layers[0].get("clickTargetNeedsReview").is_none());
+    }
 
     #[test]
     fn safe_relative_subpath_blocks_traversal_and_outside_roots() {

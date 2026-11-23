@@ -382,9 +382,13 @@ fn import_slot(bridge: &GpuBridge, handle: HANDLE, width: u32, height: u32) -> P
 
 // ───────────────────────── Worker (thread de decodificação) ─────────────────────────
 
+/// Acorda a thread de render (ex.: `LoopProxy::wake`) quando a abertura assíncrona termina.
+pub type VideoWaker = Arc<dyn Fn() + Send + Sync>;
+
 struct WorkerArgs {
     path: PathBuf,
     device: ID3D11Device,
+    wake: Option<VideoWaker>,
 }
 
 struct OpenedStream {
@@ -395,24 +399,32 @@ struct OpenedStream {
 type OpenReply = Result<OpenedStream, String>;
 
 fn worker_main(args: WorkerArgs, shared: Arc<Shared>, reply: mpsc::Sender<OpenReply>) {
+    // Resposta da abertura + acorda o render (que faz `try_recv` em `advance`).
+    let send = |msg: OpenReply| -> bool {
+        let delivered = reply.send(msg).is_ok();
+        if let Some(wake) = args.wake.as_ref() {
+            wake();
+        }
+        delivered
+    };
     // Ordem de drop (inversa): pipeline → MF → COM.
     let _com = ComScope::enter();
     let _mf = match MfScope::start() {
         Ok(mf) => mf,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            send(Err(e));
             return;
         }
     };
     let (mut pipeline, opened) = match Pipeline::open(&args) {
         Ok(ok) => ok,
         Err(e) => {
-            let _ = reply.send(Err(e));
+            send(Err(e));
             return;
         }
     };
-    if reply.send(Ok(opened)).is_err() {
-        return; // `open` desistiu (timeout): os handles foram fechados no drop da mensagem
+    if !send(Ok(opened)) {
+        return; // `open` desistiu (timeout/close): os handles foram fechados no drop da mensagem
     }
     drop(reply);
     pipeline.run(&shared);
@@ -882,6 +894,15 @@ impl Session {
     }
 }
 
+/// Abertura em curso: o worker abre o arquivo no MF (pode levar segundos com 4K/HEVC) enquanto
+/// o loop segue desenhando. Concluída em `advance()` por `try_recv`.
+struct PendingOpen {
+    shared: Arc<Shared>,
+    worker: Option<JoinHandle<()>>,
+    reply: mpsc::Receiver<OpenReply>,
+    started: Instant,
+}
+
 // ───────────────────────── MfVideoDecoder ─────────────────────────
 
 /// Decodificador Media Foundation com saída zero-copy em `wgpu::Texture` (backend DX12).
@@ -889,6 +910,10 @@ impl Session {
 pub struct MfVideoDecoder {
     bridge: Option<GpuBridge>,
     session: Option<Session>,
+    pending: Option<PendingOpen>,
+    /// Falha da abertura assíncrona (a sessão não existe para guardar o erro).
+    open_error: Option<String>,
+    waker: Option<VideoWaker>,
     looping: bool,
     paused: bool,
     generation: u64,
@@ -905,6 +930,9 @@ impl MfVideoDecoder {
         Self {
             bridge: None,
             session: None,
+            pending: None,
+            open_error: None,
+            waker: None,
             looping: true,
             paused: false,
             generation: 0,
@@ -920,7 +948,15 @@ impl MfVideoDecoder {
         self.session.as_ref().map(|s| s.media_ms(Instant::now()))
     }
 
-    fn open_session(&mut self, path: &Path) -> PlatformResult<VideoInfo> {
+    /// Acorda o loop quando uma abertura assíncrona termina (sucesso ou erro).
+    pub fn set_waker(&mut self, waker: VideoWaker) {
+        self.waker = Some(waker);
+    }
+
+    /// Abre sem bloquear: o worker abre o arquivo e o anel é importado no `advance()` seguinte à
+    /// resposta. Erros imediatos (arquivo ausente, sem GPU) voltam aqui; os demais em `last_error`.
+    pub fn open_async(&mut self, path: &Path) -> PlatformResult<()> {
+        self.close();
         let bridge = self.bridge.as_ref().ok_or_else(|| {
             PlatformError::Os("MfVideoDecoder: chame bind_gpu antes de open".into())
         })?;
@@ -933,24 +969,82 @@ impl MfVideoDecoder {
         let args = WorkerArgs {
             path: path.to_path_buf(),
             device: bridge.d3d11.clone(),
+            wake: self.waker.clone(),
         };
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("prismview-mf-video".into())
             .spawn(move || worker_main(args, worker_shared, reply_tx))
             .map_err(|e| PlatformError::Os(format!("thread de vídeo: {e}")))?;
+        self.pending = Some(PendingOpen {
+            shared,
+            worker: Some(worker),
+            reply: reply_rx,
+            started: Instant::now(),
+        });
+        Ok(())
+    }
 
-        let mut opened = match reply_rx.recv_timeout(OPEN_TIMEOUT) {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(message)) => {
-                stop_worker(&shared, Some(worker), true);
-                return Err(PlatformError::Os(message));
+    /// Conclui a abertura assíncrona se o worker já respondeu (ou estourou o tempo).
+    fn poll_pending(&mut self) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let reply = match pending.reply.try_recv() {
+            Ok(reply) => reply,
+            Err(mpsc::TryRecvError::Empty) if pending.started.elapsed() < OPEN_TIMEOUT => return,
+            Err(mpsc::TryRecvError::Empty) => Err("timeout abrindo o vídeo".to_string()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("worker de vídeo encerrou sem responder".to_string())
             }
-            Err(_) => {
-                // Worker travado no MF: sinaliza parada e não espera (thread se encerra sozinha).
-                stop_worker(&shared, Some(worker), false);
-                return Err(PlatformError::Os("timeout abrindo o vídeo".into()));
+        };
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        match reply {
+            Ok(opened) => {
+                if let Err(err) = self.finish_open(&mut pending, opened) {
+                    self.open_error = Some(err.to_string());
+                }
             }
+            Err(message) => {
+                // Worker travado no MF (timeout) ou já encerrado: não espera a thread.
+                stop_worker(&pending.shared, pending.worker.take(), false);
+                self.open_error = Some(message);
+            }
+        }
+    }
+
+    /// Bloqueia até a abertura terminar (contrato síncrono do trait `open`).
+    fn open_session(&mut self, path: &Path) -> PlatformResult<VideoInfo> {
+        self.open_async(path)?;
+        let Some(mut pending) = self.pending.take() else {
+            return Err(PlatformError::Os("abertura de vídeo perdida".into()));
+        };
+        let reply = pending
+            .reply
+            .recv_timeout(OPEN_TIMEOUT)
+            .unwrap_or_else(|_| Err("timeout abrindo o vídeo".to_string()));
+        match reply {
+            Ok(opened) => self.finish_open(&mut pending, opened),
+            Err(message) => {
+                stop_worker(&pending.shared, pending.worker.take(), false);
+                Err(PlatformError::Os(message))
+            }
+        }
+    }
+
+    /// Importa o anel de texturas compartilhadas no D3D12/wgpu e cria a sessão.
+    fn finish_open(
+        &mut self,
+        pending: &mut PendingOpen,
+        mut opened: OpenedStream,
+    ) -> PlatformResult<VideoInfo> {
+        let shared = Arc::clone(&pending.shared);
+        let worker = pending.worker.take();
+        let Some(bridge) = self.bridge.as_ref() else {
+            stop_worker(&shared, worker, true);
+            return Err(PlatformError::Os("MfVideoDecoder: GPU desvinculada".into()));
         };
 
         let (width, height) = (opened.info.width, opened.info.height);
@@ -963,7 +1057,7 @@ impl MfVideoDecoder {
             match imported {
                 Ok(slot) => ring.push(slot),
                 Err(err) => {
-                    stop_worker(&shared, Some(worker), true);
+                    stop_worker(&shared, worker, true);
                     return Err(err);
                 }
             }
@@ -978,7 +1072,7 @@ impl MfVideoDecoder {
         self.generation += 1;
         self.session = Some(Session {
             shared,
-            worker: Some(worker),
+            worker,
             ring,
             info: info.clone(),
             frame_interval: Duration::from_millis(frame_ms),
@@ -1085,6 +1179,7 @@ impl HardwareVideoDecoder for MfVideoDecoder {
     }
 
     fn advance(&mut self) -> bool {
+        self.poll_pending();
         let paused = self.paused;
         let Some(s) = self.session.as_mut() else {
             return false;
@@ -1182,6 +1277,10 @@ impl HardwareVideoDecoder for MfVideoDecoder {
     }
 
     fn time_until_next_frame(&self) -> Option<Duration> {
+        if let Some(pending) = self.pending.as_ref() {
+            // O worker acorda o loop ao responder; isto só garante o timeout.
+            return Some(OPEN_TIMEOUT.saturating_sub(pending.started.elapsed()));
+        }
         let s = self.session.as_ref()?;
         let sync = s.awaiting_sync || s.shown.is_none();
         if self.paused && !sync {
@@ -1213,10 +1312,18 @@ impl HardwareVideoDecoder for MfVideoDecoder {
     }
 
     fn last_error(&self) -> Option<String> {
+        if let Some(err) = self.open_error.as_ref() {
+            return Some(err.clone());
+        }
         self.session.as_ref().and_then(|s| s.shared.lock().error.clone())
     }
 
     fn close(&mut self) {
+        self.open_error = None;
+        if let Some(mut pending) = self.pending.take() {
+            // Sem join: o MF pode estar travado abrindo; o worker sai ao ver o canal fechado.
+            stop_worker(&pending.shared, pending.worker.take(), false);
+        }
         if let Some(mut session) = self.session.take() {
             stop_worker(&session.shared, session.worker.take(), true);
             // As wgpu::Texture caem aqui; o wgpu adia a destruição até a GPU terminar.
