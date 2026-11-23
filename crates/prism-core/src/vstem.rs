@@ -648,6 +648,7 @@ pub fn warp_glyph(contours: &[Contour], warp: &StemWarp, lines: &FontLines, para
 
             shift[i] = (share * (t_new - t) * params.compensation * thin).clamp(0.0, 0.9 * t);
         }
+        smooth_shifts(&wpts, &mut shift, &internal, stroke);
         let mut pts = Vec::with_capacity(n);
         for i in 0..n {
             let (e0, e1) = ((i + n - 1) % n, i);
@@ -685,6 +686,76 @@ pub fn warp_glyph(contours: &[Contour], warp: &StemWarp, lines: &FontLines, para
         out.push(Contour { pts });
     }
     out
+}
+
+/// Suaviza o recuo por aresta ao longo de trechos *curvos* (sem quinas): a espessura medida por
+/// raio oscila em junções (cintura do "8", bojo do "5") e isso viraria dentes no contorno. Quinas
+/// (> 35°) delimitam os trechos, então barras retas mantêm o recuo exato.
+fn smooth_shifts(wp: &[P], shift: &mut [f32], internal: &[bool], stroke: f32) {
+    let n = shift.len();
+    if n < 4 {
+        return;
+    }
+    let len: Vec<f32> = (0..n)
+        .map(|i| {
+            let (a, b) = (wp[i], wp[(i + 1) % n]);
+            ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt().max(1e-4)
+        })
+        .collect();
+    // corner[i] = vértice i (entre as arestas i-1 e i) é quina
+    let corner: Vec<bool> = (0..n)
+        .map(|i| {
+            let (p, q, r) = (wp[(i + n - 1) % n], wp[i], wp[(i + 1) % n]);
+            let (ax, ay, bx, by) = (q[0] - p[0], q[1] - p[1], r[0] - q[0], r[1] - q[1]);
+            let c = (ax * bx + ay * by) / ((ax * ax + ay * ay).sqrt() * (bx * bx + by * by).sqrt()).max(1e-6);
+            c < 0.82 // ≈ 35°
+        })
+        .collect();
+    let orig = shift.to_vec();
+    let radius = 0.45 * stroke;
+    for i in 0..n {
+        if internal[i] || orig[i] <= 0.0 && !has_neighbor_shift(&orig, i, n) {
+            continue;
+        }
+        let (mut acc, mut wsum) = (orig[i] * len[i], len[i]);
+        // para frente
+        let mut d = 0.5 * len[i];
+        let mut j = i;
+        loop {
+            if corner[(j + 1) % n] || d > radius {
+                break;
+            }
+            j = (j + 1) % n;
+            if j == i || internal[j] {
+                break;
+            }
+            let w = len[j] * (1.0 - d / radius).max(0.0);
+            acc += orig[j] * w;
+            wsum += w;
+            d += len[j];
+        }
+        // para trás
+        let mut d = 0.5 * len[i];
+        let mut j = i;
+        loop {
+            if corner[j] || d > radius {
+                break;
+            }
+            j = (j + n - 1) % n;
+            if j == i || internal[j] {
+                break;
+            }
+            let w = len[j] * (1.0 - d / radius).max(0.0);
+            acc += orig[j] * w;
+            wsum += w;
+            d += len[j];
+        }
+        shift[i] = acc / wsum.max(1e-6);
+    }
+}
+
+fn has_neighbor_shift(s: &[f32], i: usize, n: usize) -> bool {
+    s[(i + 1) % n] > 0.0 || s[(i + n - 1) % n] > 0.0
 }
 
 fn flat_edges(contours: &[Contour]) -> Vec<(P, P)> {

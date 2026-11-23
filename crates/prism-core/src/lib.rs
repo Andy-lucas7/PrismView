@@ -1,6 +1,7 @@
 pub mod fx;
 pub mod package;
 pub mod schema;
+pub use ttf_parser;
 pub mod vstem;
 
 pub mod stem_stretch {

@@ -31,6 +31,7 @@ use cosmic_text::{
     fontdb, Align, Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight,
     Wrap,
 };
+use super::stem_text::{self, GlyphSource, StemCache};
 use glyphon::{Cache, ColorMode, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 
 /// Callback de plataforma que resolve apenas os arquivos de fonte (`.ttf/.otf/.ttc/.otc`) de uma
@@ -70,6 +71,10 @@ pub struct TextSpec<'a> {
     pub align: TextAlignment,
     /// Largura máxima em px físicos (0 = largura automática sem quebra de linha).
     pub max_width_px: f32,
+    /// Alongamento por haste (1 = normal). >1 troca a rasterização por contornos vetoriais.
+    pub stretch: f32,
+    /// Compensação de espessura do alongamento (0..1).
+    pub stem_compensation: f32,
 }
 
 /// Resultado do layout de um slot.
@@ -87,6 +92,8 @@ pub struct TextLayout {
     pub tex_gen: u64,
     /// Sem nada a desenhar (texto vazio): não há textura.
     pub empty: bool,
+    /// A textura já vem alongada (altura × stretch): o compositor NÃO deve esticar de novo.
+    pub stretched: bool,
 }
 
 impl TextLayout {
@@ -98,6 +105,7 @@ impl TextLayout {
         uv_max: [0.0, 0.0],
         tex_gen: 0,
         empty: true,
+        stretched: false,
     };
 }
 
@@ -114,6 +122,8 @@ struct TextKey {
     letter_spacing_bits: u32,
     align: TextAlignment,
     max_width_bits: u32,
+    stretch_bits: u32,
+    comp_bits: u32,
 }
 
 impl TextKey {
@@ -124,6 +134,8 @@ impl TextKey {
             && self.letter_spacing_bits == spec.letter_spacing_em.to_bits()
             && self.align == spec.align
             && self.max_width_bits == spec.max_width_px.to_bits()
+            && self.stretch_bits == spec.stretch.to_bits()
+            && self.comp_bits == spec.stem_compensation.to_bits()
             && self.text == spec.text
             && self.font_id == spec.font_id
     }
@@ -139,6 +151,8 @@ impl TextKey {
         self.letter_spacing_bits = spec.letter_spacing_em.to_bits();
         self.align = spec.align;
         self.max_width_bits = spec.max_width_px.to_bits();
+        self.stretch_bits = spec.stretch.to_bits();
+        self.comp_bits = spec.stem_compensation.to_bits();
     }
 }
 
@@ -162,6 +176,10 @@ struct TextSlot {
     tex_gen: u64,
     needs_raster: bool,
     used_serial: u64,
+    /// Alongamento aplicado (>1 = textura vinda de `stem_text`).
+    stretch: f32,
+    stem_comp: f32,
+    weight: u16,
 }
 
 // ───────────────────────── TextSystem ─────────────────────────
@@ -188,6 +206,7 @@ pub struct TextSystem {
     /// Fallback sans-serif leve (`Segoe UI` / `Arial`) já inicializado.
     fallback_loaded: bool,
     slots: HashMap<String, TextSlot>,
+    stem_cache: StemCache,
     serial: u64,
     max_texture_dim: u32,
 }
@@ -216,6 +235,7 @@ impl TextSystem {
             loaded_files: HashSet::new(),
             fallback_loaded: false,
             slots: HashMap::new(),
+            stem_cache: StemCache::default(),
             serial: 0,
             max_texture_dim: device.limits().max_texture_dimension_2d,
         }
@@ -456,6 +476,9 @@ impl TextSystem {
                     tex_gen: 0,
                     needs_raster: false,
                     used_serial: serial,
+                    stretch: 1.0,
+                    stem_comp: 1.0,
+                    weight: 400,
                 },
             );
         }
@@ -700,6 +723,14 @@ impl TextSystem {
             return slot.layout;
         }
 
+        let stretch = if spec.stretch.is_finite() { spec.stretch.clamp(1.0, 2.8) } else { 1.0 };
+        let stretched = stretch > 1.004;
+        slot.stretch = if stretched { stretch } else { 1.0 };
+        slot.stem_comp = if spec.stem_compensation.is_finite() { spec.stem_compensation } else { 1.0 };
+        slot.weight = spec.weight;
+        // Altura da caixa já alongada: o bloco todo cresce `stretch`× a partir do topo.
+        let height = if stretched { height * stretch } else { height };
+
         let pad = ((size * 0.08).ceil() as u32).max(2);
         slot.pad = pad;
         let need_w = (width.ceil() as u32).saturating_add(pad * 2).clamp(1, max_dim);
@@ -728,7 +759,9 @@ impl TextSystem {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: TEXT_TEXTURE_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -749,6 +782,7 @@ impl TextSystem {
             uv_max: [need_w as f32 / cap.0 as f32, need_h as f32 / cap.1 as f32],
             tex_gen: slot.tex_gen,
             empty: false,
+            stretched,
         };
         slot.needs_raster = true;
         slot.layout
@@ -782,6 +816,64 @@ impl TextSystem {
                 continue;
             };
             any = true;
+
+            // Alongamento por haste: contornos vetoriais → textura (CPU), sem passar pelo glyphon.
+            if slot.stretch > 1.004 {
+                let (qw, qh) = (
+                    (slot.layout.quad_width as u32).min(tex.cap.0),
+                    (slot.layout.quad_height as u32).min(tex.cap.1),
+                );
+                let raster = if slot.spaced_glyphs.is_empty() {
+                    let srcs = [GlyphSource { buffer: &slot.buffer, ox: 0.0, oy: 0.0 }];
+                    stem_text::rasterize(
+                        &mut self.font_system,
+                        &mut self.stem_cache,
+                        &srcs,
+                        slot.stretch,
+                        slot.stem_comp,
+                        slot.weight,
+                        qw,
+                        qh,
+                        slot.pad as f32,
+                    )
+                } else {
+                    let srcs: Vec<GlyphSource<'_>> = slot
+                        .spaced_glyphs
+                        .iter()
+                        .map(|(b, gx, gy)| GlyphSource { buffer: b, ox: *gx, oy: *gy })
+                        .collect();
+                    stem_text::rasterize(
+                        &mut self.font_system,
+                        &mut self.stem_cache,
+                        &srcs,
+                        slot.stretch,
+                        slot.stem_comp,
+                        slot.weight,
+                        qw,
+                        qh,
+                        slot.pad as f32,
+                    )
+                };
+                if let Some(r) = raster {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &tex._texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &r.rgba,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(r.width * 4),
+                            rows_per_image: Some(r.height),
+                        },
+                        wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 },
+                    );
+                    continue;
+                }
+                // Sem contornos (fonte bitmap/emoji): cai no raster comum abaixo.
+            }
 
             self.viewport.update(
                 queue,
