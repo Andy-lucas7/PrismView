@@ -20,6 +20,8 @@ import { BackdropSourceInfo, getCssBackgroundCanvas } from "../utils/opticalGlas
 import { OpticalGlassSurface } from "./OpticalGlassSurface";
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
 import { HUB_MOCK_NOW, HUB_MOCK_WEATHER } from "../engine/hubMock";
+import { StemText } from "./StemText";
+import { warpGlyphMaps } from "../utils/stemGlyphMaps";
 // Type-only: keeps the 3D engine in its own lazy chunk
 import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
 
@@ -1372,7 +1374,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           }
 
           if (g.enabled && textMode === "GLYPH") {
-            const maps = getGlyphGlassMaps({
+            const mapsBase = getGlyphGlassMaps({
               text: resolved,
               fontStack,
               fontSize: scaledFont,
@@ -1383,6 +1385,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               fontRev,
               maxWidthPx: textMaxWPx > 0 ? textMaxWPx : undefined,
             });
+            // Alongamento por haste: só as partes verticais crescem (mapas deformados, escala vertical = 1).
+            const maps = mapsBase && stretchY > 1.01 ? warpGlyphMaps(mapsBase, stretchY, scaledFont) : mapsBase;
             if (maps) {
               return (
                 <div
@@ -1390,8 +1394,6 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                     position: "relative",
                     width: `${maps.width}px`,
                     height: `${maps.height}px`,
-                    transform: stretchY > 1.01 ? `scaleY(${stretchY.toFixed(3)})` : undefined,
-                    transformOrigin: "center center",
                   }}
                   className="pointer-events-none"
                 >
@@ -1411,7 +1413,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                     width={maps.width}
                     height={maps.height}
                     rotationDeg={rotation}
-                    scaleY={stretchY}
+                    scaleY={1}
                     glass={g}
                     containerScale={containerScale}
                     opacity={opacity}
@@ -1426,6 +1428,27 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 </div>
               );
             }
+          }
+
+          if (stretchY > 1.01 && !(g.enabled && hasChroma)) {
+            return (
+              <div style={{ opacity: g.enabled ? opacity : undefined }} className="pointer-events-none">
+                <StemText
+                  text={resolved}
+                  fontStack={fontStack}
+                  fontSizePx={scaledFont}
+                  fontWeight={layer.text.fontWeight}
+                  letterSpacingEm={layer.text.letterSpacing}
+                  align={layer.text.align}
+                  maxWidthPx={textMaxWPx > 0 ? textMaxWPx : undefined}
+                  stretch={stretchY}
+                  color={fillRgba}
+                  shadowPx={glyphAlpha <= 0.002 ? 0 : layer.text.shadowBlur}
+                  shadowAlpha={0.65 * glyphAlpha}
+                  fontRev={fontRev}
+                />
+              </div>
+            );
           }
 
           return (
