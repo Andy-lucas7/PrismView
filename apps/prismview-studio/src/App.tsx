@@ -67,6 +67,7 @@ import {
   type PowerPreference,
   usePowerState,
 } from "./engine/powerGovernor";
+import { applyMotionCssVars } from "./engine/motion";
 
 /** 4.7: Hub thumbnail. Fixed telemetry + memo => cards do not re-render on the 1.5 s telemetry tick. */
 const HubThumbnail = React.memo(function HubThumbnail({ project }: { project: PrismProject }) {
@@ -1631,7 +1632,7 @@ const StudioHubApp: React.FC = () => {
   const totalTemplatesCount = templates3d.length + defaultTemplates.length;
 
   return (
-    <div className="relative w-screen h-screen bg-[#060608] text-white flex overflow-hidden">
+    <div className="relative w-screen h-screen bg-pureBlack text-white flex overflow-hidden">
       {/* Subtle Monochrome Architectural Light */}
       <div
         className="pointer-events-none absolute inset-0"
@@ -2874,6 +2875,8 @@ const StudioHubApp: React.FC = () => {
     </div>
   );
 };
+
+applyMotionCssVars();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

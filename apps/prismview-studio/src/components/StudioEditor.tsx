@@ -1605,7 +1605,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   };
 
   return (
-    <div className="relative w-full h-full bg-[#060608] overflow-hidden">
+    <div className="relative w-full h-full bg-pureBlack overflow-hidden">
       {/* Top Floating Bar (Stationary during drag) */}
       <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
         <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
