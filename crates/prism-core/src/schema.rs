@@ -1403,6 +1403,21 @@ pub struct EngineStatus {
     /// Estado do `PowerGovernor` (`normal|eco|ultra|paused|frozen`); vazio no motor legado.
     #[serde(default)]
     pub power_state: String,
+    /// Problemas da cena atual (vídeo que não abriu, modelo inválido, imagem ilegível...).
+    /// No máximo `ENGINE_ISSUES_MAX`; limpo a cada cena nova.
+    #[serde(default)]
+    pub errors: Vec<EngineIssue>,
+}
+
+/// Teto de `EngineStatus::errors`.
+pub const ENGINE_ISSUES_MAX: usize = 32;
+
+/// Problema reportado pelo motor ao Studio. `layer_id` vazio = da cena como um todo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EngineIssue {
+    #[serde(default)]
+    pub layer_id: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

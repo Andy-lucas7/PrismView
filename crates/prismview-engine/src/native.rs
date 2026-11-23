@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use prism_core::fx::{EvalContext, SystemTelemetry};
 use prism_core::schema::{
-    DirtyFlags, EngineStatus, IpcRequest, IpcResponse, PrismScene, MANIFEST_VERSION,
+    DirtyFlags, EngineIssue, EngineStatus, IpcRequest, IpcResponse, PrismScene,
+    ENGINE_ISSUES_MAX, MANIFEST_VERSION,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
@@ -58,7 +59,8 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, open_studio, parse_tray_enabled, resolve_font_files, run as run_loop,
+    acquire_single_instance, log_file, open_studio, parse_tray_enabled, resolve_font_files,
+    run as run_loop,
     trim_working_set, ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder,
     SensorsConfig, TrayAction, Win32DesktopHost, Win32SystemSensors,
 };
@@ -103,11 +105,33 @@ const SCENE3D_UNBOUND: u64 = u64::MAX;
 /// Intervalo mínimo entre quadros de widgets com molas em movimento (sem bloqueio de VSync).
 const WIDGET_MIN_FRAME: Duration = Duration::from_micros(8_333);
 
+/// Reaberturas de um vídeo com erro (1 s, 5 s, 30 s; depois desiste até a próxima cena).
+const VIDEO_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
 /// Decoder de um arquivo de vídeo da cena.
 struct VideoSlot {
     path: PathBuf,
     decoder: MfVideoDecoder,
     paused: bool,
+    /// Erro atual já registrado (log + status): não repetir a cada iteração.
+    error_reported: bool,
+    retries: usize,
+    retry_at: Option<Instant>,
+}
+
+/// Registra um problema da cena (log + `EngineStatus.errors`, sem duplicar, até o teto).
+fn push_issue(issues: &mut Vec<EngineIssue>, layer_id: Option<&str>, message: String) {
+    eprintln!("[prismview-engine] {message}");
+    if issues.len() < ENGINE_ISSUES_MAX && !issues.iter().any(|i| i.message == message) {
+        issues.push(EngineIssue {
+            layer_id: layer_id.map(str::to_string),
+            message,
+        });
+    }
 }
 
 struct Output {
@@ -186,6 +210,8 @@ struct NativeApp {
     formulas_sec: i64,
     /// Dependências FX das fórmulas dos bindings 3D (decidem a demanda de sensores e o tique de 1 s).
     formula_deps: DirtyFlags,
+    /// Problemas da cena atual (vídeo, arquivo de cena); limpo a cada `load_scene`.
+    issues: Vec<EngineIssue>,
 }
 
 /// Ponto de entrada do modo nativo. Retorna o código de saída do processo.
@@ -198,6 +224,14 @@ pub fn run() -> i32 {
     if at_login && !has_scene && !has_widgets {
         return 0;
     }
+
+    // Sem console (processo destacado): `eprintln!`/pânicos → `native\engine.log` (2 × 1 MB).
+    if let Some(dir) = NativeApp::state_dir() {
+        if let Err(err) = log_file::redirect_stderr_to_file(&dir, "engine.log") {
+            eprintln!("[prismview-engine] log: {err}");
+        }
+    }
+    eprintln!("[prismview-engine] início pid={} {}", std::process::id(), Local::now().to_rfc3339());
 
     // Um motor por sessão: login + Studio subindo juntos, ou PING perdido, não podem gerar dois
     // processos na GPU/WorkerW. Mantido vivo até `run` retornar.
@@ -313,6 +347,7 @@ impl NativeApp {
             wallpaper_wanted: false,
             formulas_sec: i64::MIN,
             formula_deps: DirtyFlags::NONE,
+            issues: Vec::new(),
         }
     }
 
@@ -514,6 +549,34 @@ impl NativeApp {
         std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("PrismView").join("native"))
     }
 
+    /// Problemas atuais para o Studio: os registrados + modelos 3D com erro + imagens ilegíveis.
+    fn status_issues(&self) -> Vec<EngineIssue> {
+        let mut out = self.issues.clone();
+        if let Some(scene3d) = self.scene3d.as_ref() {
+            for (id, message) in scene3d.object_errors() {
+                if out.len() >= ENGINE_ISSUES_MAX {
+                    break;
+                }
+                out.push(EngineIssue {
+                    layer_id: Some(id.to_string()),
+                    message: format!("Objeto 3D: {message}"),
+                });
+            }
+        }
+        if let Some(renderer) = self.renderer.as_ref() {
+            for path in renderer.failed_images() {
+                if out.len() >= ENGINE_ISSUES_MAX {
+                    break;
+                }
+                out.push(EngineIssue {
+                    layer_id: None,
+                    message: format!("Imagem não carregou: {path}"),
+                });
+            }
+        }
+        out
+    }
+
     /// Arquivos de cena vindos do IPC: só dentro de `%APPDATA%\PrismView\native\` (o Studio grava
     /// ali); qualquer outro caminho é recusado.
     fn read_allowed_scene_file(raw: &str) -> Result<PrismScene, String> {
@@ -557,7 +620,7 @@ impl NativeApp {
                     self.scene = Some(scene);
                     self.wallpaper_wanted = true;
                 }
-                Err(err) => eprintln!("[prismview-engine] cena persistida: {err}"),
+                Err(err) => push_issue(&mut self.issues, None, format!("cena persistida: {err}")),
             }
         }
     }
@@ -570,6 +633,7 @@ impl NativeApp {
             self.wallpaper_wanted = true;
             self.rebuild_outputs(host);
         }
+        self.issues.clear();
         // A cena é SEMPRE aceita: sem GPU/saídas agora (Explorer reiniciando, monitor religando,
         // device perdido), `rebuild_outputs` → `ensure_renderer` aplica `self.scene` depois.
         self.ctx.now = Local::now();
@@ -1102,7 +1166,7 @@ impl NativeApp {
         };
         for (path, _background) in wanted {
             if !path.is_file() {
-                eprintln!("[prismview-engine] vídeo ausente: {}", path.display());
+                push_issue(&mut self.issues, None, format!("Vídeo não encontrado: {}", path.display()));
                 continue;
             }
             let mut decoder = MfVideoDecoder::new();
@@ -1123,8 +1187,15 @@ impl NativeApp {
                     path,
                     decoder,
                     paused: false,
+                    error_reported: false,
+                    retries: 0,
+                    retry_at: None,
                 }),
-                Err(err) => eprintln!("[prismview-engine] vídeo {}: {err}", path.display()),
+                Err(err) => push_issue(
+                    &mut self.issues,
+                    None,
+                    format!("Vídeo não abriu: {} ({err})", path.display()),
+                ),
             }
         }
         self.dirty = true;
@@ -1157,8 +1228,42 @@ impl NativeApp {
             if paused {
                 continue;
             }
-            if let Some(err) = slot.decoder.last_error() {
-                eprintln!("[prismview-engine] vídeo {}: {err}", slot.path.display());
+            // Reabertura agendada após erro (backoff).
+            if let Some(at) = slot.retry_at {
+                if now < at {
+                    let wait = at - now;
+                    next = Some(next.map_or(wait, |n| n.min(wait)));
+                    continue;
+                }
+                slot.retry_at = None;
+                slot.error_reported = false;
+                if let Err(err) = slot.decoder.open_async(&slot.path) {
+                    push_issue(
+                        &mut self.issues,
+                        None,
+                        format!("Vídeo não reabriu: {} ({err})", slot.path.display()),
+                    );
+                    slot.error_reported = true;
+                    continue;
+                }
+            }
+            // Erro: 1 registro por ocorrência (sem log/alocação por quadro) e reabertura agendada.
+            if slot.decoder.has_error() {
+                if !slot.error_reported {
+                    slot.error_reported = true;
+                    let err = slot.decoder.last_error().unwrap_or_default();
+                    push_issue(
+                        &mut self.issues,
+                        None,
+                        format!("Erro no vídeo {}: {err}", slot.path.display()),
+                    );
+                    if let Some(delay) = VIDEO_RETRY_DELAYS.get(slot.retries) {
+                        slot.retries += 1;
+                        slot.retry_at = Some(now + *delay);
+                        next = Some(next.map_or(*delay, |n| n.min(*delay)));
+                    }
+                }
+                continue;
             }
             let advanced = slot.decoder.advance();
             if advanced {
@@ -1590,6 +1695,7 @@ impl NativeApp {
                     pinned_widget_ids: self.widgets.iter().map(|w| w.spec.id.clone()).collect(),
                     active_monitor_count: u32::try_from(self.outputs.len()).unwrap_or(u32::MAX),
                     rendered_frames: self.frames,
+                    errors: self.status_issues(),
                     gpu_adapter: self
                         .gpu
                         .as_ref()

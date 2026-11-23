@@ -26,6 +26,7 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -138,6 +139,8 @@ struct SharedState {
 struct Shared {
     state: Mutex<SharedState>,
     cv: Condvar,
+    /// Espelho barato de `SharedState::error.is_some()` (consultado a cada iteração do loop).
+    failed: AtomicBool,
 }
 
 impl Shared {
@@ -152,6 +155,7 @@ impl Shared {
                 error: None,
             }),
             cv: Condvar::new(),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -850,6 +854,7 @@ fn fail(shared: &Shared, slot: Option<usize>, message: String) {
     }
     st.error = Some(message);
     drop(st);
+    shared.failed.store(true, Ordering::Release);
     shared.cv.notify_all();
 }
 
@@ -946,6 +951,15 @@ impl MfVideoDecoder {
     /// Posição atual de reprodução (ms, monotônica entre voltas do loop).
     pub fn position_ms(&self) -> Option<u64> {
         self.session.as_ref().map(|s| s.media_ms(Instant::now()))
+    }
+
+    /// Há erro (abertura ou decodificação)? Sem lock nem alocação: pode ser chamado por quadro.
+    pub fn has_error(&self) -> bool {
+        self.open_error.is_some()
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.shared.failed.load(Ordering::Acquire))
     }
 
     /// Acorda o loop quando uma abertura assíncrona termina (sucesso ou erro).
@@ -1170,6 +1184,7 @@ impl HardwareVideoDecoder for MfVideoDecoder {
         st.end_of_stream = false;
         st.error = None;
         drop(st);
+        s.shared.failed.store(false, Ordering::Release);
         s.shared.cv.notify_all();
         Ok(())
     }

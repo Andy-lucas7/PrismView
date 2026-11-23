@@ -1292,7 +1292,7 @@ impl Scene3dRenderer {
         let aspect = w as f32 / h as f32;
         let (eye, target, fov) = self.camera_view();
         let fwd = (target - eye).normalize_or_zero();
-        let right = fwd.cross(Vec3::Y).normalize_or_zero();
+        let right = fwd.cross(camera_up_ref(fwd)).normalize_or_zero();
         if fwd == Vec3::ZERO || right == Vec3::ZERO {
             return None;
         }
@@ -1468,6 +1468,7 @@ impl Scene3dRenderer {
         self.output_generation = self.output_generation.wrapping_add(1);
     }
 
+    /// Olho, alvo e FOV da câmera do wallpaper (órbita aplicada).
     fn camera_view(&self) -> (Vec3, Vec3, f32) {
         let cam = &self.config.camera;
         let finite = |v: f32, d: f32| if v.is_finite() { v } else { d };
@@ -1563,7 +1564,7 @@ impl Scene3dRenderer {
         let (eye, target, fov) = self.camera_view();
         let aspect = size.0 as f32 / size.1.max(1) as f32;
         let proj = Mat4::perspective_infinite_reverse_rh(fov.to_radians(), aspect, NEAR_PLANE);
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let view = Mat4::look_at_rh(eye, target, camera_up_ref((target - eye).normalize_or_zero()));
         let view_proj = proj * view;
         let frustum = Frustum::from_view_proj(&view_proj);
 
@@ -1944,5 +1945,27 @@ mod tests {
         assert!(decode_dynamic_image(&empty_path, 64).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// "Up" de referência da câmera: `Y`, ou `Z` quando o olhar é (quase) vertical — senão
+/// `fwd × Y` zera e a view/o pick degeneram (câmera a ±90°).
+fn camera_up_ref(fwd: Vec3) -> Vec3 {
+    if fwd.dot(Vec3::Y).abs() > 0.999 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    }
+}
+
+#[cfg(test)]
+mod camera_up_tests {
+    use super::*;
+
+    #[test]
+    fn vertical_view_still_has_a_right_vector() {
+        for fwd in [Vec3::NEG_Y, Vec3::Y, Vec3::new(0.3, -0.9, 0.1).normalize()] {
+            assert!(fwd.cross(camera_up_ref(fwd)).length() > 1e-3);
+        }
     }
 }

@@ -50,9 +50,12 @@ import {
 } from "./types/prism";
 import { friendlyError } from "./utils/friendlyError";
 import { collectOpenAppReview, OpenAppReviewItem, resolveOpenAppReview } from "./utils/importReview";
+import { nativeCompatIssues } from "./utils/nativeCompat";
 
 /** Backoff das novas tentativas de salvar (o último valor se repete até dar certo). */
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
+/** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
+const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
 import { UnifiedCompositor } from "./components/UnifiedCompositor";
 import { StudioEditor } from "./components/StudioEditor";
 import {
@@ -501,10 +504,8 @@ const StudioHubApp: React.FC = () => {
     pinned_widget_ids: [],
     locked_widget_ids: [],
     monitors: [],
-    monitor_wallpapers: {},
   });
   const [monitors, setMonitors] = useState<MonitorInfoDto[]>([]);
-  const [targetMonitorId, setTargetMonitorId] = useState<string | null>(null);
   const [autostart, setAutostart] = useState(false);
   const [engineTrayEnabled, setEngineTrayEnabled] = useState(true);
   const [trayBusy, setTrayBusy] = useState(false);
@@ -696,9 +697,6 @@ const StudioHubApp: React.FC = () => {
       const fn = await listen<MonitorInfoDto[]>("prism://monitors-changed", (ev) => {
         if (disposed) return;
         setMonitors(ev.payload);
-        setTargetMonitorId((cur) =>
-          cur && !ev.payload.some((m) => m.id === cur) ? null : cur
-        );
       });
       if (disposed) {
         fn();
@@ -791,34 +789,41 @@ const StudioHubApp: React.FC = () => {
   const desktopSyncInFlightRef = useRef(false);
   const desktopSyncPendingRef = useRef<PrismProject | null>(null);
 
-  const runDesktopSyncNow = useCallback(async (proj: PrismProject) => {
-    const rt = runtimeRef.current;
-    if (proj.packageType === "WIDGET") {
-      if (rt.pinned_widget_ids.includes(proj.id)) {
-        const nextRt = await invokeCmd<RuntimeState>("pin_standalone_widget", {
-          project: proj,
-        }).catch(() => null);
-        if (nextRt) setRuntime(nextRt);
+  // Sync automático com o desktop: a 1ª falha seguida avisa; o aviso só volta após um sucesso.
+  const desktopSyncFailedRef = useRef(false);
+  const runDesktopSyncNow = useCallback(
+    async (proj: PrismProject) => {
+      const rt = runtimeRef.current;
+      let request: Promise<RuntimeState> | null = null;
+      if (proj.packageType === "WIDGET") {
+        if (rt.pinned_widget_ids.includes(proj.id)) {
+          request = invokeCmd<RuntimeState>("pin_standalone_widget", { project: proj });
+        }
+      } else if (rt.active_wallpaper_id === proj.id) {
+        // `autosave`: só cena + recarga no motor (o .prism não é re-zipado a cada pausa).
+        request = invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
+          project: withNativeAssets(proj),
+          monitorId: null,
+          autosave: true,
+        });
       }
-      return;
-    }
-    const matchingMonitors = Object.entries(rt.monitor_wallpapers ?? {})
-      .filter(([, pid]) => pid === proj.id)
-      .map(([mid]) => mid);
-    if (matchingMonitors.length > 0) {
-      const nextRt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
-        project: withNativeAssets(proj),
-        monitorId: matchingMonitors[0],
-      }).catch(() => null);
-      if (nextRt) setRuntime(nextRt);
-    } else if (rt.active_wallpaper_id === proj.id) {
-      const nextRt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
-        project: withNativeAssets(proj),
-        monitorId: null,
-      }).catch(() => null);
-      if (nextRt) setRuntime(nextRt);
-    }
-  }, []);
+      if (!request) return;
+      try {
+        setRuntime(await request);
+        desktopSyncFailedRef.current = false;
+      } catch (err) {
+        if (!desktopSyncFailedRef.current) {
+          desktopSyncFailedRef.current = true;
+          notify(
+            `O desktop não pôde ser atualizado: ${friendlyError(err, "erro desconhecido")} A próxima edição tenta de novo.`
+          );
+        } else {
+          console.error("[PrismView] sync desktop:", err);
+        }
+      }
+    },
+    [notify]
+  );
 
   const syncIfActiveOnDesktop = useCallback(
     async (proj: PrismProject) => {
@@ -1007,15 +1012,43 @@ const StudioHubApp: React.FC = () => {
         try {
           const rt = await invokeCmd<RuntimeState>("apply_desktop_wallpaper", {
             project: withNativeAssets(proj),
-            monitorId: targetMonitorId,
+            monitorId: null,
           });
           setRuntime(rt);
+          desktopSyncFailedRef.current = false;
           if (rt.monitors?.length) setMonitors(rt.monitors);
-          if (!silent) {
+          // Avisos do conversor (arquivo ausente…) + recursos que o desktop não desenha.
+          const problems = [
+            ...(rt.warnings ?? []),
+            ...nativeCompatIssues(proj).map((i) => i.message),
+          ];
+          if (problems.length > 0) {
+            console.warn("[PrismView] avisos ao aplicar:", problems);
+            notify(
+              `"${proj.title}" aplicado com ${problems.length} aviso(s): ${problems[0]}${
+                problems.length > 1 ? ` (+${problems.length - 1})` : ""
+              }`
+            );
+          } else if (!silent) {
             // Motor nativo desenha todos os monitores com a mesma cena.
             const targetLabel = monitors.length > 1 ? ` em ${monitors.length} monitores` : "";
             notify(`Wallpaper "${proj.title}" aplicado${targetLabel}`);
           }
+          // Vídeo/modelo/imagem carregam depois no motor: confere os erros dele um pouco depois.
+          window.setTimeout(() => {
+            void invokeCmd<{ errors?: { layer_id?: string | null; message: string }[] }>(
+              "native_engine_status"
+            )
+              .then((status) => {
+                const errors = status.errors ?? [];
+                if (errors.length === 0) return;
+                console.warn("[PrismView] erros do motor:", errors);
+                notify(
+                  `Desktop: ${errors[0].message}${errors.length > 1 ? ` (+${errors.length - 1})` : ""}`
+                );
+              })
+              .catch((err) => console.error("[PrismView] status do motor:", err));
+          }, ENGINE_STATUS_CHECK_DELAY_MS);
         } catch (err) {
           if (!silent) {
             notify(
@@ -1032,10 +1065,10 @@ const StudioHubApp: React.FC = () => {
     );
   };
 
-  const clearWallpaper = async (monitorId: string | null = null) => {
+  const clearWallpaper = async () => {
     await withBusy("clear", async () => {
       try {
-        const rt = await invokeCmd<RuntimeState>("clear_desktop_wallpaper", { monitorId });
+        const rt = await invokeCmd<RuntimeState>("clear_desktop_wallpaper", { monitorId: null });
         setRuntime(rt);
         notify("Wallpaper removido do desktop");
       } catch (err) {
@@ -1314,17 +1347,7 @@ const StudioHubApp: React.FC = () => {
           if (rt) setRuntime(rt);
         }
       } else {
-        const activeMonitors = Object.entries(runtime.monitor_wallpapers ?? {})
-          .filter(([, pid]) => pid === proj.id)
-          .map(([mid]) => mid);
-        if (activeMonitors.length > 0) {
-          for (const mid of activeMonitors) {
-            const rt = await invokeCmd<RuntimeState>("clear_desktop_wallpaper", {
-              monitorId: mid,
-            }).catch(logIgnored);
-            if (rt) setRuntime(rt);
-          }
-        } else if (runtime.active_wallpaper_id === proj.id) {
+        if (runtime.active_wallpaper_id === proj.id) {
           const rt = await invokeCmd<RuntimeState>("clear_desktop_wallpaper", {
             monitorId: null,
           }).catch(logIgnored);
@@ -1353,8 +1376,7 @@ const StudioHubApp: React.FC = () => {
     const isWidget = pendingDelete.packageType === "WIDGET";
     const active = isWidget
       ? runtime.pinned_widget_ids.includes(pendingDelete.id)
-      : runtime.active_wallpaper_id === pendingDelete.id ||
-        Object.values(runtime.monitor_wallpapers ?? {}).includes(pendingDelete.id);
+      : runtime.active_wallpaper_id === pendingDelete.id;
     const extra = active
       ? isWidget
         ? " Ele está fixado na tela e será removido de lá."
@@ -1467,15 +1489,12 @@ const StudioHubApp: React.FC = () => {
   };
 
   const targetMonitorAspect = useMemo(() => {
-    const mon =
-      (targetMonitorId ? monitors.find((m) => m.id === targetMonitorId) : null) ??
-      monitors.find((m) => m.is_primary) ??
-      monitors[0];
+    const mon = monitors.find((m) => m.is_primary) ?? monitors[0];
     if (mon && mon.width > 0 && mon.height > 0) {
       return mon.width / mon.height;
     }
     return 16 / 9;
-  }, [monitors, targetMonitorId]);
+  }, [monitors]);
 
   if (editing) {
     return (
@@ -2002,32 +2021,6 @@ const StudioHubApp: React.FC = () => {
                   ))}
                 </div>
 
-                {monitors.length > 1 && (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[11px] text-[#A1A1AA] mr-1">Tela alvo:</span>
-                    <button
-                      type="button"
-                      onClick={() => setTargetMonitorId(null)}
-                      className={`px-3 py-1 rounded-full text-[11px] transition ${
-                        targetMonitorId === null ? "prism-pill-active" : "prism-pill-idle"
-                      }`}
-                    >
-                      Todas ({monitors.length})
-                    </button>
-                    {monitors.map((m, idx) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => setTargetMonitorId(m.id)}
-                        className={`px-3 py-1 rounded-full text-[11px] font-mono-fx transition ${
-                          targetMonitorId === m.id ? "prism-pill-active" : "prism-pill-idle"
-                        }`}
-                      >
-                        {m.is_primary ? "Principal" : `Tela ${idx + 1}`} · {m.width}×{m.height}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
 
               {filteredWallpapers.length === 0 && (
@@ -2057,10 +2050,7 @@ const StudioHubApp: React.FC = () => {
 
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
                 {filteredWallpapers.map((wp) => {
-                  const isActive = targetMonitorId
-                    ? runtime.monitor_wallpapers?.[targetMonitorId] === wp.id
-                    : runtime.active_wallpaper_id === wp.id ||
-                      Object.values(runtime.monitor_wallpapers ?? {}).includes(wp.id);
+                  const isActive = runtime.active_wallpaper_id === wp.id;
                   const wpKind = classifyWallpaperKind(wp);
                   return (
                     <article key={wp.id} className="prism-hub-card flex flex-col">
@@ -2121,7 +2111,7 @@ const StudioHubApp: React.FC = () => {
                           {isActive ? (
                             <button
                               type="button"
-                              onClick={() => void clearWallpaper(targetMonitorId)}
+                              onClick={() => void clearWallpaper()}
                               disabled={busy !== null}
                               className={`${LOCK_CLS} prism-pill-idle rounded-full py-2 text-xs flex items-center justify-center gap-1.5`}
                             >

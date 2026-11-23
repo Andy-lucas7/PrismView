@@ -748,6 +748,11 @@ impl SceneRenderer {
         self.scene.is_some()
     }
 
+    /// Imagens que não decodificaram/enviaram (para o status do Studio).
+    pub fn failed_images(&self) -> impl Iterator<Item = &str> {
+        self.images.failed.iter().map(String::as_str)
+    }
+
     /// Imagens decodificadas em segundo plano ficaram prontas: invalida a lista (o rebuild faz o
     /// upload). Chamar 1× por iteração do loop; `true` = redesenhar.
     pub fn poll_images(&mut self) -> bool {

@@ -47,6 +47,15 @@ pub(crate) fn discard_temp(tmp: &Path) {
     }
 }
 
+/// Registra (stderr → `studio.log`) falhas de I/O de melhor-esforço. `NotFound` é ignorado.
+pub(crate) fn log_io<T>(what: &str, result: std::io::Result<T>) {
+    if let Err(e) = result {
+        if e.kind() != ErrorKind::NotFound {
+            eprintln!("[prismview-studio] {what}: {e}");
+        }
+    }
+}
+
 /// Troca `path` pelo temporário já gravado. Em erro, o temporário é apagado.
 pub(crate) fn commit_temp(tmp: &Path, path: &Path) -> Result<(), String> {
     fs::rename(tmp, path).map_err(|e| {

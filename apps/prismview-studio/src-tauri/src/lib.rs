@@ -1,5 +1,7 @@
 mod atomic_fs;
+mod bundled_fonts;
 mod desktop_host;
+mod log_file;
 mod native_engine;
 mod native_scene;
 mod reactive_sensors;
@@ -63,11 +65,12 @@ pub struct RuntimeStateDto {
     pub locked_widget_ids: Vec<String>,
     #[serde(default)]
     pub monitors: Vec<MonitorInfoDto>,
-    #[serde(default)]
-    pub monitor_wallpapers: HashMap<String, String>,
     /// Aviso quando a migração automática de um wallpaper antigo (WebView) para o motor nativo falhou.
     #[serde(default)]
     pub legacy_migration_notice: Option<String>,
+    /// Avisos do último "Aplicar" (arquivo ausente etc.); vazio fora dele.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,9 +120,7 @@ struct PersistedSession {
 struct AppRuntimeState {
     active_wallpaper: Option<Value>,
     monitors: Vec<MonitorInfoDto>,
-    monitor_wallpapers: HashMap<String, Value>,  // monitor_id -> project
     monitor_visibility: HashMap<String, bool>,   // monitor_id -> desktop uncovered
-    wallpaper_labels: HashMap<String, String>,   // window_label -> monitor_id
     pinned_widgets: HashMap<String, Value>,
     widget_labels: HashMap<String, String>,      // window_label -> widget_id
     ready_windows: HashSet<String>,
@@ -514,11 +515,11 @@ fn prismview_root_dir() -> PathBuf {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             let root = base.join("PrismView");
-            let _ = fs::create_dir_all(root.join("projects"));
-            let _ = fs::create_dir_all(root.join("packages"));
-            let _ = fs::create_dir_all(root.join("imports"));
-            let _ = fs::create_dir_all(root.join("fonts"));
-            let _ = fs::create_dir_all(root.join("assets"));
+            atomic_fs::log_io("create_dir_all", fs::create_dir_all(root.join("projects")));
+            atomic_fs::log_io("create_dir_all", fs::create_dir_all(root.join("packages")));
+            atomic_fs::log_io("create_dir_all", fs::create_dir_all(root.join("imports")));
+            atomic_fs::log_io("create_dir_all", fs::create_dir_all(root.join("fonts")));
+            atomic_fs::log_io("create_dir_all", fs::create_dir_all(root.join("assets")));
             root
         })
         .clone()
@@ -690,9 +691,6 @@ fn load_project_from_disk(project_id: &str) -> Option<Value> {
     Some(val)
 }
 
-fn wallpaper_window_label(monitor_id: &str) -> String {
-    format!("wallpaper-{}", sanitize_name(monitor_id))
-}
 
 fn ensure_monitors_loaded(st: &mut AppRuntimeState) -> Vec<MonitorInfoDto> {
     if st.monitors.is_empty() {
@@ -715,23 +713,14 @@ fn save_session_from_state(st: &AppRuntimeState) {
         (Some(id), Some(val)) if !project_path(id).is_file() => Some(val.clone()),
         _ => None,
     };
-    let mut monitor_wallpaper_ids = HashMap::new();
-    let mut monitor_wallpaper_snapshots = HashMap::new();
-    for (mon_id, val) in &st.monitor_wallpapers {
-        if let Some(pid) = val.get("id").and_then(|v| v.as_str()) {
-            monitor_wallpaper_ids.insert(mon_id.clone(), pid.to_string());
-            if !project_path(pid).is_file() {
-                monitor_wallpaper_snapshots.insert(mon_id.clone(), val.clone());
-            }
-        }
-    }
     let mut pinned_widget_ids: Vec<String> = st.pinned_widgets.keys().cloned().collect();
     pinned_widget_ids.sort();
     let session = PersistedSession {
         active_wallpaper_id,
         active_wallpaper_snapshot,
-        monitor_wallpaper_ids,
-        monitor_wallpaper_snapshots,
+        // Legado (wallpaper WebView por monitor): só lido na migração, nunca mais gravado.
+        monitor_wallpaper_ids: HashMap::new(),
+        monitor_wallpaper_snapshots: HashMap::new(),
         pinned_widget_ids,
         paused: st.manual_paused,
     };
@@ -904,7 +893,7 @@ fn cleanup_unreferenced_import_uuids(candidate_uuids: &HashSet<String>) {
         if !still_referenced.contains(uuid) {
             let dir = imports_root.join(uuid);
             if dir.is_dir() {
-                let _ = fs::remove_dir_all(&dir);
+                atomic_fs::log_io("remove_dir_all", fs::remove_dir_all(&dir));
             }
         }
     }
@@ -946,26 +935,12 @@ fn build_runtime_state(st: &AppRuntimeState) -> RuntimeStateDto {
         })
         .map(|(k, _)| k.clone())
         .collect();
-    let monitor_wallpapers: HashMap<String, String> = st
-        .monitor_wallpapers
-        .iter()
-        .filter_map(|(mid, val)| {
-            val.get("id")
-                .and_then(|v| v.as_str())
-                .map(|pid| (mid.clone(), pid.to_string()))
-        })
-        .collect();
     let active_wallpaper_id = st
         .active_wallpaper
         .as_ref()
         .and_then(|v| v.get("id"))
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            st.monitors
-                .first()
-                .and_then(|m| monitor_wallpapers.get(&m.id).cloned())
-        });
+        .map(str::to_string);
     RuntimeStateDto {
         paused: st.manual_paused,
         desktop_visible: st.desktop_visible,
@@ -973,8 +948,8 @@ fn build_runtime_state(st: &AppRuntimeState) -> RuntimeStateDto {
         pinned_widget_ids: st.pinned_widgets.keys().cloned().collect(),
         locked_widget_ids,
         monitors: st.monitors.clone(),
-        monitor_wallpapers,
         legacy_migration_notice: st.legacy_migration_notice.clone(),
+        warnings: Vec::new(),
     }
 }
 
@@ -1012,7 +987,7 @@ fn bundle_path_into_zip(
         .to_ascii_lowercase();
     let file_opts = if matches!(
         ext.as_str(),
-        "mp4" | "webm" | "mkv" | "mov" | "jpg" | "jpeg" | "png" | "webp" | "woff2"
+        "mp4" | "webm" | "mkv" | "mov" | "jpg" | "jpeg" | "png" | "webp" | "woff2" | "glb" | "ktx2"
     ) {
         SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
     } else {
@@ -1312,19 +1287,6 @@ async fn delete_project(
                 st.ready_windows.remove(&wlbl);
                 close_list.push(wlbl);
             }
-            let matching_mons: Vec<String> = st
-                .monitor_wallpapers
-                .iter()
-                .filter(|(_, p)| p.get("id").and_then(|v| v.as_str()) == Some(project_id.as_str()))
-                .map(|(mid, _)| mid.clone())
-                .collect();
-            for mid in matching_mons {
-                st.monitor_wallpapers.remove(&mid);
-                let lbl = wallpaper_window_label(&mid);
-                st.wallpaper_labels.remove(&lbl);
-                st.ready_windows.remove(&lbl);
-                close_list.push(lbl);
-            }
             if st
                 .active_wallpaper
                 .as_ref()
@@ -1450,19 +1412,6 @@ fn refresh_parallax_targets(st: &mut AppRuntimeState) {
     st.parallax_targets.clear();
     st.audio_targets.clear();
     st.keyboard_targets.clear();
-    for (mon_id, proj) in &st.monitor_wallpapers {
-        let lbl = wallpaper_window_label(mon_id);
-        let (has_cursor, has_audio, has_kbd) = project_reactive_flags(proj);
-        if has_cursor {
-            st.parallax_targets.insert(lbl.clone());
-        }
-        if has_audio {
-            st.audio_targets.insert(lbl.clone());
-        }
-        if has_kbd {
-            st.keyboard_targets.insert(lbl);
-        }
-    }
     for (wid, proj) in &st.pinned_widgets {
         let lbl = format!("widget-{}", sanitize_name(wid));
         let (has_cursor, has_audio, has_kbd) = project_reactive_flags(proj);
@@ -1500,41 +1449,9 @@ fn build_telemetry_snapshot(
     }
 }
 
-/// Fecha janelas WebView de wallpaper deixadas por versões antigas e zera o estado delas, sem
-/// mexer no motor nativo.
-fn close_legacy_wallpaper_windows(app: &AppHandle, state: &SharedState) -> Result<(), String> {
-    let labels: Vec<String> = {
-        let mut st = state.lock().map_err(|e| e.to_string())?;
-        let mut all: Vec<String> = st.wallpaper_labels.keys().cloned().collect();
-        for m in &st.monitors {
-            all.push(wallpaper_window_label(&m.id));
-        }
-        all.push("wallpaper".to_string());
-        st.monitor_wallpapers.clear();
-        st.wallpaper_labels.clear();
-        for lbl in &all {
-            st.ready_windows.remove(lbl);
-        }
-        refresh_parallax_targets(&mut st);
-        all
-    };
-    for label in labels {
-        if let Some(win) = app.get_webview_window(&label) {
-            let _ = win.close();
-        }
-    }
-    Ok(())
-}
-
 /// Remove o wallpaper do desktop: motor nativo encerrado + cena ativa apagada + estado limpo.
-fn clear_wallpaper_inner(
-    app: &AppHandle,
-    state: &SharedState,
-    target_monitor_id: Option<String>,
-) -> Result<(), String> {
-    let _ = target_monitor_id;
+fn clear_wallpaper_inner(state: &SharedState) -> Result<(), String> {
     native_engine::clear_desktop()?;
-    close_legacy_wallpaper_windows(app, state)?;
     if let Ok(mut st) = state.lock() {
         st.active_wallpaper = None;
         save_session_from_state(&st);
@@ -1553,26 +1470,11 @@ fn reconcile_monitors_and_worker_w(app: &AppHandle, state: &SharedState) {
         st.monitors = fresh_monitors.clone();
         st.monitor_visibility
             .retain(|mid, _| fresh_ids.contains(mid));
-        // Prune disconnected monitors from monitor_wallpapers too so RuntimeState and ExitRequested stay accurate
-        st.monitor_wallpapers
-            .retain(|mid, _| fresh_ids.contains(mid));
         for m in &fresh_monitors {
             st.monitor_visibility.entry(m.id.clone()).or_insert(true);
         }
 
-        let mut stale = Vec::new();
-        let existing_labels: Vec<(String, String)> = st
-            .wallpaper_labels
-            .iter()
-            .map(|(l, m)| (l.clone(), m.clone()))
-            .collect();
-        for (lbl, mid) in existing_labels {
-            if !fresh_ids.contains(&mid) {
-                stale.push(lbl.clone());
-                st.wallpaper_labels.remove(&lbl);
-                st.ready_windows.remove(&lbl);
-            }
-        }
+        let stale: Vec<String> = Vec::new();
 
         let widgets: Vec<(String, bool)> = st
             .pinned_widgets
@@ -1634,14 +1536,15 @@ async fn apply_desktop_wallpaper(
     engine: tauri::State<'_, native_engine::SharedEngine>,
     project: Value,
     monitor_id: Option<String>,
+    autosave: Option<bool>,
 ) -> Result<RuntimeStateDto, String> {
     let state_arc = Arc::clone(state.inner());
     let engine_arc = Arc::clone(engine.inner());
     let _ = monitor_id;
     tauri::async_runtime::spawn_blocking(move || {
-        engine_arc.apply_project(&project)?;
-        // Limpa restos de sessões antigas (janelas WebView de wallpaper) sem tocar no motor.
-        close_legacy_wallpaper_windows(&app, &state_arc)?;
+        // Autosave do wallpaper ativo: só cena + LOAD_SCENE_FILE; o `.prism` em `packages/`
+        // é refeito apenas no "Aplicar" explícito (re-zipar vídeos grandes a cada pausa custa CPU/SSD).
+        let warnings = engine_arc.apply_project(&project, !autosave.unwrap_or(false))?;
         let has_widgets = {
             let mut st = state_arc.lock().map_err(|e| e.to_string())?;
             st.active_wallpaper = Some(project);
@@ -1651,7 +1554,9 @@ async fn apply_desktop_wallpaper(
         ensure_engine_login_autostart(has_widgets);
         sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
-        Ok(build_runtime_state(&st))
+        let mut dto = build_runtime_state(&st);
+        dto.warnings = warnings;
+        Ok(dto)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1668,7 +1573,7 @@ async fn clear_desktop_wallpaper(
     let state_arc = Arc::clone(state.inner());
     let _ = monitor_id;
     tauri::async_runtime::spawn_blocking(move || {
-        clear_wallpaper_inner(&app, &state_arc, None)?;
+        clear_wallpaper_inner(&state_arc)?;
         sync_studio_tray_visibility(&app, &state_arc);
         let st = state_arc.lock().map_err(|e| e.to_string())?;
         Ok(build_runtime_state(&st))
@@ -1947,33 +1852,24 @@ fn unlock_all_widgets_inner(app: &AppHandle, state: &SharedState) {
 }
 
 fn apply_manual_pause_inner(app: &AppHandle, state: &SharedState, paused: bool) -> Result<(), String> {
-    let (wp_targets, wg_targets, any_vis) = {
+    let (wg_targets, any_vis) = {
         let mut st = state.lock().map_err(|e| e.to_string())?;
         st.manual_paused = paused;
         st.force_vis_resync = true;
         save_session_from_state(&st);
 
-        let wps: Vec<(String, bool)> = st
-            .wallpaper_labels
-            .iter()
-            .filter(|(lbl, _)| st.ready_windows.contains(*lbl))
-            .map(|(lbl, mid)| {
-                let mon_vis = st.monitor_visibility.get(mid).copied().unwrap_or(true);
-                (lbl.clone(), !paused && mon_vis)
-            })
-            .collect();
         let wgs: Vec<(String, bool)> = st
             .widget_labels
             .iter()
             .filter(|(lbl, _)| st.ready_windows.contains(*lbl))
             .map(|(lbl, _)| (lbl.clone(), !paused && st.desktop_visible))
             .collect();
-        (wps, wgs, !paused && st.desktop_visible)
+        (wgs, !paused && st.desktop_visible)
     };
     let reason = if paused { "manual_pause" } else { "resumed" };
     // Propaga pausa/retomada ao motor nativo em background (não bloqueia a UI).
     std::thread::spawn(move || native_engine::set_paused(paused));
-    for (lbl, vis) in wp_targets.into_iter().chain(wg_targets) {
+    for (lbl, vis) in wg_targets {
         let _ = app.emit_to(
             &lbl,
             "prism://visibility-changed",
@@ -2223,7 +2119,7 @@ pub(crate) fn export_prism_archive_sync(
             let p = PathBuf::from(custom);
             if let Some(parent) = p.parent() {
                 if !parent.as_os_str().is_empty() {
-                    let _ = fs::create_dir_all(parent);
+                    atomic_fs::log_io("create_dir_all", fs::create_dir_all(parent));
                 }
             }
             p
@@ -2460,7 +2356,7 @@ async fn import_prism_archive(
         })();
 
         if let Err(err) = extract_res {
-            let _ = fs::remove_dir_all(&extract_dir);
+            atomic_fs::log_io("remove_dir_all", fs::remove_dir_all(&extract_dir));
             return Err(err);
         }
 
@@ -2500,7 +2396,7 @@ async fn import_prism_archive(
                 Ok(saved)
             }
             Err(err) => {
-                let _ = fs::remove_dir_all(&extract_dir);
+                atomic_fs::log_io("remove_dir_all", fs::remove_dir_all(&extract_dir));
                 Err(err)
             }
         }
@@ -2519,7 +2415,8 @@ async fn pick_local_file(kind: Option<String>) -> Result<Option<PickedFileDto>, 
             Some("video") => "Vídeos (*.mp4;*.webm;*.mkv;*.mov)\0*.mp4;*.webm;*.mkv;*.mov\0\0",
             Some("image") => "Imagens (*.png;*.jpg;*.jpeg;*.webp)\0*.png;*.jpg;*.jpeg;*.webp\0\0",
             Some("svg") => "Vetores SVG (*.svg)\0*.svg\0\0",
-            Some("font") => "Fontes (*.ttf;*.otf;*.woff2)\0*.ttf;*.otf;*.woff2\0\0",
+            // Sem woff/woff2: o motor nativo (desktop) não decodifica WOFF2.
+            Some("font") => "Fontes (*.ttf;*.otf)\0*.ttf;*.otf\0\0",
             Some("model3d") => "Modelos 3D Blender / glTF (*.glb;*.gltf)\0*.glb;*.gltf\0\0",
             Some("prism") => "Pacotes PrismView (*.prism;*.widget.prism)\0*.prism\0\0",
             _ => "Mídia e Modelos 3D (*.glb;*.gltf;*.mp4;*.webm;*.png;*.jpg;*.webp;*.svg)\0*.glb;*.gltf;*.mp4;*.webm;*.mkv;*.mov;*.png;*.jpg;*.jpeg;*.webp;*.svg\0\0",
@@ -2620,7 +2517,7 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                 // Execute debounced WorkerW / multi-monitor recovery (WM_DISPLAYCHANGE / TaskbarCreated)
                 let (due_recovery, need_resync) = if let Ok(mut st) = state.lock() {
                     let worker_died = st.last_worker_w != 0
-                        && !st.monitor_wallpapers.is_empty()
+                        && !st.pinned_widgets.is_empty()
                         && !desktop_host::is_window_alive(st.last_worker_w);
                     if worker_died && st.pending_recovery_at.is_none() {
                         st.pending_recovery_at = Some(now);
@@ -2670,16 +2567,10 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                     let per_mon_vis = desktop_host::compute_monitors_visibility(&monitors, studio_hwnd);
                     let any_desktop_vis = per_mon_vis.values().any(|&v| v);
 
-                    let (manual_paused, wp_windows, widget_labels_ready) =
+                    let (manual_paused, widget_labels_ready) =
                         if let Ok(mut st) = state.lock() {
                             st.monitor_visibility = per_mon_vis.clone();
                             st.desktop_visible = any_desktop_vis;
-                            let wps: Vec<(String, String)> = st
-                                .wallpaper_labels
-                                .iter()
-                                .filter(|(lbl, _)| st.ready_windows.contains(*lbl))
-                                .map(|(lbl, mid)| (lbl.clone(), mid.clone()))
-                                .collect();
                             let wgs: Vec<(String, i32, i32)> = st
                                 .widget_labels
                                 .iter()
@@ -2704,44 +2595,17 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                                     (lbl.clone(), fx, fy)
                                 })
                                 .collect();
-                            (st.manual_paused, wps, wgs)
+                            (st.manual_paused, wgs)
                         } else {
-                            (false, Vec::new(), Vec::new())
+                            (false, Vec::new())
                         };
 
                     // Prune stale entries from last_window_vis so closed windows never leak memory
                     let mut live_labels: HashSet<String> = HashSet::new();
-                    for (lbl, _) in &wp_windows {
-                        live_labels.insert(lbl.clone());
-                    }
                     for (lbl, _, _) in &widget_labels_ready {
                         live_labels.insert(lbl.clone());
                     }
                     last_window_vis.retain(|k, _| live_labels.contains(k));
-
-                    // Emit independent per-monitor visibility changes ONLY to affected windows
-                    for (label, mon_id) in wp_windows {
-                        let eff = !manual_paused
-                            && per_mon_vis.get(&mon_id).copied().unwrap_or(true);
-                        if last_window_vis.get(&label).copied() != Some(eff) {
-                            last_window_vis.insert(label.clone(), eff);
-                            let _ = app.emit_to(
-                                &label,
-                                "prism://visibility-changed",
-                                VisibilityEventPayload {
-                                    visible: eff,
-                                    reason: if eff {
-                                        "monitor_visible"
-                                    } else if manual_paused {
-                                        "manual_pause"
-                                    } else {
-                                        "monitor_occluded"
-                                    }
-                                    .to_string(),
-                                },
-                            );
-                        }
-                    }
 
                     for (label, fallback_x, fallback_y) in widget_labels_ready {
                         // Use real physical outer_position so HiDPI monitors match physical bounds accurately
@@ -2825,32 +2689,10 @@ fn spawn_background_monitors(app: AppHandle, state: SharedState, stop: Arc<Atomi
                             want_kbd |= st.studio_keyboard_active;
                         }
                     }
-                    let mut c_targets: Vec<(String, MonitorInfoDto)> = Vec::new();
+                    let c_targets: Vec<(String, MonitorInfoDto)> = Vec::new();
                     let mut w_snap: Vec<(String, i32, i32, bool, bool, bool)> = Vec::new();
 
                     if !st.manual_paused {
-                        for (lbl, mid) in &st.wallpaper_labels {
-                            let mon_vis = st
-                                .monitor_visibility
-                                .get(mid)
-                                .copied()
-                                .unwrap_or(true);
-                            if mon_vis && st.ready_windows.contains(lbl) {
-                                t_targets.push(lbl.clone());
-                                if st.parallax_targets.contains(lbl) {
-                                    if let Some(mon) = st.monitors.iter().find(|m| &m.id == mid) {
-                                        c_targets.push((lbl.clone(), mon.clone()));
-                                    }
-                                }
-                                let wa = st.audio_targets.contains(lbl);
-                                let wk = st.keyboard_targets.contains(lbl);
-                                if wa || wk {
-                                    r_targets.push(lbl.clone());
-                                    want_audio |= wa;
-                                    want_kbd |= wk;
-                                }
-                            }
-                        }
                         for (lbl, wid) in &st.widget_labels {
                             if !st.ready_windows.contains(lbl) {
                                 continue;
@@ -3057,6 +2899,13 @@ fn set_studio_reactive_sensors(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Sem console: `eprintln!`/pânicos vão para `%APPDATA%\PrismView\studio.log`.
+    if let Err(err) = log_file::redirect_stderr_to_file(&prismview_root_dir(), "studio.log") {
+        eprintln!("[prismview-studio] log: {err}");
+    }
+    eprintln!("[prismview-studio] início pid={} t={}", std::process::id(), atomic_fs::unix_secs());
+    // Fontes padrão no lugar antes de o motor subir (ele registra `fonts\` ao criar o renderer).
+    bundled_fonts::install(&prismview_root_dir().join("fonts"));
     desktop_host::enable_per_monitor_dpi();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let cover_dir = prismview_root_dir().join("assets");
@@ -3149,7 +2998,9 @@ pub fn run() {
                     }
                     "unlock_widgets" => unlock_all_widgets_inner(app, &st_menu),
                     "clear_wp" => {
-                        let _ = clear_wallpaper_inner(app, &st_menu, None);
+                        if let Err(err) = clear_wallpaper_inner(&st_menu) {
+                            eprintln!("[prismview-studio] limpar wallpaper: {err}");
+                        }
                     }
                     "quit_all" => {
                         flush_dirty_widget_saves(&st_menu, true);
@@ -3242,7 +3093,7 @@ pub fn run() {
                 std::thread::spawn(move || {
                     let migrating = legacy_wallpaper.is_some();
                     let result = match legacy_wallpaper {
-                        Some(project) => engine.apply_project(&project),
+                        Some(project) => engine.apply_project(&project, true).map(|_| ()),
                         None => engine.ensure_running(),
                     };
                     sync_studio_tray_visibility(&handle_for_migration, &state_for_migration);
@@ -3256,7 +3107,6 @@ pub fn run() {
                         .to_string();
                     if let Ok(mut st) = state_for_migration.lock() {
                         st.active_wallpaper = None;
-                        st.monitor_wallpapers.clear();
                         st.legacy_migration_notice = Some(notice.clone());
                         save_session_from_state(&st);
                     }
@@ -3313,10 +3163,6 @@ pub fn run() {
                     } else if let Some(wid) = st.widget_labels.remove(&label) {
                         st.dirty_widget_saves.remove(&wid);
                         st.pinned_widgets.remove(&wid);
-                        refresh_parallax_targets(&mut st);
-                    } else if st.wallpaper_labels.remove(&label).is_some() {
-                        // Keep st.monitor_wallpapers intact so explorer.exe / WorkerW crash recovery
-                        // (TaskbarCreated) and tray residency can respawn the wallpaper automatically.
                         refresh_parallax_targets(&mut st);
                     }
                 }

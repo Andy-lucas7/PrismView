@@ -801,7 +801,7 @@ pub fn materialize_assets(scene: &mut Value, data_root: &Path, cache_dir: &Path)
         used: HashSet::new(),
         warnings: Vec::new(),
     };
-    let _ = fs::create_dir_all(cache_dir);
+    crate::atomic_fs::log_io("create_dir_all", fs::create_dir_all(cache_dir));
     if let Some(bg) = scene.get_mut("background") {
         if matches!(text(bg, "type"), "IMAGE" | "VIDEO") {
             st.field(bg, "path");
@@ -817,7 +817,7 @@ pub fn materialize_assets(scene: &mut Value, data_root: &Path, cache_dir: &Path)
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !st.used.contains(&name) {
-                let _ = fs::remove_file(entry.path());
+                crate::atomic_fs::log_io("remove_file", fs::remove_file(entry.path()));
             }
         }
     }
@@ -894,11 +894,11 @@ impl AssetState {
             path = self.data_root.join(&path);
         }
         let Ok(meta) = fs::metadata(&path) else {
-            self.warnings.push(format!("arquivo ausente: {local}"));
+            self.warnings.push(format!("Arquivo não encontrado: {local}"));
             return None;
         };
         if !meta.is_file() {
-            self.warnings.push(format!("não é arquivo: {local}"));
+            self.warnings.push(format!("Caminho não é um arquivo: {local}"));
             return None;
         }
         let abs = fs::canonicalize(&path).map(strip_verbatim).unwrap_or(path);

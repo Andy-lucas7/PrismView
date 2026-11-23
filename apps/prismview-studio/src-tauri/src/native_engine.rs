@@ -207,7 +207,7 @@ pub fn set_autostart_opt_out(opt_out: bool) {
             eprintln!("[native_engine] autostart_opt_out: {e}");
         }
     } else {
-        let _ = fs::remove_file(marker);
+        crate::atomic_fs::log_io("remove_file", fs::remove_file(marker));
     }
 }
 
@@ -261,7 +261,7 @@ fn remove_persisted_widget(id: &str) -> Result<(), String> {
                 list.retain(|w| w.get("id").and_then(Value::as_str) != Some(id));
                 let empty = list.is_empty();
                 if empty {
-                    let _ = fs::remove_file(&path);
+                    crate::atomic_fs::log_io("remove_file", fs::remove_file(&path));
                 } else {
                     let bytes = serde_json::to_vec_pretty(&v).map_err(|e| e.to_string())?;
                     crate::atomic_fs::write_atomic(&path, &bytes, false)
@@ -270,7 +270,7 @@ fn remove_persisted_widget(id: &str) -> Result<(), String> {
             }
         }
     }
-    let _ = fs::remove_file(dir.join(WIDGET_SCENES_DIR).join(format!("{id}.json")));
+    crate::atomic_fs::log_io("remove_file", fs::remove_file(dir.join(WIDGET_SCENES_DIR).join(format!("{id}.json"))));
     Ok(())
 }
 
@@ -374,8 +374,9 @@ fn schedule_background_archive(engine: &SharedEngine, project: Value) {
 impl NativeEngine {
     /// Fluxo "Aplicar no Desktop": converte o projeto, materializa assets (hardlink/cache), grava a
     /// cena ativa atomicamente, garante o motor no ar e manda `LOAD_SCENE_FILE` na hora (< 300ms).
-    /// O pacote `.prism` em `packages/` é atualizado depois em background sem travar a UI.
-    pub fn apply_project(self: &Arc<Self>, project: &Value) -> Result<(), String> {
+    /// O pacote `.prism` em `packages/` é atualizado depois em background sem travar a UI, só
+    /// quando `archive` (Aplicar explícito; o autosave não re-zipa). Devolve avisos para a UI.
+    pub fn apply_project(self: &Arc<Self>, project: &Value, archive: bool) -> Result<Vec<String>, String> {
         let _guard = self
             .apply_lock
             .lock()
@@ -386,7 +387,8 @@ impl NativeEngine {
         //     (a cena ativa não depende de onde o Estúdio guardou os arquivos).
         let state = state_dir()?;
         let data_root = state.parent().map(Path::to_path_buf).unwrap_or_else(|| state.clone());
-        for warning in crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets")) {
+        let warnings = crate::native_scene::materialize_assets(&mut scene, &data_root, &state.join("assets"));
+        for warning in &warnings {
             eprintln!("[native_engine] {warning}");
         }
         // 2) Cena ativa: escrita atômica (tmp + rename) para o motor nunca ler pela metade.
@@ -402,8 +404,10 @@ impl NativeEngine {
         }))?;
         drop(_guard);
         // 4) Atualiza o `.prism` otimizado em `packages/` fora do caminho crítico.
-        schedule_background_archive(self, project.clone());
-        Ok(())
+        if archive {
+            schedule_background_archive(self, project.clone());
+        }
+        Ok(warnings)
     }
 
     /// Entrega 3 — widget nativo (janela DirectComposition no motor, sem WebView2). Converte e
@@ -479,7 +483,7 @@ impl NativeEngine {
             remove_persisted_widget(id)?;
         }
         if let Ok(state) = state_dir() {
-            let _ = fs::remove_dir_all(state.join("assets").join("widgets").join(id));
+            crate::atomic_fs::log_io("remove_dir_all", fs::remove_dir_all(state.join("assets").join("widgets").join(id)));
         }
         Ok(())
     }
@@ -690,7 +694,7 @@ pub async fn native_engine_apply(
     project: Value,
 ) -> Result<Value, String> {
     blocking(&engine, move |e| {
-        e.apply_project(&project)?;
+        e.apply_project(&project, true)?;
         Ok(e.status())
     })
     .await

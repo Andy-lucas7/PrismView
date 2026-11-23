@@ -1297,7 +1297,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         ? ".svg"
         : kind === "model3d"
         ? ".glb,.gltf"
-        : ".ttf,.otf,.woff2";
+        : ".ttf,.otf";
     input.onchange = async () => {
       const f = input.files?.[0];
       if (!f) return;

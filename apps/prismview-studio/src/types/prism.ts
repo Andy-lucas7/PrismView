@@ -441,9 +441,10 @@ export interface RuntimeState {
   pinned_widget_ids: string[];
   locked_widget_ids: string[];
   monitors?: MonitorInfoDto[];
-  monitor_wallpapers?: Record<string, string>;
   /** Migração automática de wallpaper legado (WebView) falhou; precisa reaplicar no motor nativo. */
   legacy_migration_notice?: string | null;
+  /** Avisos do último "Aplicar" (arquivo ausente etc.). */
+  warnings?: string[];
 }
 
 /** Projeto que não pôde ser lido (`list_projects`). `restored`: o `.bak` entrou no lugar. */

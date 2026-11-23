@@ -23,6 +23,7 @@
 
 mod composition;
 mod desktop_hit;
+pub mod log_file;
 pub mod event_loop;
 pub mod fonts;
 pub mod monitors;
