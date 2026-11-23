@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
-import { AnimatePresence, motion, MotionConfig } from "framer-motion";
+import { AnimatePresence, animate, motion, MotionConfig, useMotionValue, useReducedMotion, useTransform } from "framer-motion";
 import {
   Box,
   ChevronDown,
@@ -61,6 +61,7 @@ const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
 import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
 import { HubLayout, readHubView, writeHubView, type HubView } from "./components/hub/HubLayout";
+import { StudioHero, type HeroRect } from "./components/hub/StudioHero";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -68,7 +69,7 @@ import {
   type PowerPreference,
   usePowerState,
 } from "./engine/powerGovernor";
-import { applyMotionCssVars } from "./engine/motion";
+import { DURATION, EASE, SPRING, applyMotionCssVars, sec } from "./engine/motion";
 
 function useLiveTelemetry(): LiveTelemetry {
   const [telemetry, setTelemetry] = useState<LiveTelemetry>(DEFAULT_TELEMETRY);
@@ -495,6 +496,21 @@ const StudioHubApp: React.FC = () => {
   }, []);
   const [hubTab, setHubTab] = useState<HubTab>("WALLPAPERS");
   const [hubView, setHubView] = useState<HubView>(readHubView);
+  // ── transição Hub ⇄ Studio (card cresce até a tela cheia; ver StudioHero)
+  type StudioPhase = "idle" | "opening" | "closing";
+  const reduceMotion = Boolean(useReducedMotion());
+  const [phase, setPhase] = useState<StudioPhase>("idle");
+  const phaseRef = useRef<StudioPhase>("idle");
+  const pendingCloseRef = useRef(false);
+  const closeStudioRef = useRef<() => void>(() => {});
+  const [hero, setHero] = useState<{ project: PrismProject; rect: HeroRect | null; innerRect: HeroRect | null } | null>(null);
+  const [hubFocusId, setHubFocusId] = useState<string | null>(null);
+  const heroP = useMotionValue(0);
+  const heroOpacity = useMotionValue(0);
+  const hubOpacity = useTransform(heroP, (v) => {
+    const t = Math.min(1, v / 0.6);
+    return 1 - t * t * (3 - 2 * t);
+  });
   const changeHubView = useCallback((v: HubView) => {
     setHubView(v);
     writeHubView(v);
@@ -1314,7 +1330,7 @@ const StudioHubApp: React.FC = () => {
       }
     });
     if (!out.proj) return;
-    if (openInStudio) setEditing(out.proj);
+    if (openInStudio) openStudio(out.proj);
     else await applyWallpaper(out.proj);
   };
 
@@ -1354,14 +1370,14 @@ const StudioHubApp: React.FC = () => {
       }
     });
     if (!out.proj) return;
-    if (openInStudio) setEditing(out.proj);
+    if (openInStudio) openStudio(out.proj);
     else await applyWallpaper(out.proj);
   };
 
   const createNew3DWallpaper = async () => {
     const created = createPure3DProject(`Cena 3D ${wallpapers.length + 1}`, "");
     await persistProjectImmediate(created);
-    setEditing(created);
+    openStudio(created);
   };
 
   const createNew = async (kind: "WALLPAPER" | "WIDGET") => {
@@ -1374,7 +1390,7 @@ const StudioHubApp: React.FC = () => {
       packageType: kind,
     };
     await persistProjectImmediate(created);
-    setEditing(created);
+    openStudio(created);
   };
 
   const addMissingDefaultPresets = async (kind: "WALLPAPER" | "WIDGET") => {
@@ -1594,9 +1610,123 @@ const StudioHubApp: React.FC = () => {
     return 16 / 9;
   }, [monitors]);
 
-  if (editing) {
-    return (
-      <div className="w-screen h-screen bg-black text-white overflow-hidden">
+  /** Executa `fn` após `n` quadros (garante que o React já pintou o que acabou de montar). */
+  function afterFrames(n: number, fn: () => void): void {
+    if (n <= 0) fn();
+    else requestAnimationFrame(() => afterFrames(n - 1, fn));
+  }
+  function cardRects(id: string): { rect: HeroRect | null; innerRect: HeroRect | null } {
+    const sel = (k: string) => document.querySelector(`[data-hub-${k}="${CSS.escape(id)}"]`) as HTMLElement | null;
+    const card = sel("card");
+    const inner = sel("inner");
+    const conv = (el: HTMLElement | null): HeroRect | null => {
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return r.width > 8 && r.height > 8 ? { left: r.left, top: r.top, width: r.width, height: r.height } : null;
+    };
+    return { rect: conv(card), innerRect: conv(inner) };
+  }
+  const heroEase = { ...SPRING.expand, restDelta: 0.0008, restSpeed: 0.02 };
+
+  /** Abre o Studio: o card cresce até preencher a tela; só então o Studio monta e o hero some em fade. */
+  function openStudio(project: PrismProject): void {
+    if (phaseRef.current !== "idle") return;
+    phaseRef.current = "opening";
+    setPhase("opening");
+    setHubFocusId(project.id);
+    const { rect, innerRect } = cardRects(project.id);
+    const finish = () => {
+      heroP.set(0);
+      setHero(null);
+      phaseRef.current = "idle";
+      setPhase("idle");
+      if (pendingCloseRef.current) {
+        pendingCloseRef.current = false;
+        afterFrames(1, () => closeStudioRef.current());
+      }
+    };
+    if (!rect || reduceMotion) {
+      // Sem card visível (criar/importar) ou movimento reduzido: Hub some em fade, Studio entra em fade.
+      animate(heroP, 1, { duration: sec(DURATION.base), ease: [...EASE.emphasized] }).then(() => {
+        setEditing(project);
+        afterFrames(1, finish);
+      });
+      return;
+    }
+    setHero({ project, rect, innerRect });
+    heroP.set(0);
+    heroOpacity.set(0);
+    afterFrames(2, () => {
+      animate(heroOpacity, 1, { duration: sec(DURATION.instant) });
+      animate(heroP, 1, heroEase).then(() => {
+        setEditing(project); // monta o Studio por baixo do hero já em tela cheia
+        afterFrames(2, () =>
+          window.setTimeout(() => {
+            animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
+          }, DURATION.fast)
+        );
+      });
+    });
+  }
+
+  /** Fecha o Studio: o hero cobre a tela e encolhe de volta até o card (que pode ter mudado de lugar). */
+  function closeStudio(): void {
+    if (phaseRef.current !== "idle") {
+      pendingCloseRef.current = true; // Voltar durante a abertura: executa assim que ela terminar
+      return;
+    }
+    if (!editing) return;
+    const proj = editing;
+    setEditingTxActive(false);
+    void flushPendingSave();
+    phaseRef.current = "closing";
+    setPhase("closing");
+    setHubFocusId(proj.id);
+    const finish = () => {
+      setHero(null);
+      phaseRef.current = "idle";
+      setPhase("idle");
+    };
+    if (reduceMotion) {
+      heroP.set(1);
+      setEditing(null);
+      afterFrames(1, () => animate(heroP, 0, { duration: sec(DURATION.base), ease: [...EASE.emphasized] }).then(finish));
+      return;
+    }
+    setHero({ project: proj, rect: null, innerRect: null });
+    heroP.set(1);
+    heroOpacity.set(0);
+    afterFrames(2, () => {
+      animate(heroOpacity, 1, { duration: sec(DURATION.instant) }).then(() => {
+        setHubTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
+        setEditing(null); // desmonta o Studio (coberto) e monta o Hub por baixo
+        afterFrames(3, () => {
+          let { rect, innerRect } = cardRects(proj.id);
+          if (!rect) {
+            const w = window.innerWidth * 0.46;
+            const h = window.innerHeight * 0.46;
+            rect = { left: (window.innerWidth - w) / 2, top: (window.innerHeight - h) / 2, width: w, height: h };
+          }
+          setHero({ project: proj, rect, innerRect });
+          afterFrames(1, () => {
+            animate(heroP, 0, heroEase).then(() => {
+              animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
+            });
+          });
+        });
+      });
+    });
+  }
+
+  closeStudioRef.current = closeStudio;
+
+  const studioTree = editing ? (
+      <motion.div
+        className="fixed inset-0 z-[10] h-screen w-screen overflow-hidden bg-black text-white"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: sec(DURATION.fast), ease: [...EASE.decelerate] }}
+      >
         <StudioEditor
           project={editing}
           availableWidgets={widgets}
@@ -1610,11 +1740,7 @@ const StudioHubApp: React.FC = () => {
           onSaveNow={() => {
             void flushPendingSave().then(flushFailedSaves);
           }}
-          onBack={() => {
-            setEditingTxActive(false);
-            void flushPendingSave();
-            setEditing(null);
-          }}
+          onBack={closeStudio}
           applying={busy !== null && (busy.startsWith("apply:") || busy.startsWith("pin:"))}
           exporting={busy !== null && busy.startsWith("export:")}
           onApply={() => {
@@ -1635,13 +1761,12 @@ const StudioHubApp: React.FC = () => {
           }}
         />
         <ToastOverlay message={toast} />
-      </div>
-    );
-  }
+      </motion.div>
+  ) : null;
 
   const totalTemplatesCount = templates3d.length + defaultTemplates.length;
 
-  return (
+  const hubTree = (
     <div className="relative w-screen h-screen bg-pureBlack text-white flex overflow-hidden">
       {/* Subtle Monochrome Architectural Light */}
       <div
@@ -2195,10 +2320,11 @@ const StudioHubApp: React.FC = () => {
               <HubLayout
                 view={hubView}
                 onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
                 items={filteredWallpapers}
                 getKey={(x) => x.id}
                 getAmbient={(x) => hubAmbient(x)}
-                onActivate={(x) => setEditing(x)}
+                onActivate={(x) => openStudio(x)}
                 lowPower={power.state !== "NORMAL"}
                 ariaLabel="Wallpapers"
                 renderItem={(wp) => {
@@ -2207,7 +2333,8 @@ const StudioHubApp: React.FC = () => {
                   return (
                     <article key={wp.id} className="prism-hub-card flex flex-col">
                       <div
-                        onClick={() => setEditing(wp)}
+                        data-hub-card={wp.id}
+                        onClick={() => openStudio(wp)}
                         className="relative aspect-video bg-black cursor-pointer overflow-hidden"
                       >
                         <HubThumbnail project={wp} />
@@ -2292,7 +2419,7 @@ const StudioHubApp: React.FC = () => {
                           )}
                           <button
                             type="button"
-                            onClick={() => setEditing(wp)}
+                            onClick={() => openStudio(wp)}
                             className="prism-pill-idle rounded-full py-2 text-xs flex items-center justify-center gap-1.5"
                           >
                             <Sliders className="w-3.5 h-3.5" /> Estúdio
@@ -2336,10 +2463,11 @@ const StudioHubApp: React.FC = () => {
               <HubLayout
                 view={hubView}
                 onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
                 items={filteredWidgets}
                 getKey={(x) => x.id}
                 getAmbient={(x) => hubAmbient(x)}
-                onActivate={(x) => setEditing(x)}
+                onActivate={(x) => openStudio(x)}
                 lowPower={power.state !== "NORMAL"}
                 ariaLabel="Widgets"
                 renderItem={(w) => {
@@ -2348,7 +2476,8 @@ const StudioHubApp: React.FC = () => {
                   return (
                     <article key={w.id} className="prism-hub-card flex flex-col">
                       <div
-                        onClick={() => setEditing(w)}
+                        data-hub-card={w.id}
+                        onClick={() => openStudio(w)}
                         className="relative aspect-[16/10] flex items-center justify-center p-4 cursor-pointer overflow-hidden bg-[#0D0D0F]"
                         style={{
                           backgroundImage:
@@ -2357,6 +2486,7 @@ const StudioHubApp: React.FC = () => {
                         }}
                       >
                         <div
+                          data-hub-inner={w.id}
                           className="w-full max-w-[340px]"
                           style={{ aspectRatio: `${w.widget.width} / ${w.widget.height}` }}
                         >
@@ -2461,7 +2591,7 @@ const StudioHubApp: React.FC = () => {
                           )}
                           <button
                             type="button"
-                            onClick={() => setEditing(w)}
+                            onClick={() => openStudio(w)}
                             className="prism-pill-idle rounded-full py-2 text-xs flex items-center justify-center gap-1.5"
                           >
                             <Sliders className="w-3.5 h-3.5" /> Estúdio
@@ -2516,6 +2646,7 @@ const StudioHubApp: React.FC = () => {
               <HubLayout
                 view={hubView}
                 onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
                 items={unifiedTemplates}
                 getKey={(x) => x.project.id}
                 getAmbient={(x) => hubAmbient(x.project)}
@@ -2535,7 +2666,7 @@ const StudioHubApp: React.FC = () => {
                       if (isWidgetTpl) await pinWidget(target);
                       else await applyWallpaper(target);
                     } else {
-                      setEditing(target);
+                      openStudio(target);
                     }
                   };
                   return (
@@ -2907,6 +3038,19 @@ const StudioHubApp: React.FC = () => {
       />
       <ToastOverlay message={toast} />
     </div>
+  );
+
+  const showHub = !editing || phase === "closing";
+  return (
+    <>
+      {showHub && (
+        <motion.div className="h-screen w-screen" style={{ opacity: hubOpacity, pointerEvents: phase === "idle" ? undefined : "none" }}>
+          {hubTree}
+        </motion.div>
+      )}
+      {studioTree}
+      {hero && <StudioHero project={hero.project} rect={hero.rect} innerRect={hero.innerRect} p={heroP} opacity={heroOpacity} />}
+    </>
   );
 };
 

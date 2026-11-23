@@ -48,11 +48,13 @@ export interface HubLayoutProps<T> {
   /** Economia de energia ativa (ECO/ULTRA/FROZEN): sem vidro/blur nas miniaturas. */
   lowPower?: boolean;
   ariaLabel?: string;
+  /** Card inicial do carrossel (ex.: voltar do Studio para o mesmo card). */
+  initialKey?: string;
 }
 
 /** Hub: alterna Carrossel (principal) e Grade, com troca em fade + blur. */
 export function HubLayout<T>({
-  view, onViewChange, items, getKey, renderItem, getAmbient, onActivate, lowPower = false, ariaLabel,
+  view, onViewChange, items, getKey, renderItem, getAmbient, onActivate, lowPower = false, ariaLabel, initialKey,
 }: HubLayoutProps<T>) {
   const reduced = Boolean(useReducedMotion());
   const [effectsOk, setEffectsOk] = useState(readEffects);
@@ -121,6 +123,7 @@ export function HubLayout<T>({
               effects={effects}
               onJank={onJank}
               ariaLabel={ariaLabel}
+              initialKey={initialKey}
             />
           </motion.div>
         ) : (

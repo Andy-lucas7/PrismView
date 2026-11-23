@@ -181,22 +181,29 @@ export interface ViewCarouselProps<T> {
   /** Chamado 1× quando o detector de engasgo pede para desligar efeitos. */
   onJank?: () => void;
   ariaLabel?: string;
+  /** Card central inicial (pula a animação de entrada: usado ao voltar do Studio). */
+  initialKey?: string;
 }
 
 export function ViewCarousel<T>({
-  items, getKey, renderItem, getAmbient, onActivate, effects, onJank, ariaLabel = "Views",
+  items, getKey, renderItem, getAmbient, onActivate, effects, onJank, ariaLabel = "Views", initialKey,
 }: ViewCarouselProps<T>) {
   const n = items.length;
   const reduced = Boolean(useReducedMotion());
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const pos = useMotionValue(0);
-  const [center, setCenter] = useState(0);
-  const centerRef = useRef(0);
-  const targetRef = useRef(0);
-  const activeKeyRef = useRef<string | null>(null);
+  const startIdx = useMemo(() => {
+    const i = initialKey ? items.findIndex((it) => getKey(it) === initialKey) : -1;
+    return i < 0 ? 0 : i;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const pos = useMotionValue(startIdx);
+  const [center, setCenter] = useState(startIdx);
+  const centerRef = useRef(startIdx);
+  const targetRef = useRef(startIdx);
+  const activeKeyRef = useRef<string | null>(initialKey && startIdx >= 0 && items[startIdx] !== undefined ? initialKey : null);
   const animRef = useRef<AnimationPlaybackControls | null>(null);
   const [geo, setGeo] = useState({ cardW: 560, step: 400 });
-  const enteringRef = useRef(true);
+  const enteringRef = useRef(!(initialKey && startIdx >= 0 && items[startIdx] !== undefined && getKey(items[startIdx]) === initialKey));
   const itemsRef = useRef(items);
   itemsRef.current = items;
   const nRef = useRef(n);
