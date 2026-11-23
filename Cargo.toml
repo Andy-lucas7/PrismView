@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/prismview-studio/src-tauri",
+    "crates/prism-core",
     "crates/prismview-engine",
 ]
 
@@ -30,6 +31,11 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Otimiza dependências pesadas (wgpu, wgpu-hal, glam, cosmic-text, glyphon) mesmo em `dev`,
+# mantendo compilação incremental rápida dos nossos crates e derrubando CPU em dev em ~5-10×.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

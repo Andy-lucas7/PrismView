@@ -174,8 +174,9 @@ impl MipGenerator {
         }
     }
 
-    /// Preenche os mips 1.. de `texture` a partir do mip 0 (só RGBA8/RGBA8 sRGB).
-    fn generate(
+    /// Preenche os mips 1.. de `texture` a partir do mip 0 (só RGBA8/RGBA8 sRGB). Também usado
+    /// pelas imagens 2D do compositor.
+    pub(crate) fn generate(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
@@ -376,6 +377,11 @@ pub struct GpuModel {
     /// `(primeira primitiva, quantidade)` por malha de `ModelAsset::meshes`.
     pub mesh_primitives: Vec<(u32, u32)>,
     pub materials: Vec<GpuMaterial>,
+    /// Metadados de CPU dos materiais (mesma ordem de `materials`, incluindo o padrão no fim),
+    /// para montar overrides de `dynamicTextures` por instância sem clonar o `GpuModel`.
+    pub material_data: Vec<MaterialData>,
+    /// Views das texturas do modelo (mesma ordem de `asset.textures`), para overrides parciais.
+    pub texture_views: Vec<Option<wgpu::TextureView>>,
     pub vertex_count: u32,
     _textures: Vec<wgpu::Texture>,
     /// Estimativa de VRAM (buffers + texturas).
@@ -596,11 +602,11 @@ impl GpuModel {
             .collect();
 
         // ── Materiais (+ padrão no fim) ──
-        let default = MaterialData::default();
-        let materials: Vec<GpuMaterial> = asset
-            .materials
+        let mut material_data: Vec<MaterialData> = Vec::with_capacity(asset.materials.len() + 1);
+        material_data.extend(asset.materials.iter().cloned());
+        material_data.push(MaterialData::default());
+        let materials: Vec<GpuMaterial> = material_data
             .iter()
-            .chain(std::iter::once(&default))
             .map(|m| build_material(device, ctx, m, &views))
             .collect();
 
@@ -614,6 +620,8 @@ impl GpuModel {
             primitives,
             mesh_primitives,
             materials,
+            material_data,
+            texture_views: views,
             vertex_count: u32::try_from(deform.len()).unwrap_or(u32::MAX),
             _textures: textures.into_iter().flatten().collect(),
             vram_bytes: vram,
@@ -738,19 +746,121 @@ fn resolve_slot(views: &[Option<wgpu::TextureView>], slot: Option<TextureSlot>) 
     Some((view, slot.uv_set == 1))
 }
 
+impl ModelUploadContext {
+    /// Sobe uma imagem RGBA8 sRGB (capa de mídia ou textura customizada) com cadeia completa de
+    /// mipmaps na GPU. Devolve `(texture, view, vram_bytes)`.
+    pub fn upload_rgba_srgb(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> Option<(wgpu::Texture, wgpu::TextureView, u64)> {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max_dim || height > max_dim {
+            return None;
+        }
+        let bytes_per_row = width.checked_mul(4)?;
+        let needed = (bytes_per_row as usize).checked_mul(height as usize)?;
+        if rgba.len() < needed {
+            return None;
+        }
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mip_count = 32 - width.max(height).leading_zeros();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_dynamic_texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba[..needed],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        if mip_count > 1 {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prismview_dynamic_tex_mips"),
+            });
+            self.mipgen.generate(device, &mut encoder, &texture, format, mip_count);
+            queue.submit(std::iter::once(encoder.finish()));
+        }
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let base_bytes = needed as u64;
+        let vram_bytes = base_bytes + if mip_count > 1 { base_bytes / 3 } else { 0 };
+        Some((texture, view, vram_bytes))
+    }
+
+    /// Monta um `GpuMaterial` derivado de `base`, trocando `t_base` (e `t_emissive` quando
+    /// `emissive_map` é `true`) pela textura dinâmica `dyn_view`.
+    pub fn build_material_override(
+        &self,
+        device: &wgpu::Device,
+        base: &MaterialData,
+        base_views: &[Option<wgpu::TextureView>],
+        dyn_view: &wgpu::TextureView,
+        emissive_map: bool,
+    ) -> GpuMaterial {
+        build_material_inner(device, self, base, base_views, Some((dyn_view, emissive_map)))
+    }
+}
+
 fn build_material(
     device: &wgpu::Device,
     ctx: &ModelUploadContext,
     m: &MaterialData,
     views: &[Option<wgpu::TextureView>],
 ) -> GpuMaterial {
+    build_material_inner(device, ctx, m, views, None)
+}
+
+fn build_material_inner(
+    device: &wgpu::Device,
+    ctx: &ModelUploadContext,
+    m: &MaterialData,
+    views: &[Option<wgpu::TextureView>],
+    override_tex: Option<(&wgpu::TextureView, bool)>,
+) -> GpuMaterial {
     let resolve = |slot: Option<TextureSlot>| resolve_slot(views, slot);
+    let base_slot = match override_tex {
+        Some((dyn_view, _)) => Some((dyn_view, false)),
+        None => resolve(m.base_color_tex),
+    };
+    let emissive_slot = match override_tex {
+        Some((dyn_view, true)) => Some((dyn_view, false)),
+        _ => resolve(m.emissive_tex),
+    };
     let slots = [
-        (resolve(m.base_color_tex), TEX_BASE, &ctx.white),
+        (base_slot, TEX_BASE, &ctx.white),
         (resolve(m.metallic_roughness_tex), TEX_MR, &ctx.white),
         (resolve(m.normal_tex), TEX_NORMAL, &ctx.flat_normal),
         (resolve(m.occlusion_tex), TEX_OCCLUSION, &ctx.white),
-        (resolve(m.emissive_tex), TEX_EMISSIVE, &ctx.white),
+        (emissive_slot, TEX_EMISSIVE, &ctx.white),
     ];
     let mut present = 0u32;
     let mut uv1 = 0u32;
@@ -767,12 +877,31 @@ fn build_material(
         AlphaMode::Mask => 1,
         AlphaMode::Blend => 2,
     };
+    let mut base_color = m.base_color.map(|c| finite_or(c, 1.0));
+    let mut emissive_rgb = [
+        finite_or(m.emissive[0], 0.0),
+        finite_or(m.emissive[1], 0.0),
+        finite_or(m.emissive[2], 0.0),
+    ];
+    if let Some((_, emissive_map)) = override_tex {
+        if emissive_map {
+            // Alinha ao Studio (`Scene3DLayer`): força emissão branca ≥ 1.0 para que a capa
+            // apareça como tela iluminada mesmo em materiais Blender com emissive [0,0,0].
+            let boost = emissive_rgb[0].max(emissive_rgb[1]).max(emissive_rgb[2]).max(1.0);
+            emissive_rgb = [boost, boost, boost];
+        } else if base_color[0].max(base_color[1]).max(base_color[2]) < 1e-3 {
+            // Evita capa totalmente preta quando o material original tinha baseColor [0,0,0].
+            base_color[0] = 1.0;
+            base_color[1] = 1.0;
+            base_color[2] = 1.0;
+        }
+    }
     let uniform = MaterialUniform {
-        base_color: m.base_color.map(|c| finite_or(c, 1.0)),
+        base_color,
         emissive: [
-            finite_or(m.emissive[0], 0.0),
-            finite_or(m.emissive[1], 0.0),
-            finite_or(m.emissive[2], 0.0),
+            emissive_rgb[0],
+            emissive_rgb[1],
+            emissive_rgb[2],
             finite_or(m.normal_scale, 1.0),
         ],
         params: [

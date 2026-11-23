@@ -159,6 +159,8 @@ pub struct ModelInstance {
     base_clip: Option<usize>,
     base_looping: bool,
     clip_override: Option<ClipOverride>,
+    /// `CLIP_SCRUB`: o tempo do clipe vem de um binding (fórmula/sinal), não do relógio.
+    scrub: bool,
     /// Offsets dos bindings reativos (Fase 4), refeitos a cada quadro sobre a pose animada.
     additive: AdditiveLayer,
     /// Só os bindings mudaram: desfaz (restaura a pose animada) e reaplica, sem reamostrar.
@@ -173,7 +175,13 @@ pub struct ModelInstance {
 }
 
 impl ModelInstance {
-    pub fn new(device: &wgpu::Device, kernel: &DeformKernel, model: Arc<GpuModel>, playback: &Scene3dPlayback) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        kernel: &DeformKernel,
+        model: Arc<GpuModel>,
+        playback: &Scene3dPlayback,
+        normalize_bounds: bool,
+    ) -> Self {
         let rig = &model.rig;
         let pose = rig.rest_pose.clone();
         let node_count = pose.node_count();
@@ -251,9 +259,9 @@ impl ModelInstance {
             Self::create_deform(device, kernel, &model, &job_data, out_vertices, joint_total, pose.weights.len())
         });
 
-        // ── Normalização (Box3 do modelo → 2,4 no maior eixo, centrado) ──
+        // ── Normalização (Box3 de modelos GLB → 2,4 no maior eixo, centrado; SHOWCASE fica 1:1) ──
         let bounds = rig.bounds;
-        let normalize = if bounds.is_empty() {
+        let normalize = if !normalize_bounds || bounds.is_empty() {
             Mat4::IDENTITY
         } else {
             let size = bounds.max - bounds.min;
@@ -283,6 +291,7 @@ impl ModelInstance {
             base_clip: None,
             base_looping: true,
             clip_override: None,
+            scrub: false,
             additive,
             binding_dirty: false,
             pose_layer_active: false,
@@ -403,6 +412,12 @@ impl ModelInstance {
         self.player.speed = speed;
         self.base_clip = clip;
         self.base_looping = playback.looping;
+        if self.scrub {
+            // Config nova: o binding de scrub (se ainda existir) retoma no próximo `solve`.
+            self.scrub = false;
+            self.clip_override = None;
+            self.player.clip = None;
+        }
         if self.clip_override.is_some() {
             return;
         }
@@ -433,7 +448,8 @@ impl ModelInstance {
         if self.model.rig.animations.get(clip).is_none() {
             return;
         }
-        let same = self.player.clip == Some(clip) && self.clip_override.is_some();
+        let same = self.player.clip == Some(clip) && self.clip_override.is_some() && !self.scrub;
+        self.scrub = false;
         self.clip_override = Some(ClipOverride { hold, owner });
         if same && hold {
             return; // já segurando este clipe
@@ -445,6 +461,30 @@ impl ModelInstance {
         self.pose_dirty = true;
     }
 
+    /// `CLIP_SCRUB`: posiciona `clip` em `fraction` (0..1) da duração e congela o relógio dele
+    /// (a pose segue o valor do binding: fórmula de hora/minuto, CPU, áudio...). Sem alocação;
+    /// só marca a pose se o tempo mudou de fato.
+    pub fn scrub_clip(&mut self, clip: usize, fraction: f32) {
+        let Some(duration) = self.model.rig.animations.get(clip).map(|c| c.duration) else {
+            return;
+        };
+        let f = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+        // `duration` exato reamostraria o 1º quadro em clipes de loop: fica um ε antes do fim.
+        let time = (f * duration).min((duration - 1e-4).max(0.0));
+        if !self.scrub || self.player.clip != Some(clip) {
+            self.scrub = true;
+            self.clip_override = Some(ClipOverride { hold: true, owner: None });
+            self.player.clip = Some(clip);
+            self.player.finished = false;
+            self.player.looping = false;
+            self.player.time = time;
+            self.pose_dirty = true;
+        } else if (self.player.time - time).abs() > 1e-5 {
+            self.player.time = time;
+            self.pose_dirty = true;
+        }
+    }
+
     /// Dono do override atual (`None` = sem override ou override de clique).
     pub fn override_owner(&self) -> Option<u32> {
         self.clip_override.and_then(|o| o.owner)
@@ -452,6 +492,7 @@ impl ModelInstance {
 
     /// Encerra o override e volta ao clipe base do `playback`.
     pub fn return_to_base(&mut self) {
+        self.scrub = false;
         if self.clip_override.take().is_none() {
             return;
         }
@@ -520,11 +561,14 @@ impl ModelInstance {
 
     /// Precisa de quadros contínuos (clipe tocando).
     pub fn is_animating(&self) -> bool {
-        self.player.is_playing()
+        !self.scrub && self.player.is_playing()
     }
 
     /// Avança a animação. `true` se a pose mudou.
     pub fn advance(&mut self, dt: f32) -> bool {
+        if self.scrub {
+            return self.pose_dirty; // tempo controlado pelo binding
+        }
         let duration = self
             .player
             .clip

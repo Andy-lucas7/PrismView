@@ -10,6 +10,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset", "tray-icon"] }
+tauri-plugin-single-instance = "2"
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -20,6 +21,8 @@ windows = { workspace = true, features = [
     "Storage_Streams",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_UI_Accessibility",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input",

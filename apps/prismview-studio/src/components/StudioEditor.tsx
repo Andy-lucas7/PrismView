@@ -60,10 +60,15 @@ import {
   Scene3DInspectInfo,
   Scene3DPickedPart,
   SceneLayer,
+  ImportConflictDto,
+  isImportConflict,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { friendlyError } from "../utils/friendlyError";
+import { collectOpenAppReview } from "../utils/importReview";
+import { SaveStatus, SaveStatusChip } from "./SaveStatusChip";
+import { nativeCompatIssues } from "../utils/nativeCompat";
 import {
   cloneLayerWithFreshIds,
   collectAllLayerIds,
@@ -102,12 +107,18 @@ interface StudioEditorProps {
   project: PrismProject;
   availableWidgets: PrismProject[];
   telemetry: LiveTelemetry;
+  /** Real target desktop monitor aspect ratio (defaults to 16/9) for 1:1 preview framing. */
+  monitorAspect?: number;
   onChangeProject: (next: PrismProject) => void;
   /** Live transient update path (sliders/canvas drag): skips Hub re-renders and deep 3D normalization. */
   onChangeProjectLive?: (next: PrismProject) => void;
   /** Signals active slider/canvas drag transactions so autosave & desktop sync wait for commit. */
   onTxStateChange?: (active: boolean) => void;
   onFlushSave?: () => void;
+  /** Estado do salvamento (chip no cabeçalho). */
+  saveStatus?: SaveStatus;
+  /** Ctrl+S / "Tentar de novo": grava o pendente e o que falhou. */
+  onSaveNow?: () => void;
   onBack: () => void;
   onApply: () => void;
   onExport: () => void;
@@ -151,8 +162,10 @@ function scaleLayerTree(layer: SceneLayer, f: number): SceneLayer {
     next.text = {
       ...layer.text,
       fontSize: r(layer.text.fontSize),
-      letterSpacing: r(layer.text.letterSpacing),
+      // `letterSpacing` é em `em` (já proporcional ao `fontSize`), não deve ser multiplicado por `f`.
+      letterSpacing: layer.text.letterSpacing,
       shadowBlur: r(layer.text.shadowBlur),
+      maxWidth: layer.text.maxWidth && layer.text.maxWidth > 0 ? Math.max(60, Math.round(layer.text.maxWidth * f)) : undefined,
     };
   }
   if (layer.image) next.image = { ...layer.image, borderRadius: r(layer.image.borderRadius) };
@@ -166,10 +179,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   project,
   availableWidgets,
   telemetry,
+  monitorAspect = 16 / 9,
   onChangeProject,
   onChangeProjectLive,
   onTxStateChange,
   onFlushSave,
+  saveStatus,
+  onSaveNow,
   onBack,
   onApply,
   onExport,
@@ -370,6 +386,60 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   const canvasLogicalW = project.packageType === "WIDGET" ? Math.max(160, project.widget.width) : 1920;
   const canvasLogicalH = project.packageType === "WIDGET" ? Math.max(100, project.widget.height) : 1080;
 
+  // Measure the center stage so the wallpaper/widget frame ALWAYS fits 100% inside both width & height
+  // (zero vertical clipping on 1536×864 / 125% DPI or short windows, matching exact desktop monitor aspect).
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageBounds, setStageBounds] = useState<{ w: number; h: number }>({ w: 960, h: 540 });
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const update = () => {
+      const w = Math.max(160, el.clientWidth);
+      const h = Math.max(120, el.clientHeight);
+      setStageBounds((prev) =>
+        Math.abs(prev.w - w) > 1 || Math.abs(prev.h - h) > 1 ? { w, h } : prev
+      );
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const stageFrameStyle = useMemo<React.CSSProperties>(() => {
+    const availW = Math.max(160, stageBounds.w - 24);
+    const availH = Math.max(120, stageBounds.h - 16);
+    if (project.packageType === "WIDGET") {
+      const ratio = canvasLogicalW / Math.max(1, canvasLogicalH);
+      const maxW = Math.min(680, canvasLogicalW, availW);
+      let w = maxW;
+      let h = w / ratio;
+      if (h > availH) {
+        h = availH;
+        w = h * ratio;
+      }
+      return {
+        width: `${Math.round(w)}px`,
+        height: `${Math.round(h)}px`,
+        backgroundColor: "#0e1015",
+        backgroundImage:
+          "radial-gradient(circle at 28% 24%, rgba(255,255,255,0.16) 0%, transparent 45%), radial-gradient(circle at 76% 78%, rgba(255,255,255,0.10) 0%, transparent 48%), linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px)",
+        backgroundSize: "100% 100%, 100% 100%, 24px 24px, 24px 24px",
+      };
+    }
+    const aspect = Number.isFinite(monitorAspect) && monitorAspect > 0.2 ? monitorAspect : 16 / 9;
+    let w = Math.min(1024, availW);
+    let h = w / aspect;
+    if (h > availH) {
+      h = availH;
+      w = h * aspect;
+    }
+    return {
+      width: `${Math.round(w)}px`,
+      height: `${Math.round(h)}px`,
+    };
+  }, [stageBounds.w, stageBounds.h, project.packageType, canvasLogicalW, canvasLogicalH, monitorAspect]);
+
   // Keep only IDs that still exist in project.layers (respects explicit empty selection)
   const validSelectedIds = useMemo(
     () => selectedIds.filter((id) => findLayerById(project.layers, id) !== null),
@@ -383,6 +453,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     [project.layers, primarySelectedId]
   );
   const selectedLayer = selectedLocation?.layer ?? null;
+  // O que o desktop (motor nativo) não desenha: painel no Inspetor + badge no "Aplicar".
+  const compatIssues = useMemo(() => nativeCompatIssues(project), [project]);
   const selectedParent = selectedLocation?.parent ?? null;
   const selectedLayerIdRef = useRef<string | null>(null);
   selectedLayerIdRef.current = selectedLayer?.id ?? null;
@@ -787,11 +859,18 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     try {
       const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", { kind: "prism" });
       if (!picked) return;
-      const imported = await invokeCmd<PrismProject>("import_prism_archive", {
+      // Mesmo id já na biblioteca: importa como cópia (nunca sobrescreve sem perguntar).
+      const first = await invokeCmd<PrismProject | ImportConflictDto>("import_prism_archive", {
         archivePath: picked.path,
       });
+      const imported = isImportConflict(first)
+        ? await invokeCmd<PrismProject>("import_prism_archive", { archivePath: picked.path, replace: false })
+        : first;
       if (imported?.layers) {
         importWidgetAsGroup(imported);
+        if (collectOpenAppReview(imported.layers).length > 0) {
+          flashHint('Ações "Abrir app" do pacote vieram desativadas: revise o caminho no Inspetor.');
+        }
       }
     } catch (err) {
       flashHint(friendlyError(err, "Não foi possível importar o widget."));
@@ -996,6 +1075,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     room: roomShortcuts,
     onUndo: handleUndo,
     onRedo: handleRedo,
+    onSave: onSaveNow,
     onDelete: () => deleteLayers(selectedIdsRef.current),
     onNudge: nudgeSelectedLayers,
     onCopy: handleCopy,
@@ -1230,7 +1310,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         ? ".svg"
         : kind === "model3d"
         ? ".glb,.gltf"
-        : ".ttf,.otf,.woff2";
+        : ".ttf,.otf";
     input.onchange = async () => {
       const f = input.files?.[0];
       if (!f) return;
@@ -1463,14 +1543,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
-            <button
+            <button aria-label="Trazer para frente (Ctrl+])"
               onClick={() => moveZ([layer.id], 1)}
               title="Trazer para frente (Ctrl+])"
               className="p-1 hover:text-white"
             >
               <ArrowUp className="w-3 h-3" />
             </button>
-            <button
+            <button aria-label="Enviar para trás (Ctrl+[)"
               onClick={() => moveZ([layer.id], -1)}
               title="Enviar para trás (Ctrl+[)"
               className="p-1 hover:text-white"
@@ -1495,14 +1575,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             >
               {layer.locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
             </button>
-            <button
+            <button aria-label="Duplicar (Ctrl+D)"
               onClick={() => duplicateLayers([layer.id])}
               title="Duplicar (Ctrl+D)"
               className="p-1 hover:text-white"
             >
               <Copy className="w-3 h-3" />
             </button>
-            <button
+            <button aria-label="Excluir (Del)"
               onClick={() => deleteLayers([layer.id])}
               title="Excluir (Del)"
               className="p-1 hover:text-white"
@@ -1530,21 +1610,26 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
         <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
           <button
+            type="button"
+            aria-label="Voltar ao Hub"
+            title="Voltar ao Hub"
             onClick={onBack}
             className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
           <input
+            aria-label="Nome do projeto"
             value={project.title}
             onChange={(e) => applyCoalescedChange({ ...project, title: e.target.value })}
             className="bg-transparent text-xs font-semibold text-white outline-none px-1.5 w-48"
           />
+          {saveStatus && onSaveNow && <SaveStatusChip status={saveStatus} onSaveNow={onSaveNow} />}
           <span className="px-2.5 py-1 rounded-full bg-white/10 text-[10px] uppercase tracking-wider text-[#A1A1AA]">
             {project.packageType === "WIDGET" ? ".widget.prism" : ".prism"}
           </span>
           <span className="h-4 w-px bg-white/15 mx-0.5" />
-          <button
+          <button aria-label="Desfazer (Ctrl+Z)"
             type="button"
             onClick={handleUndo}
             disabled={!history.canUndo}
@@ -1557,7 +1642,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Undo2 className="w-3.5 h-3.5" />
           </button>
-          <button
+          <button aria-label="Refazer (Ctrl+Y)"
             type="button"
             onClick={handleRedo}
             disabled={!history.canRedo}
@@ -1570,7 +1655,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Redo2 className="w-3.5 h-3.5" />
           </button>
-          <button
+          <button aria-label="Atalhos do Estúdio"
             type="button"
             onClick={() => setShortcutsOpen((v) => !v)}
             title="Atalhos do Estúdio"
@@ -1620,7 +1705,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 const active = scene3dEditMode === m.id;
                 const Icon = m.icon;
                 return (
-                  <button
+                  <button aria-label={m.title}
                     key={m.id}
                     type="button"
                     onClick={() => setViewMode(m.id)}
@@ -1646,11 +1731,25 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             {exporting ? "Exportando…" : "Exportar"}
           </button>
           <button
+            type="button"
             onClick={onApply}
             disabled={applying}
             aria-busy={applying}
-            className="prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+            title={
+              compatIssues.length > 0
+                ? `${compatIssues.length} item(ns) não aparecem no desktop (veja o Inspetor)`
+                : undefined
+            }
+            className="relative prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
           >
+            {compatIssues.length > 0 && (
+              <span
+                className="absolute -top-1.5 -right-1.5 min-w-5 h-5 px-1 rounded-full bg-amber-400 text-black text-[10px] font-semibold flex items-center justify-center"
+                aria-label={`${compatIssues.length} aviso(s) de compatibilidade`}
+              >
+                {compatIssues.length}
+              </span>
+            )}
             <Sparkles className={`w-3.5 h-3.5 ${applying ? "animate-spin" : ""}`} />
             {applying
               ? project.packageType === "WIDGET"
@@ -1884,25 +1983,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
       )}
 
-      {/* CENTER: 1:1 Unified GPU Compositor Canvas (Fixed frame — never reflows on drag) */}
-      <div className="absolute inset-0 flex items-center justify-center pt-20 pb-6 pl-[304px] pr-[380px]">
-        <div
-          className={`relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] ${
-            project.packageType === "WIDGET" ? "max-w-full" : "w-full max-w-5xl aspect-video"
-          }`}
-          style={
-            project.packageType === "WIDGET"
-              ? {
-                  width: `${Math.min(680, canvasLogicalW)}px`,
-                  aspectRatio: `${canvasLogicalW} / ${canvasLogicalH}`,
-                  backgroundColor: "#0e1015",
-                  backgroundImage:
-                    "radial-gradient(circle at 28% 24%, rgba(255,255,255,0.16) 0%, transparent 45%), radial-gradient(circle at 76% 78%, rgba(255,255,255,0.10) 0%, transparent 48%), linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.06) 1px, transparent 1px)",
-                  backgroundSize: "100% 100%, 100% 100%, 24px 24px, 24px 24px",
-                }
-              : undefined
-          }
-        >
+      {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
+      <div className="absolute inset-0 pt-20 pb-6 pl-[304px] pr-[380px]">
+        <div ref={stageRef} className="w-full h-full flex items-center justify-center">
+          <div
+            className="relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] shrink-0"
+            style={stageFrameStyle}
+          >
           <UnifiedCompositor
             project={project}
             telemetry={telemetry}
@@ -1915,14 +2002,29 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onSelectLayer={(id, modifiers) => handleSelectLayer(id, modifiers)}
             onMoveLayer={(id, x, y) => patchLayerRaw(id, (l) => ({ ...l, x, y }))}
             onMoveLayers={patchMultiplePositionsRaw}
-            onResizeLayer={(id, w, h, isText) =>
-              patchLayerRaw(id, (l) =>
-                isText && l.text
-                  ? { ...l, text: { ...l.text, fontSize: Math.max(10, Math.min(340, w)) } }
-                  : l.kind === "GROUP" && l.width > 0
-                    ? scaleLayerTree(l, w / l.width)
-                    : { ...l, width: w, height: h }
-              )
+            onResizeLayer={(id, patch) =>
+              patchLayerRaw(id, (l) => {
+                if (l.kind === "TEXT" && l.text) {
+                  const nextText = { ...l.text };
+                  if (patch.fontSize !== undefined) {
+                    nextText.fontSize = Math.max(10, Math.min(340, patch.fontSize));
+                  }
+                  if (patch.textMaxWidth === null) {
+                    delete nextText.maxWidth;
+                  } else if (patch.textMaxWidth !== undefined) {
+                    nextText.maxWidth = Math.max(60, Math.min(2400, patch.textMaxWidth));
+                  }
+                  return { ...l, text: nextText };
+                }
+                if (l.kind === "GROUP" && l.width > 0 && patch.width !== undefined) {
+                  return scaleLayerTree(l, patch.width / l.width);
+                }
+                return {
+                  ...l,
+                  width: patch.width ?? l.width,
+                  height: patch.height ?? l.height,
+                };
+              })
             }
             onDragStateChange={(dragging) => {
               if (dragging) {
@@ -1953,7 +2055,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               ).map((g) => {
                 const Icon = g.icon;
                 return (
-                  <button
+                  <button aria-label={`${g.label} (${g.key})`}
                     key={g.mode}
                     type="button"
                     onClick={() => setGizmoMode(g.mode)}
@@ -1968,7 +2070,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 );
               })}
               <span className="h-4 w-px bg-white/15 mx-1" />
-              <button
+              <button aria-label="Mostrar / ocultar grade"
                 type="button"
                 onClick={() => setShowGrid3d((v) => !v)}
                 title="Mostrar / ocultar grade"
@@ -1976,7 +2078,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Grid3x3 className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Snap (0,25 · 15° · 0,1×)"
                 type="button"
                 onClick={() => setSnap3d((v) => !v)}
                 title="Snap (0,25 · 15° · 0,1×)"
@@ -1984,7 +2086,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Magnet className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Focar objeto selecionado (F)"
                 type="button"
                 onClick={() => editorApiRef.current?.focusSelected()}
                 title="Focar objeto selecionado (F)"
@@ -2000,7 +2102,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 + .glb
               </button>
-              <button
+              <button aria-label="Duplicar objeto (Ctrl+D)"
                 type="button"
                 onClick={duplicateRoomObject}
                 disabled={!selected3dObjectId}
@@ -2009,7 +2111,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Copy className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Excluir objeto (Del)"
                 type="button"
                 onClick={removeRoomObject}
                 disabled={!selected3dObjectId}
@@ -2018,7 +2120,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
-              <button
+              <button aria-label="Mostrar / ocultar esqueleto do objeto selecionado"
                 type="button"
                 onClick={() => setShowSkeleton3d((v) => !v)}
                 title="Mostrar / ocultar esqueleto do objeto selecionado"
@@ -2069,7 +2171,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               >
                 + Interagir com esta parte
               </button>
-              <button
+              <button aria-label="Limpar seleção da parte"
                 type="button"
                 title="Limpar seleção da parte"
                 onClick={() => {
@@ -2118,11 +2220,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               )}
             </div>
           )}
+          </div>
         </div>
       </div>
 
       {/* RIGHT PANEL: Clean Tabbed Minimalist Inspector */}
       <StudioInspector
+        compatIssues={compatIssues}
         project={project}
         mode={inspectorMode}
         onModeChange={setInspectorMode}

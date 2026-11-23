@@ -214,6 +214,18 @@ impl LayerBindingSolver {
         self.animating
     }
 
+    /// `true` se as molas estão ativas e a camada `layer_id` possui algum binding ativo.
+    #[inline]
+    pub fn is_layer_animating(&self, layer_id: &str) -> bool {
+        self.animating && self.bindings.iter().any(|b| b.layer_id == layer_id)
+    }
+
+    /// A camada tem algum binding (mesmo com delta nulo agora).
+    #[inline]
+    pub fn has_binding(&self, layer_id: &str) -> bool {
+        self.bindings.iter().any(|b| b.layer_id == layer_id)
+    }
+
     /// Delta atual da camada (`None` = sem binding ou delta nulo).
     #[inline]
     pub fn fx(&self, layer_id: &str) -> Option<LayerFx> {
@@ -282,5 +294,23 @@ mod tests {
             s.solve(&snap, 1.0 / 60.0);
         }
         assert!(s.fx("L").is_none());
+    }
+
+    #[test]
+    fn layer_animating_tracks_active_parallax() {
+        let mut s = LayerBindingSolver::new();
+        s.set_specs(&[serde_json::json!({
+            "id": "p", "layerId": "clock", "source": "CURSOR_X", "target": "OFFSET_X",
+            "strength": 18.0, "smoothing": 0.12
+        })]);
+        let mut snap = SignalSnapshot::default();
+        snap.cursor_norm = [1.0, 0.0];
+        assert!(s.solve(&snap, 1.0 / 60.0));
+        assert!(s.is_layer_animating("clock"));
+        assert!(!s.is_layer_animating("date"));
+        for _ in 0..300 {
+            s.solve(&snap, 1.0 / 60.0);
+        }
+        assert!(!s.is_layer_animating("clock"));
     }
 }

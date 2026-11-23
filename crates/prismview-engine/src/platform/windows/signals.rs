@@ -30,9 +30,21 @@ pub(crate) const SIG_SESSION: u32 = 1 << 5;
 pub(crate) const SIG_WAKE: u32 = 1 << 6;
 /// `WM_PAINT` numa janela de wallpaper: o renderer deve apresentar um frame.
 pub(crate) const SIG_REPAINT: u32 = 1 << 7;
+/// Clique direito no ícone da bandeja: abrir menu de contexto fora do wndproc.
+pub(crate) const SIG_TRAY_MENU: u32 = 1 << 8;
+/// Duplo clique esquerdo no ícone da bandeja: abrir/focar o PrismView Studio.
+pub(crate) const SIG_TRAY_OPEN: u32 = 1 << 9;
+/// `TaskbarCreated` recebido: restaurar ícone da bandeja se visível.
+pub(crate) const SIG_TASKBAR_CREATED: u32 = 1 << 10;
+
+/// Um widget nativo terminou de ser arrastado ou mudou de DPI: reler as posições.
+pub(crate) const SIG_WIDGET_MOVED: u32 = 1 << 11;
+/// Clique solto dentro de um widget nativo (ponto em `WIDGET_CLICK`).
+pub(crate) const SIG_WIDGET_CLICK: u32 = 1 << 12;
 
 /// Bits que o loop entrega direto ao handler (não viram `DesktopEvent`).
-pub(crate) const LOOP_SIGNALS: u32 = SIG_WAKE | SIG_REPAINT;
+pub(crate) const LOOP_SIGNALS: u32 =
+    SIG_WAKE | SIG_REPAINT | SIG_TRAY_MENU | SIG_TRAY_OPEN | SIG_WIDGET_MOVED | SIG_WIDGET_CLICK;
 
 // ───────────── Timers (id = índice em DEBOUNCE_MS) ─────────────
 
@@ -51,6 +63,19 @@ thread_local! {
     static TASKBAR_CREATED_MSG: Cell<u32> = const { Cell::new(0) };
     /// > 0 enquanto o próprio host destrói janelas (WM_DESTROY esperado).
     static EXPECTED_DESTROY: Cell<u32> = const { Cell::new(0) };
+    /// Último clique em widget: (hwnd, x, y) em px do cliente (o mais recente vence).
+    static WIDGET_CLICK: Cell<(isize, i32, i32)> = const { Cell::new((0, 0, 0)) };
+}
+
+/// `WM_LBUTTONUP` num widget travado: guarda o ponto e sinaliza o loop.
+pub(crate) fn widget_clicked(hwnd: HWND, x: i32, y: i32) {
+    let _ = WIDGET_CLICK.try_with(|c| c.set((hwnd.0 as isize, x, y)));
+    raise(SIG_WIDGET_CLICK);
+}
+
+/// Retira o clique pendente (hwnd 0 = nenhum).
+pub(crate) fn take_widget_click() -> (isize, i32, i32) {
+    WIDGET_CLICK.try_with(|c| c.replace((0, 0, 0))).unwrap_or((0, 0, 0))
 }
 
 #[inline]

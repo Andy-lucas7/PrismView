@@ -1,8 +1,10 @@
-E3-L3 OK (gate ts: 0 erros novos).
-- Novo `engine/scene3d/modelTree.ts` (só importado pelo chunk do editor): `getModelTree(idx)` (WeakMap por `ModelSceneIndex`, nós `{id,name,type bone|mesh|group,depth,parentId,children,morphs,materials}`; `id` = índice pré-ordem em `flat`), `getTreeNodeObject(idx,id)`.
-- `scene3dEditorTools.ts`: host ganhou `getModelIndex`; sessão ganhou `setSkeleton` (SkeletonHelper do objeto selecionado, religado se o modelo recarrega, `dispose` ao desligar/sair), `getObjectTree`, `highlightNode` (1 `Box3Helper` reutilizado, osso sem geometria = cubo 0.08).
-- `Scene3DLayer`: `Scene3DEditorApi.getObjectTree/highlightNode`; props `showSkeleton`, `onEditorSync` (dispara ao criar o editor e a cada (re)load de modelo). `Room3DEditBinding` (UnifiedCompositor) ganhou `showSkeleton`/`onEditorSync`.
-- `StudioEditor`: `outlinerRev` + `bumpOutlinerRev`; botão Esqueleto agora funcional. `StudioInspector`: props `room3dMode/editorApiRef/outlinerRev`; seção "Ossos & Peças" (só objeto GLB) usa novo `components/Scene3DOutliner.tsx` (busca, colapsar, janela virtual >300 linhas, clique = destaque; limpa destaque ao trocar objeto/desmontar).
-- Árvore só existe em ROOM (API do editor); fora dele o inspetor mostra aviso. Esqueleto = só objeto selecionado.
-- E3-L4: Alt+Clique pode reusar `highlightNode`/`getObjectTree` (id de nó → nome em `tree.flat[id].name`); não há ainda mapeamento clique→nodeId (usar `matchesMeshTarget`/raycast em `engine.pick`).
-- Não testado em runtime (precisa .glb esquelético na máquina).
+E3-L6 revisão final concluída (gates ts/rust NÃO executados por solicitação do usuário).
+Correções aplicadas na auditoria geral:
+- Zero-alloc per-frame: `applyConfigCamera` em `environment.ts` (sem alocar objeto/arrays no orbit easing) e reuso de `rayHitResult` em `Scene3DLayer.tsx::performRaycastAt`.
+- Isolamento de `scene.background`: `applySceneBackground` não compartilha mais `Color` global entre múltiplas instâncias 3D.
+- Paridade TS↔Rust: `holder.updateMatrixWorld(true)` após normalização de `.glb`/procedural (corrige `nodeUnitScale` de `NODE_MOVE_OFFSET` no 1º quadro) + sincronização de hierarquia `parentId` em `Scene3DLayer.tsx` + escala mínima `0.05` alinhada no `StudioInspector`.
+- Correções de UI/HUD: `emitStats` relata `powerCapsRef.current.state` real em modo ROOM; `activeObjInfo` não cai mais nos dados do objeto 0 para objetos secundários carregando; `saveWallpaperCamera` usa `getCameraState()`.
+- `CLAUDE.md` atualizado com schema v3, modo ROOM, `backgroundMode`, câmera e novos alvos.
+Pendências para teste em máquina (Windows + GPU):
+- Rodar `node tools/autorun/gate.mjs both` (e `cargo test -p prismview-engine` / `cargo test --manifest-path apps/prismview-studio/src-tauri/Cargo.toml`) para validar TS + Rust.
+- Testar em GPU: `.glb` esquelético + morphs (Alt+Clique em osso, Esqueleto, SWING/MOVE/MORPH, chips), multi-objeto + `.prism` export/import, fundo TRANSPARENT/SOLID/ENVIRONMENT sobre vidro óptico, e wallpaper nativo no motor wgpu.

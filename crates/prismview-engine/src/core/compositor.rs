@@ -13,6 +13,7 @@
 //! `unwrap/expect`; nenhum código de SO.
 
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -218,9 +219,13 @@ struct TextureEntry {
     view: Option<wgpu::TextureView>,
     /// Muda a cada (re)associação do id a uma textura/view: chave de caches de bind group.
     version: u64,
+    /// Id estável que aponta para outra textura (frame atual de um vídeo): trocar o alvo não
+    /// muda a lista de desenho nem cria bind group. Resolvido em 1 nível.
+    alias: Option<TextureId>,
 }
 
 pub struct Compositor2D {
+    format: wgpu::TextureFormat,
     pipelines: [wgpu::RenderPipeline; BlendKind::COUNT],
     canvas_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
@@ -229,6 +234,8 @@ pub struct Compositor2D {
     free: Vec<u32>,
     max_texture_dim: u32,
     next_version: u64,
+    /// Gerador de mips (criado no 1º upload de imagem com mips).
+    mipgen: Option<crate::engine_core::scene3d::gpu_model::MipGenerator>,
 }
 
 impl Compositor2D {
@@ -287,7 +294,8 @@ impl Compositor2D {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            // Imagens têm mips (sem cintilar ao reduzir em parallax/escala); texto/vídeo têm 1.
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -334,6 +342,7 @@ impl Compositor2D {
         let pipelines = BlendKind::ALL.map(make);
 
         let mut this = Self {
+            format,
             pipelines,
             canvas_layout,
             texture_layout,
@@ -341,10 +350,15 @@ impl Compositor2D {
             textures: Vec::new(),
             free: Vec::new(),
             max_texture_dim: device.limits().max_texture_dimension_2d,
+            mipgen: None,
             next_version: 1,
         };
         this.install_white(device, queue);
         this
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
     }
 
     fn install_white(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -359,6 +373,7 @@ impl Compositor2D {
                 _owned: None,
                 view: None,
                 version: 0,
+                alias: None,
             });
         }
     }
@@ -371,13 +386,44 @@ impl Compositor2D {
     /// View da textura **própria** de `id` (imagens). `None` para ids emprestados via `bind_view`
     /// (o dono da textura entrega a view) e para ids liberados.
     pub fn texture_view(&self, id: TextureId) -> Option<&wgpu::TextureView> {
-        self.textures.get(id.0 as usize).and_then(|t| t.view.as_ref())
+        self.entry(id).and_then(|t| t.view.as_ref())
     }
 
     /// Versão atual da associação de `id` (muda quando o id passa a apontar para outra
     /// textura/view). `0` se desconhecido.
     pub fn texture_version(&self, id: TextureId) -> u64 {
-        self.textures.get(id.0 as usize).map_or(0, |t| t.version)
+        self.entry(id).map_or(0, |t| t.version)
+    }
+
+    /// Entrada de `id`, seguindo um alias (1 nível).
+    fn entry(&self, id: TextureId) -> Option<&TextureEntry> {
+        let entry = self.textures.get(id.0 as usize)?;
+        match entry.alias {
+            Some(target) => self.textures.get(target.0 as usize),
+            None => Some(entry),
+        }
+    }
+
+    /// Cria um id estável que desenha `target` (ver `set_alias`). Liberar com `release_texture`.
+    pub fn create_alias(&mut self, target: TextureId) -> TextureId {
+        let version = self.bump_version();
+        self.insert_entry(TextureEntry {
+            bind_group: None,
+            _owned: None,
+            view: None,
+            version,
+            alias: Some(target),
+        })
+    }
+
+    /// Redireciona o alias para outra textura. Sem alocação: a lista já gravada passa a desenhar
+    /// o novo alvo no próximo passe (frame de vídeo sem rebuild 2D).
+    pub fn set_alias(&mut self, alias: TextureId, target: TextureId) {
+        if let Some(slot) = self.textures.get_mut(alias.0 as usize) {
+            if slot.alias.is_some() {
+                slot.alias = Some(target);
+            }
+        }
     }
 
     /// Maior lado de textura aceito pelo device.
@@ -424,6 +470,31 @@ impl Compositor2D {
         height: u32,
         premultiplied_rgba: &[u8],
     ) -> Option<TextureId> {
+        self.create_texture_rgba_ext(device, queue, width, height, premultiplied_rgba, false)
+    }
+
+    /// Como `create_texture_rgba`, com cadeia de mips gerada na GPU (imagens estáticas: evita
+    /// cintilar quando reduzidas por escala/parallax).
+    pub fn create_texture_rgba_mipped(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        premultiplied_rgba: &[u8],
+    ) -> Option<TextureId> {
+        self.create_texture_rgba_ext(device, queue, width, height, premultiplied_rgba, true)
+    }
+
+    fn create_texture_rgba_ext(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        premultiplied_rgba: &[u8],
+        mipped: bool,
+    ) -> Option<TextureId> {
         let expected = (width as usize)
             .checked_mul(height as usize)?
             .checked_mul(4)?;
@@ -435,6 +506,7 @@ impl Compositor2D {
         {
             return None;
         }
+        let mips = if mipped { 32 - width.max(height).leading_zeros() } else { 1 };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("prismview_c2d_image"),
             size: wgpu::Extent3d {
@@ -442,11 +514,17 @@ impl Compositor2D {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: if mips > 1 {
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+            },
             view_formats: &[],
         });
         queue.write_texture(
@@ -468,6 +546,16 @@ impl Compositor2D {
                 depth_or_array_layers: 1,
             },
         );
+        if mips > 1 {
+            let mipgen = self
+                .mipgen
+                .get_or_insert_with(|| crate::engine_core::scene3d::gpu_model::MipGenerator::new(device));
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prismview_c2d_image_mips"),
+            });
+            mipgen.generate(device, &mut encoder, &texture, wgpu::TextureFormat::Rgba8Unorm, mips);
+            queue.submit(std::iter::once(encoder.finish()));
+        }
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.bind_view_group(device, &view);
         let version = self.bump_version();
@@ -476,6 +564,7 @@ impl Compositor2D {
             _owned: Some(texture),
             view: Some(view),
             version,
+            alias: None,
         }))
     }
 
@@ -512,6 +601,7 @@ impl Compositor2D {
                     slot._owned = None;
                     slot.view = None;
                     slot.version = version;
+                    slot.alias = None;
                     return id;
                 }
             }
@@ -521,6 +611,7 @@ impl Compositor2D {
             _owned: None,
             view: None,
             version,
+            alias: None,
         })
     }
 
@@ -530,11 +621,12 @@ impl Compositor2D {
             return;
         }
         if let Some(slot) = self.textures.get_mut(id.0 as usize) {
-            if slot.bind_group.is_some() || slot._owned.is_some() {
+            if slot.bind_group.is_some() || slot._owned.is_some() || slot.alias.is_some() {
                 slot.bind_group = None;
                 slot._owned = None;
                 slot.view = None;
                 slot.version = 0;
+                slot.alias = None;
                 self.free.push(id.0);
             }
         }
@@ -574,11 +666,7 @@ impl Compositor2D {
                 pass.set_pipeline(&self.pipelines[batch.blend as usize]);
                 current = Some(batch.blend);
             }
-            let Some(group) = self
-                .textures
-                .get(batch.tex.0 as usize)
-                .and_then(|t| t.bind_group.as_ref())
-            else {
+            let Some(group) = self.entry(batch.tex).and_then(|t| t.bind_group.as_ref()) else {
                 continue;
             };
             pass.set_bind_group(1, group, &[]);
@@ -628,6 +716,119 @@ impl Compositor2D {
             occlusion_query_set: None,
         });
         self.draw_with(canvas, &mut pass, on_marker);
+    }
+
+    /// Renderiza um intervalo de batches (`range`) em `view`, limpando com `clear` (ou mantendo
+    /// o conteúdo anterior com `LoadOp::Load` quando `clear` é `None`). Usado tanto no passe final
+    /// quanto na captura progressiva de múltiplos estágios de vidro intercalados com 3D/vídeo.
+    pub fn render_range_with<F>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: Option<[f32; 4]>,
+        canvas: &Canvas,
+        range: std::ops::Range<usize>,
+        mut on_marker: F,
+    ) where
+        F: FnMut(&mut wgpu::RenderPass<'_>, u32),
+    {
+        let load = match clear {
+            Some(c) => wgpu::LoadOp::Clear(wgpu::Color {
+                r: f64::from(c[0]),
+                g: f64::from(c[1]),
+                b: f64::from(c[2]),
+                a: f64::from(c[3]),
+            }),
+            None => wgpu::LoadOp::Load,
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("prismview_c2d_range_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        let end = range.end.min(canvas.batches.len());
+        let start = range.start.min(end);
+        if start >= end {
+            return;
+        }
+        pass.set_bind_group(0, &canvas.bind_group, &[]);
+        let mut current: Option<BlendKind> = None;
+        for batch in &canvas.batches[start..end] {
+            if batch.marker != NO_MARKER {
+                on_marker(&mut pass, batch.marker);
+                pass.set_bind_group(0, &canvas.bind_group, &[]);
+                current = None;
+                continue;
+            }
+            if current != Some(batch.blend) {
+                pass.set_pipeline(&self.pipelines[batch.blend as usize]);
+                current = Some(batch.blend);
+            }
+            let Some(group) = self.entry(batch.tex).and_then(|t| t.bind_group.as_ref()) else {
+                continue;
+            };
+            pass.set_bind_group(1, group, &[]);
+            pass.draw(0..4, batch.start..batch.end);
+        }
+    }
+
+    /// Renderiza em `view` tudo que aparece **antes do primeiro marcador** (fundo, gradientes,
+    /// imagem, vídeo, cena 3D e camadas abaixo do vidro) para servir de backdrop composto real
+    /// do vidro óptico (sempre opaco e 1:1 com a viewport).
+    pub fn render_before_first_marker(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        clear: [f32; 4],
+        canvas: &Canvas,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("prismview_c2d_glass_backdrop"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: f64::from(clear[0]),
+                        g: f64::from(clear[1]),
+                        b: f64::from(clear[2]),
+                        a: f64::from(clear[3]),
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if canvas.batches.is_empty() {
+            return;
+        }
+        pass.set_bind_group(0, &canvas.bind_group, &[]);
+        let mut current: Option<BlendKind> = None;
+        for batch in &canvas.batches {
+            if batch.marker != NO_MARKER {
+                break;
+            }
+            if current != Some(batch.blend) {
+                pass.set_pipeline(&self.pipelines[batch.blend as usize]);
+                current = Some(batch.blend);
+            }
+            let Some(group) = self.entry(batch.tex).and_then(|t| t.bind_group.as_ref()) else {
+                continue;
+            };
+            pass.set_bind_group(1, group, &[]);
+            pass.draw(0..4, batch.start..batch.end);
+        }
     }
 }
 
@@ -702,6 +903,30 @@ impl Scene3dPlacement {
     }
 }
 
+/// Contador global monotônico de versões de `BackdropTarget`: garante que nenhum `Canvas` novo
+/// (ex.: após `rebuild_outputs`, segundo monitor ou `render_clean_snapshot`) reutilize o mesmo
+/// `version` de um `BackdropTarget` anterior no cache de bind groups do `GlassRenderer`/`BlurPyramid`.
+static NEXT_BACKDROP_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// Estágio contíguo de marcadores de vidro em `Canvas::batches` (pré-calculado em `Canvas::flush`).
+/// Cenas com vidro antes e depois de 3D/vídeo/texto (ex.: texto de vidro atrás do 3D + relógio de
+/// vidro na frente do 3D) geram ≥2 estágios, permitindo captura progressiva do backdrop sem alocar.
+#[derive(Clone, Debug)]
+pub struct GlassStage {
+    pub pre_batches: std::ops::Range<usize>,
+    pub marker_batches: std::ops::Range<usize>,
+    pub markers: std::ops::Range<usize>,
+}
+
+/// Textura offscreen que captura o fundo composto (gradiente + imagem + vídeo + cena 3D) logo
+/// abaixo do vidro óptico desta saída. Só é alocada quando a cena contém vidro.
+pub struct BackdropTarget {
+    pub size: (u32, u32),
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub version: u64,
+}
+
 pub struct Canvas {
     viewport: (u32, u32),
     globals: wgpu::Buffer,
@@ -719,10 +944,63 @@ pub struct Canvas {
     pub built_scale: f32,
     /// Vidros ópticos desta saída (cada um é um marcador na ordem Z; ver `core::glass`).
     pub glass: Option<GlassLayer>,
+    /// Backdrop composto capturado abaixo do vidro desta saída (sob demanda).
+    pub backdrop: Option<BackdropTarget>,
+    /// Cópia de leitura do backdrop para cenas com múltiplos estágios de vidro intercalados.
+    pub backdrop_snap: Option<BackdropTarget>,
+    /// Estágios contíguos de vidro pré-calculados em `flush` (0 alocação por frame).
+    pub glass_stages: Vec<GlassStage>,
+    pub stage_markers: Vec<u32>,
+    pub post_glass_batches: std::ops::Range<usize>,
+    /// Contador do conteúdo do backdrop composto (cache do `BlurPyramid`).
+    pub backdrop_token: u64,
+    /// Último `live_token` já capturado em `backdrop`.
+    pub last_live_token: u64,
     /// Regiões tocáveis (controles de mídia) desta saída, refeitas junto com a lista.
     pub hits: super::interaction::HitMap,
     /// Camada 3D desenhada nesta saída (a primeira visível da cena), se houver.
     pub scene3d: Option<Scene3dPlacement>,
+    /// Subárvores com binding 2D (pós-ordem: filhos antes dos pais). O caminho rápido de
+    /// `scene2d` reaplica só o delta afim nas instâncias, sem refazer a lista.
+    pub bound: Vec<BoundSubtree>,
+    /// Alguma camada com binding foi pulada no rebuild (invisível/opacidade ~0): sem caminho rápido.
+    pub bound_skipped: bool,
+    /// Geração dos deltas de binding aplicada a esta lista (controlada por `scene2d`).
+    pub built_fx_gen: u64,
+    /// Marcadores (vidro) empurrados desde o `begin` (detecta subárvores "rígidas").
+    markers: u32,
+    /// `seq` de cada instância em `gpu_instances` (a ordem muda no sort do `flush`).
+    gpu_seq: Vec<u32>,
+    /// Cópia das instâncias do último `flush`: base sem deriva para os deltas.
+    base_instances: Vec<QuadInstance>,
+}
+
+/// Camada com binding 2D gravada no rebuild (ver `Canvas::bound`).
+#[derive(Clone, Debug)]
+pub struct BoundSubtree {
+    /// Id da camada (consulta ao `LayerBindingSolver`).
+    pub key: std::sync::Arc<str>,
+    /// `seq` dos itens da camada + descendentes.
+    pub seq: std::ops::Range<u32>,
+    /// Índices dos marcadores de vidro da subárvore em `GlassLayer::gpu`.
+    pub markers: std::ops::Range<usize>,
+    /// Índices das regiões tocáveis da subárvore.
+    pub hits: std::ops::Range<usize>,
+    /// Afim do pai (`m` coluna-maior, `t`).
+    pub parent_m: [f32; 4],
+    pub parent_t: [f32; 2],
+    /// Centro no espaço do pai SEM o offset do binding (px), rotação (rad) e escala sem binding.
+    pub center_base: [f32; 2],
+    pub rot_base: f32,
+    pub scale_base: f32,
+    /// Escala de UI do rebuild (offset do binding é em px lógicos).
+    pub ui: f32,
+    /// Delta do binding usado no rebuild.
+    pub fx0: super::bindings::LayerFx,
+    /// Estado "animando" no rebuild (muda o desenho do texto → exige rebuild ao virar).
+    pub moving0: bool,
+    /// Contém vidro (marcador) ou a camada 3D: posição gravada fora das instâncias.
+    pub rigid: bool,
 }
 
 impl Canvas {
@@ -748,8 +1026,169 @@ impl Canvas {
             built_size: (0, 0),
             built_scale: 0.0,
             glass: None,
+            backdrop: None,
+            backdrop_snap: None,
+            glass_stages: Vec::new(),
+            stage_markers: Vec::new(),
+            post_glass_batches: 0..0,
+            backdrop_token: 0,
+            last_live_token: u64::MAX,
             hits: super::interaction::HitMap::default(),
             scene3d: None,
+            bound: Vec::new(),
+            bound_skipped: false,
+            built_fx_gen: u64::MAX,
+            markers: 0,
+            gpu_seq: Vec::with_capacity(INITIAL_CAPACITY),
+            base_instances: Vec::with_capacity(INITIAL_CAPACITY),
+        }
+    }
+
+    /// Aloca ou reutiliza a textura de backdrop composto no tamanho `(w, h)`. Devolve `true` se
+    /// a textura foi recriada (forçando nova captura).
+    pub fn ensure_backdrop(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.backdrop.as_ref().is_some_and(|b| b.size == size) {
+            return false;
+        }
+        self.backdrop = None;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_glass_composited_backdrop"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let version = NEXT_BACKDROP_VERSION.fetch_add(1, Ordering::Relaxed);
+        self.backdrop = Some(BackdropTarget {
+            size,
+            texture,
+            view,
+            version,
+        });
+        true
+    }
+
+    /// Aloca sob demanda a cópia de leitura do backdrop para cenas com ≥2 estágios de vidro
+    /// separados por 3D/vídeo/imagem/texto.
+    pub fn ensure_backdrop_snap(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> bool {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.backdrop_snap.as_ref().is_some_and(|b| b.size == size) {
+            return false;
+        }
+        self.backdrop_snap = None;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prismview_glass_backdrop_snap"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let version = NEXT_BACKDROP_VERSION.fetch_add(1, Ordering::Relaxed);
+        self.backdrop_snap = Some(BackdropTarget {
+            size,
+            texture,
+            view,
+            version,
+        });
+        true
+    }
+
+    pub fn release_backdrop(&mut self) {
+        self.backdrop = None;
+        self.backdrop_snap = None;
+    }
+
+    /// Próximo `seq` (início/fim do intervalo de uma subárvore).
+    pub fn next_seq(&self) -> u32 {
+        self.seq
+    }
+
+    /// Marcadores empurrados desde o `begin`.
+    pub fn marker_count(&self) -> u32 {
+        self.markers
+    }
+
+    /// Volta instâncias e regiões tocáveis ao estado do último rebuild (base dos deltas).
+    pub fn reset_to_base(&mut self) {
+        if self.base_instances.len() == self.gpu_instances.len() {
+            self.gpu_instances.copy_from_slice(&self.base_instances);
+        }
+        self.hits.reset_to_base();
+    }
+
+    /// Aplica `p' = lin·p + t` (espaço de tela) às instâncias com `seq` no intervalo e às regiões
+    /// tocáveis. `false` se alguma instância tem recorte (clip) e `lin` não é identidade: o
+    /// recorte é alinhado à tela e precisa do rebuild.
+    pub fn transform_range(
+        &mut self,
+        seq: &std::ops::Range<u32>,
+        hits: &std::ops::Range<usize>,
+        lin: [f32; 4],
+        t: [f32; 2],
+    ) -> bool {
+        let pure_translation = (lin[0] - 1.0).abs() < 1e-6
+            && lin[1].abs() < 1e-6
+            && lin[2].abs() < 1e-6
+            && (lin[3] - 1.0).abs() < 1e-6;
+        for (inst, s) in self.gpu_instances.iter_mut().zip(self.gpu_seq.iter()) {
+            if !seq.contains(s) {
+                continue;
+            }
+            let c = [inst.center_half[0], inst.center_half[1]];
+            inst.center_half[0] = lin[0] * c[0] + lin[2] * c[1] + t[0];
+            inst.center_half[1] = lin[1] * c[0] + lin[3] * c[1] + t[1];
+            let b = inst.basis;
+            inst.basis = [
+                lin[0] * b[0] + lin[2] * b[1],
+                lin[1] * b[0] + lin[3] * b[1],
+                lin[0] * b[2] + lin[2] * b[3],
+                lin[1] * b[2] + lin[3] * b[3],
+            ];
+            if inst.clip[2] >= 0.0 {
+                if !pure_translation {
+                    return false;
+                }
+                inst.clip[0] += t[0];
+                inst.clip[1] += t[1];
+            }
+        }
+        self.hits.transform_range(hits.clone(), lin, t);
+        true
+    }
+
+    /// Envia as instâncias atuais (após `transform_range`) sem refazer lotes.
+    pub fn upload_instances(&self, queue: &wgpu::Queue) {
+        if !self.gpu_instances.is_empty() {
+            queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.gpu_instances));
         }
     }
 
@@ -789,6 +1228,9 @@ impl Canvas {
         self.seq = 0;
         self.hits.clear();
         self.scene3d = None;
+        self.bound.clear();
+        self.bound_skipped = false;
+        self.markers = 0;
     }
 
     /// Enfileira um quad. A ordem final é `(z, ordem de chamada)`: Z maior fica por cima.
@@ -810,6 +1252,7 @@ impl Canvas {
     pub fn push_marker(&mut self, z: u32, id: u32) {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
+        self.markers = self.markers.wrapping_add(1);
         self.items.push(DrawItem {
             z,
             seq,
@@ -835,6 +1278,7 @@ impl Canvas {
         self.items.sort_unstable_by_key(|i| (i.z, i.seq));
 
         self.gpu_instances.clear();
+        self.gpu_seq.clear();
         self.batches.clear();
         for item in &self.items {
             let index = u32::try_from(self.gpu_instances.len()).unwrap_or(u32::MAX);
@@ -849,6 +1293,7 @@ impl Canvas {
                 continue;
             }
             self.gpu_instances.push(item.inst);
+            self.gpu_seq.push(item.seq);
             match self.batches.last_mut() {
                 Some(last)
                     if last.marker == NO_MARKER
@@ -867,6 +1312,36 @@ impl Canvas {
             }
         }
 
+        self.glass_stages.clear();
+        self.stage_markers.clear();
+        let mut cursor = 0usize;
+        let total = self.batches.len();
+        while cursor < total {
+            let pre_start = cursor;
+            while cursor < total && self.batches[cursor].marker == NO_MARKER {
+                cursor += 1;
+            }
+            let pre_end = cursor;
+            if cursor >= total {
+                self.post_glass_batches = pre_start..pre_end;
+                break;
+            }
+            let mk_batch_start = cursor;
+            let mk_idx_start = self.stage_markers.len();
+            while cursor < total && self.batches[cursor].marker != NO_MARKER {
+                self.stage_markers.push(self.batches[cursor].marker);
+                cursor += 1;
+            }
+            let mk_batch_end = cursor;
+            let mk_idx_end = self.stage_markers.len();
+            self.glass_stages.push(GlassStage {
+                pre_batches: pre_start..pre_end,
+                marker_batches: mk_batch_start..mk_batch_end,
+                markers: mk_idx_start..mk_idx_end,
+            });
+            self.post_glass_batches = cursor..total;
+        }
+
         if self.gpu_instances.len() > self.capacity {
             let capacity = self.gpu_instances.len().next_power_of_two();
             let (buffer, bind_group) =
@@ -878,6 +1353,9 @@ impl Canvas {
         if !self.gpu_instances.is_empty() {
             queue.write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.gpu_instances));
         }
+        self.base_instances.clear();
+        self.base_instances.extend_from_slice(&self.gpu_instances);
+        self.hits.snapshot_base();
         let globals = GlobalsRaw {
             viewport: [self.viewport.0 as f32, self.viewport.1 as f32],
             _pad: [0.0; 2],

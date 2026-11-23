@@ -22,564 +22,14 @@ import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
 // Type-only: keeps the 3D engine in its own lazy chunk
 import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
 
-const LazyScene3DLayer = React.lazy(() => import("./Scene3DLayer"));
+import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, snapCoordinate, supportsCorsUrl } from "./UnifiedCompositorParts";
 
-/** Studio "Sala 3D" mode: routes the pointer to one 3D layer's editor and mutes 2D hit-testing */
-export interface Room3DEditBinding {
-  layerId: string;
-  selectedObjectId: string | null;
-  gizmoMode: Scene3DGizmoMode;
-  showGrid: boolean;
-  snapEnabled: boolean;
-  showSkeleton: boolean;
-  onEditorSync: () => void;
-  onSelectObject: (objectId: string | null) => void;
-  onPickPart?: (part: Scene3DPickedPart | null) => void;
-  onCommitObjectTransform: (
-    layerId: string,
-    objectId: string,
-    position: [number, number, number],
-    rotationDeg: [number, number, number],
-    scale: [number, number, number]
-  ) => void;
-  editorApiRef: React.MutableRefObject<Scene3DEditorApi | null>;
-}
-
-const loadedFontCache = new Set<string>();
-/** 2.9: in-flight font loads, so N layers sharing a font trigger ONE download */
-const fontLoadsInFlight = new Map<string, Promise<boolean>>();
-const sanitizedSvgCache = new Map<string, string>();
-
-/**
- * Strips scriptable/unsafe elements and attributes from user-supplied or imported SVG markup
- * before injecting into the privileged Tauri WebView DOM.
- */
-function sanitizeSvgMarkup(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed) return "";
-  const hit = sanitizedSvgCache.get(trimmed);
-  if (hit !== undefined) return hit;
-
-  let safe = "";
-  try {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(trimmed, "image/svg+xml");
-    const root = doc.documentElement;
-    if (!root || root.tagName.toLowerCase() !== "svg" || doc.querySelector("parsererror")) {
-      safe = "";
-    } else {
-      const blockedTags = new Set([
-        "script",
-        "foreignobject",
-        "iframe",
-        "object",
-        "embed",
-        "link",
-        "meta",
-        "audio",
-        "video",
-        "applet",
-        "base",
-      ]);
-      const cleanNode = (el: Element) => {
-        const children = Array.from(el.children);
-        for (const child of children) {
-          if (blockedTags.has(child.tagName.toLowerCase())) {
-            child.remove();
-          } else {
-            cleanNode(child);
-          }
-        }
-        for (const attr of Array.from(el.attributes)) {
-          const name = attr.name.toLowerCase();
-          const val = attr.value.trim().toLowerCase().replace(/\s+/g, "");
-          if (name.startsWith("on")) {
-            el.removeAttribute(attr.name);
-            continue;
-          }
-          if (
-            (name === "href" || name === "xlink:href" || name === "src" || name === "action") &&
-            (val.startsWith("javascript:") || val.startsWith("vbscript:") || val.startsWith("data:"))
-          ) {
-            el.removeAttribute(attr.name);
-            continue;
-          }
-          if (name === "style" && (val.includes("expression(") || val.includes("javascript:") || val.includes("url("))) {
-            el.removeAttribute(attr.name);
-          }
-        }
-      };
-      cleanNode(root);
-      safe = new XMLSerializer().serializeToString(root);
-    }
-  } catch {
-    safe = "";
-  }
-
-  if (sanitizedSvgCache.size > 64) {
-    const oldest = sanitizedSvgCache.keys().next().value;
-    if (oldest !== undefined) sanitizedSvgCache.delete(oldest);
-  }
-  sanitizedSvgCache.set(trimmed, safe);
-  return safe;
-}
-
-interface SnapAxisResult {
-  snapped: number;
-  guide: number | null;
-}
-
-function snapCoordinate(
-  rawCenter: number,
-  halfExtent: number,
-  targets: number[],
-  threshold: number
-): SnapAxisResult {
-  const probes = [
-    { offset: 0, value: rawCenter },
-    ...(halfExtent > 0.002
-      ? [
-          { offset: -halfExtent, value: rawCenter - halfExtent },
-          { offset: halfExtent, value: rawCenter + halfExtent },
-        ]
-      : []),
-  ];
-
-  let bestDist = threshold;
-  let bestCenter = rawCenter;
-  let bestGuide: number | null = null;
-
-  for (const target of targets) {
-    for (const p of probes) {
-      const dist = Math.abs(p.value - target);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestCenter = target - p.offset;
-        bestGuide = target;
-      }
-    }
-  }
-
-  return {
-    snapped: Math.max(0, Math.min(1, bestCenter)),
-    guide: bestGuide,
-  };
-}
-
-function ensureCustomFontLoaded(fontFamily: string, fontPath: string): Promise<boolean> {
-  if (!fontFamily || !fontPath) return Promise.resolve(false);
-  const key = `${fontFamily}|${fontPath}`;
-  if (loadedFontCache.has(key)) return Promise.resolve(false);
-  const inFlight = fontLoadsInFlight.get(key);
-  if (inFlight) return inFlight;
-  const p = (async () => {
-    try {
-      const url = resolveMediaUrl(fontPath);
-      if (!url) return false;
-      const safeFamily = fontFamily.replace(/"/g, "");
-      const face = new FontFace(safeFamily, `url("${url}")`);
-      const loaded = await face.load();
-      document.fonts.add(loaded);
-      loadedFontCache.add(key);
-      return true;
-    } catch {
-      return false;
-    } finally {
-      fontLoadsInFlight.delete(key);
-    }
-  })();
-  fontLoadsInFlight.set(key, p);
-  return p;
-}
-
-function hexToRgbTuple(hex: string): [number, number, number] {
-  const clean = (hex || "#FFFFFF").replace("#", "").trim();
-  if (clean.length === 3) {
-    const r = parseInt(clean[0] + clean[0], 16);
-    const g = parseInt(clean[1] + clean[1], 16);
-    const b = parseInt(clean[2] + clean[2], 16);
-    if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) return [r, g, b];
-  } else if (clean.length >= 6) {
-    const r = parseInt(clean.slice(0, 2), 16);
-    const g = parseInt(clean.slice(2, 4), 16);
-    const b = parseInt(clean.slice(4, 6), 16);
-    if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) return [r, g, b];
-  }
-  return [255, 255, 255];
-}
-
-function colorWithAlpha(color: string, alpha?: number): string {
-  const a = alpha === undefined ? 1 : Math.max(0, Math.min(1, alpha));
-  const raw = (color || "#FFFFFF").trim();
-  if (a >= 0.999 && !raw.startsWith("#")) return raw;
-  if (raw.startsWith("#")) {
-    const [r, g, b] = hexToRgbTuple(raw);
-    return `rgba(${r}, ${g}, ${b}, ${a.toFixed(3)})`;
-  }
-  return raw;
-}
-
-function supportsCorsUrl(url: string): boolean {
-  if (!url) return false;
-  const low = url.toLowerCase();
-  return (
-    low.startsWith("http://asset.localhost") ||
-    low.startsWith("https://asset.localhost") ||
-    low.startsWith("asset:") ||
-    low.startsWith("blob:") ||
-    low.startsWith("data:") ||
-    low.startsWith("/")
-  );
-}
-
-function computeMediaDrawRect(
-  boxLeft: number,
-  boxTop: number,
-  boxW: number,
-  boxH: number,
-  srcW: number,
-  srcH: number,
-  objectFit: "cover" | "contain"
-): { drawLeft: number; drawTop: number; drawW: number; drawH: number } {
-  const safeSrcW = Math.max(1, srcW);
-  const safeSrcH = Math.max(1, srcH);
-  const safeBoxW = Math.max(1, boxW);
-  const safeBoxH = Math.max(1, boxH);
-  const mediaAspect = safeSrcW / safeSrcH;
-  const boxAspect = safeBoxW / safeBoxH;
-
-  let drawW = safeBoxW;
-  let drawH = safeBoxH;
-  if (objectFit === "cover") {
-    if (mediaAspect > boxAspect) {
-      drawH = safeBoxH;
-      drawW = safeBoxH * mediaAspect;
-    } else {
-      drawW = safeBoxW;
-      drawH = safeBoxW / mediaAspect;
-    }
-  } else {
-    if (mediaAspect > boxAspect) {
-      drawW = safeBoxW;
-      drawH = safeBoxW / mediaAspect;
-    } else {
-      drawH = safeBoxH;
-      drawW = safeBoxH * mediaAspect;
-    }
-  }
-  return {
-    drawLeft: boxLeft + (safeBoxW - drawW) * 0.5,
-    drawTop: boxTop + (safeBoxH - drawH) * 0.5,
-    drawW,
-    drawH,
-  };
-}
-
-function sceneHasAnyGlass(layers: SceneLayer[]): boolean {
-  for (const l of layers) {
-    if (l.hidden) continue;
-    if (l.glass?.enabled) return true;
-    if (l.children?.length && sceneHasAnyGlass(l.children)) return true;
-  }
-  return false;
-}
-
-function sceneHasVisibleVideo(layers: SceneLayer[]): boolean {
-  for (const l of layers) {
-    if (l.hidden) continue;
-    if (l.kind === "VIDEO" && l.video?.src) return true;
-    if (l.children?.length && sceneHasVisibleVideo(l.children)) return true;
-  }
-  return false;
-}
-
-/** True when the layer subtree never reads telemetry, the clock, media state or the backdrop stack. */
-function isLayerStatic(layer: SceneLayer): boolean {
-  if (layer.glass?.enabled) return false;
-  if (layer.fx) {
-    for (const k in layer.fx) {
-      if (layer.fx[k]?.includes("$")) return false;
-    }
-  }
-  switch (layer.kind) {
-    case "IMAGE":
-      if (layer.image?.sourceMode === "MEDIA_COVER") return false;
-      break;
-    case "SVG":
-      if (layer.clickAction === "MEDIA_PLAY_PAUSE") return false;
-      break;
-    case "TEXT":
-      if (layer.text?.content?.includes("$")) return false;
-      break;
-    case "GROUP":
-      break;
-    default:
-      return false;
-  }
-  if (layer.children?.length) {
-    for (const c of layer.children) if (!isLayerStatic(c)) return false;
-  }
-  return true;
-}
-
-interface MemoLayerNodeProps {
-  render: () => React.ReactNode;
-  deps: readonly unknown[];
-}
-
-const MemoLayerNode = React.memo(
-  function MemoLayerNode({ render }: MemoLayerNodeProps) {
-    return <>{render()}</>;
-  },
-  (prev, next) =>
-    prev.deps.length === next.deps.length && prev.deps.every((d, i) => Object.is(d, next.deps[i]))
-);
-
-function layersNeedClockTick(layers: SceneLayer[], mediaPlaying: boolean): boolean {
-  for (const l of layers) {
-    if (l.hidden) continue;
-    if (l.kind === "PROGRESS" && l.progress?.source === "MEDIA" && mediaPlaying) {
-      return true;
-    }
-    if (l.kind === "TEXT" && l.text?.content) {
-      if (/df\(/i.test(l.text.content)) return true;
-      if (mediaPlaying && /mi\(\s*(pos|pct)\s*\)/i.test(l.text.content)) return true;
-    }
-    if (l.fx) {
-      for (const expr of Object.values(l.fx)) {
-        if (expr && (/df\(/i.test(expr) || (mediaPlaying && /mi\(\s*(pos|pct)\s*\)/i.test(expr)))) {
-          return true;
-        }
-      }
-    }
-    if (l.children?.length && layersNeedClockTick(l.children, mediaPlaying)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-interface VideoElementProps {
-  src: string;
-  speed: number;
-  muted: boolean;
-  volume: number;
-  paused: boolean;
-  objectFit: "cover" | "contain";
-  clipRadius: number;
-  onMediaEl?: (el: HTMLVideoElement | null) => void;
-  onMediaReady?: () => void;
-}
-
-const RealVideoLayer: React.FC<VideoElementProps> = ({
-  src,
-  speed,
-  muted,
-  volume,
-  paused,
-  objectFit,
-  clipRadius,
-  onMediaEl,
-  onMediaReady,
-}) => {
-  const ref = useRef<HTMLVideoElement | null>(null);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
-  const url = resolveMediaUrl(src);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.playbackRate = Math.max(0.25, Math.min(3, speed || 1));
-    el.muted = muted;
-    el.volume = muted ? 0 : Math.max(0, Math.min(1, volume));
-  }, [speed, muted, volume]);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (paused) {
-      el.pause();
-    } else {
-      el.play().catch(() => {});
-    }
-  }, [paused, url]);
-
-  if (!url) {
-    return (
-      <div className="w-full h-full flex items-center justify-center bg-[#0D0D0F] border border-dashed border-white/20 text-xs text-[#A1A1AA]">
-        Selecione um arquivo .mp4 / .webm no Inspetor
-      </div>
-    );
-  }
-
-  return (
-    <video
-      ref={(el) => {
-        // 2.7: on unmount React passes null — release the decoder/buffers of the previous element
-        const prev = ref.current;
-        if (!el && prev) {
-          prev.pause();
-          prev.removeAttribute("src");
-          prev.load();
-        }
-        ref.current = el;
-        onMediaEl?.(el);
-      }}
-      src={url}
-      crossOrigin={supportsCorsUrl(url) ? "anonymous" : undefined}
-      autoPlay={!paused}
-      preload={paused ? "metadata" : "auto"}
-      loop
-      muted={muted}
-      playsInline
-      onLoadedData={(e) => {
-        if (pausedRef.current) {
-          e.currentTarget.pause();
-        } else {
-          e.currentTarget.play().catch(() => {});
-        }
-        onMediaReady?.();
-      }}
-      style={{ objectFit, borderRadius: `${clipRadius}px` }}
-      className="w-full h-full pointer-events-none"
-    />
-  );
-};
-
-/**
- * 3.5: per-layer host for the lazy 3D engine. The compositor re-renders on every telemetry (1.5 s)
- * and clock (1 s) tick; this wrapper keeps every callback identity stable (latest handlers live
- * in a ref) so the memoized Scene3DLayer only re-renders when its real inputs change.
- */
-interface Scene3DSlotProps {
-  layerId: string;
-  config: Scene3DConfig | undefined;
-  width: number;
-  height: number;
-  paused: boolean;
-  isThumbnail: boolean;
-  interactive: boolean;
-  testMode: boolean;
-  cursorNormRef?: React.RefObject<[number, number] | null>;
-  subscribeCursorTick?: (cb: () => void) => () => void;
-  subscribeCursorClick?: (cb: (x: number, y: number) => void) => () => void;
-  reactiveSignalRef?: React.RefObject<ReactiveSignal>;
-  subscribeReactiveTick?: (cb: () => void) => () => void;
-  mediaCoverPath: string;
-  mediaPlaying: boolean;
-  cpuPercent: number;
-  powerState: PowerState;
-  mediaElementsRef: React.MutableRefObject<
-    Map<string, HTMLVideoElement | HTMLImageElement | HTMLCanvasElement>
-  >;
-  setMediaRev: React.Dispatch<React.SetStateAction<number>>;
-  videoFrameTokenRef: React.MutableRefObject<number>;
-  frameTickSubsRef: React.MutableRefObject<Set<() => void>>;
-  onInspectScene3D?: (layerId: string, info: Scene3DInspectInfo) => void;
-  onHoverMesh3D?: (meshName: string | null) => void;
-  onScene3DStats?: (layerId: string, stats: Scene3DStats) => void;
-  room3d: Room3DEditBinding | null;
-}
-
-const Scene3DSlot: React.FC<Scene3DSlotProps> = (p) => {
-  const fallbackConfig = React.useMemo(() => defaultScene3D(), []);
-  const latest = useRef(p);
-  latest.current = p;
-  const { layerId } = p;
-
-  const onCanvasEl = useCallback(
-    (el: HTMLCanvasElement | null) => {
-      const l = latest.current;
-      if (el) {
-        l.mediaElementsRef.current.set(layerId, el);
-        l.setMediaRev((r) => r + 1);
-      } else {
-        l.mediaElementsRef.current.delete(layerId);
-      }
-    },
-    [layerId]
-  );
-  const onFrameReady = useCallback(() => {
-    const l = latest.current;
-    l.videoFrameTokenRef.current += 1;
-    l.frameTickSubsRef.current.forEach((cb) => cb());
-  }, []);
-  const onInspectModel = useCallback(
-    (info: Scene3DInspectInfo) => latest.current.onInspectScene3D?.(layerId, info),
-    [layerId]
-  );
-  const onHoverMesh = useCallback(
-    (name: string | null) => latest.current.onHoverMesh3D?.(name),
-    []
-  );
-  const hasStats = Boolean(p.onScene3DStats);
-  const onStats = useCallback(
-    (st: Scene3DStats) => latest.current.onScene3DStats?.(layerId, st),
-    [layerId]
-  );
-  const onCommitObjectTransform = useCallback(
-    (
-      objectId: string,
-      pos: [number, number, number],
-      rot: [number, number, number],
-      sc: [number, number, number]
-    ) => latest.current.room3d?.onCommitObjectTransform(layerId, objectId, pos, rot, sc),
-    [layerId]
-  );
-
-  // Telemetry only reaches the engine when an enabled binding reads it (3.4/3.5)
-  const bindings = p.config?.bindings;
-  const needsCpu = React.useMemo(
-    () => (bindings ?? []).some((b) => b.enabled && b.source === "CPU_USAGE"),
-    [bindings]
-  );
-  const needsMedia = React.useMemo(
-    () => (bindings ?? []).some((b) => b.enabled && b.source === "MEDIA_PLAYING"),
-    [bindings]
-  );
-
-  const room = p.room3d;
-  return (
-    <LazyScene3DLayer
-      config={p.config ?? fallbackConfig}
-      width={p.width}
-      height={p.height}
-      paused={p.paused}
-      isThumbnail={p.isThumbnail}
-      interactive={p.interactive}
-      testMode={p.testMode}
-      cursorNormRef={p.cursorNormRef}
-      subscribeCursorTick={p.subscribeCursorTick}
-      subscribeCursorClick={p.subscribeCursorClick}
-      reactiveSignalRef={p.reactiveSignalRef}
-      subscribeReactiveTick={p.subscribeReactiveTick}
-      mediaCoverPath={p.mediaCoverPath}
-      mediaPlaying={needsMedia ? p.mediaPlaying : false}
-      cpuPercent={needsCpu ? p.cpuPercent : 0}
-      onCanvasEl={onCanvasEl}
-      onFrameReady={onFrameReady}
-      onInspectModel={onInspectModel}
-      onHoverMesh={onHoverMesh}
-      powerState={p.powerState}
-      onStats={hasStats ? onStats : undefined}
-      {...(room
-        ? {
-            editMode3d: true,
-            selectedObjectId: room.selectedObjectId,
-            gizmoMode: room.gizmoMode,
-            showGrid: room.showGrid,
-            snapEnabled: room.snapEnabled,
-            showSkeleton: room.showSkeleton,
-            onEditorSync: room.onEditorSync,
-            onSelectObject: room.onSelectObject,
-            onPickPart: room.onPickPart,
-            onCommitObjectTransform,
-            editorApiRef: room.editorApiRef,
-          }
-        : null)}
-    />
-  );
+export type LayerResizePatch = {
+  width?: number;
+  height?: number;
+  fontSize?: number;
+  /** `null` volta para largura automática (sem quebra de linha) */
+  textMaxWidth?: number | null;
 };
 
 export interface UnifiedCompositorProps {
@@ -603,7 +53,7 @@ export interface UnifiedCompositorProps {
   ) => void;
   onMoveLayer?: (id: string, x: number, y: number) => void;
   onMoveLayers?: (moves: Array<{ id: string; x: number; y: number }>) => void;
-  onResizeLayer?: (id: string, width: number, height: number, isText: boolean) => void;
+  onResizeLayer?: (id: string, patch: LayerResizePatch) => void;
   onDragStateChange?: (dragging: boolean) => void;
   onInspectScene3D?: (layerId: string, info: Scene3DInspectInfo) => void;
   onHoverMesh3D?: (meshName: string | null) => void;
@@ -706,6 +156,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
 
   const dragRef = useRef<{
     mode: "MOVE" | "RESIZE";
+    resizeHandle?: "nw" | "ne" | "sw" | "se" | "w" | "e" | "n" | "s";
     id: string;
     isText: boolean;
     isTopLevel: boolean;
@@ -717,6 +168,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     startY: number;
     startW: number;
     startH: number;
+    /** Texto: fontSize inicial (px lógicos), maxWidth inicial (0 = auto) e largura renderizada inicial (px lógicos). */
+    startFont?: number;
+    startTextMaxW?: number;
+    startBoxW?: number;
+    startBoxH?: number;
+    naturalTextW?: number;
     halfW: number;
     halfH: number;
     snapTargetsX: number[];
@@ -730,6 +187,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     clientX: number;
     clientY: number;
     altKey: boolean;
+    shiftKey: boolean;
   } | null>(null);
 
   useEffect(() => {
@@ -964,15 +422,61 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         );
       }
     } else if (drag.mode === "RESIZE" && onResizeLayer) {
+      const handle = drag.resizeHandle ?? "se";
       const dxLog = (pending.clientX - drag.startClientX) / Math.max(scale, 0.05);
       const dyLog = (pending.clientY - drag.startClientY) / Math.max(scale, 0.05);
+      const signX = handle.includes("e") ? 1 : handle.includes("w") ? -1 : 0;
+      const signY = handle.includes("s") ? 1 : handle.includes("n") ? -1 : 0;
+
       if (drag.isText) {
-        const nextFont = Math.max(12, Math.min(340, Math.round(drag.startW + dxLog)));
-        onResizeLayer(drag.id, nextFont, nextFont, true);
+        const startFont = drag.startFont ?? drag.startW;
+        const startBoxW = Math.max(40, drag.startBoxW ?? 320);
+        const startBoxH = Math.max(24, drag.startBoxH ?? startFont * 1.1);
+        const startMaxW = drag.startTextMaxW ?? 0;
+
+        if (handle === "e" || handle === "w") {
+          // Alças laterais (estilo Canva): mudam APENAS a largura da caixa (quebra de linha), sem alterar a fonte.
+          const rawW = Math.max(60, Math.min(2400, Math.round(startBoxW + signX * dxLog * 2)));
+          const natW = drag.naturalTextW ?? 0;
+          // Se puxou além da largura natural em 1 linha, destrava de volta para auto-width (1 linha limpa).
+          if (natW > 0 && rawW >= natW + 12) {
+            onResizeLayer(drag.id, { textMaxWidth: null });
+          } else {
+            onResizeLayer(drag.id, { textMaxWidth: rawW });
+          }
+        } else {
+          // Alças de canto (estilo Canva): escalam proporcionalmente fonte + largura da caixa mantendo as mesmas quebras!
+          const diag = Math.hypot(startBoxW, startBoxH);
+          const proj = (signX * dxLog * 2 * startBoxW + signY * dyLog * 2 * startBoxH) / Math.max(diag, 1);
+          const ratio = Math.max(0.15, (diag + proj) / Math.max(diag, 1));
+          const nextFont = Math.max(10, Math.min(340, Math.round(startFont * ratio)));
+          if (startMaxW > 0) {
+            const actualRatio = nextFont / Math.max(startFont, 1);
+            const nextMaxW = Math.max(60, Math.min(2400, Math.round(startMaxW * actualRatio)));
+            onResizeLayer(drag.id, { fontSize: nextFont, textMaxWidth: nextMaxW });
+          } else {
+            onResizeLayer(drag.id, { fontSize: nextFont });
+          }
+        }
+      } else if (handle === "e" || handle === "w") {
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
+        onResizeLayer(drag.id, { width: nw });
+      } else if (handle === "n" || handle === "s") {
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
+        onResizeLayer(drag.id, { height: nh });
+      } else if (pending.shiftKey) {
+        // Shift no canto = redimensionamento livre nos dois eixos.
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
+        onResizeLayer(drag.id, { width: nw, height: nh });
       } else {
-        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + dxLog * 2)));
-        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + dyLog * 2)));
-        onResizeLayer(drag.id, nw, nh, false);
+        // Canto (estilo Canva): mantém a proporção exata da caixa.
+        const diag = Math.hypot(drag.startW, drag.startH);
+        const proj = (signX * dxLog * 2 * drag.startW + signY * dyLog * 2 * drag.startH) / Math.max(diag, 1);
+        const ratio = Math.max(0.1, (diag + proj) / Math.max(diag, 1));
+        const nw = Math.max(24, Math.min(2400, Math.round(drag.startW * ratio)));
+        const nh = Math.max(20, Math.min(1400, Math.round(drag.startH * ratio)));
+        onResizeLayer(drag.id, { width: nw, height: nh });
       }
     }
   };
@@ -996,6 +500,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       clientX: e.clientX,
       clientY: e.clientY,
       altKey: e.altKey,
+      shiftKey: e.shiftKey,
     };
     if (dragMoveRafRef.current === null) {
       dragMoveRafRef.current = requestAnimationFrame(() => {
@@ -1100,9 +605,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         if (coversScene && el && el.width > 1 && el.height > 1) {
           const boxLeft = full ? 0 : candidate.x * size.w - bw * 0.5;
           const boxTop = full ? 0 : candidate.y * size.h - bh * 0.5;
+          const bgMode = candidate.scene3d?.backgroundMode ?? "TRANSPARENT";
+          const underlay =
+            bgMode === "TRANSPARENT" ? computeBackdropForTopIndex(i).backdrop ?? undefined : undefined;
           return {
             backdrop: {
-              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}`,
+              key: `3d|${candidate.id}|${candidate.scene3d?.objects?.[0]?.modelSrc || "default"}|${bgMode}`,
               kind: "canvas",
               live: true,
               element: el,
@@ -1113,6 +621,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               drawW: Math.max(1, bw),
               drawH: Math.max(1, bh),
               frameToken: videoFrameTokenRef.current,
+              underlay,
             },
             hasIntermediateHtml,
           };
@@ -1748,6 +1257,9 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           const fontStack = `"${safeFamily}", "Outfit", "Inter", "Segoe UI", sans-serif`;
           const textMode = g.textMode ?? "GLYPH";
 
+          const textMaxWLog = layer.text.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : 0;
+          const textMaxWPx = textMaxWLog > 0 ? textMaxWLog * containerScale : 0;
+
           const baseTextStyle: React.CSSProperties = {
             fontFamily: fontStack,
             fontSize: `${scaledFont}px`,
@@ -1756,13 +1268,19 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             textAlign: layer.text.align,
             color: fillRgba,
             lineHeight: 1.06,
-            whiteSpace: "pre-wrap",
+            // Sem `maxWidth` explícito = largura automática em 1 linha (respeitando `\n`), sem a
+            // quebra artificial em 50% do CSS shrink-to-fit. Com `maxWidth` (alças laterais) = quebra limpa.
+            whiteSpace: textMaxWPx > 0 ? "pre-wrap" : "pre",
+            width: textMaxWPx > 0 ? `${textMaxWPx}px` : "max-content",
+            overflowWrap: textMaxWPx > 0 ? "break-word" : undefined,
             fontVariantNumeric: "tabular-nums",
             textShadow:
-              g.enabled && hasChroma
-                ? `-${chromaPx}px 0 8px rgba(255,30,66,0.42), ${chromaPx}px 0 8px rgba(0,210,255,0.46), 0 2px ${layer.text.shadowBlur}px rgba(0,0,0,0.55)`
+              glyphAlpha <= 0.002
+                ? undefined
+                : g.enabled && hasChroma
+                ? `-${chromaPx}px 0 8px rgba(255,30,66,${(0.42 * glyphAlpha).toFixed(3)}), ${chromaPx}px 0 8px rgba(0,210,255,${(0.46 * glyphAlpha).toFixed(3)}), 0 2px ${layer.text.shadowBlur}px rgba(0,0,0,${(0.55 * glyphAlpha).toFixed(3)})`
                 : layer.text.shadowBlur > 0
-                ? `0 2px ${layer.text.shadowBlur}px rgba(0,0,0,0.65)`
+                ? `0 2px ${layer.text.shadowBlur}px rgba(0,0,0,${(0.65 * glyphAlpha).toFixed(3)})`
                 : undefined,
           };
 
@@ -1819,6 +1337,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               align: layer.text.align,
               bevelPx,
               fontRev,
+              maxWidthPx: textMaxWPx > 0 ? textMaxWPx : undefined,
             });
             if (maps) {
               return (
@@ -1932,7 +1451,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           </div>
         )}
 
-        {/* Interactive Selection Box + Corner Resize Handle (pure absolute, zero layout shift) */}
+        {/* Interactive Selection Box + Canva-style Handles (corners = proportional, sides = width/height) */}
         {isSelected && !test3dMode && !roomActive && (
           <>
             <div
@@ -1942,38 +1461,153 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   : "border-white/55 border-dashed"
               }`}
             />
-            {isPrimarySelected && !layer.locked && onResizeLayer && (
-              <button
-                type="button"
-                aria-label="Redimensionar"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  e.currentTarget.setPointerCapture(e.pointerId);
-                  dragRef.current = {
-                    mode: "RESIZE",
-                    id: layer.id,
-                    isText: layer.kind === "TEXT",
-                    isTopLevel,
-                    containerW: size.w,
-                    containerH: size.h,
-                    startClientX: e.clientX,
-                    startClientY: e.clientY,
-                    startX: layer.x,
-                    startY: layer.y,
-                    startW: layer.kind === "TEXT" ? layer.text?.fontSize ?? 96 : layer.width,
-                    startH: layer.kind === "TEXT" ? layer.text?.fontSize ?? 96 : layer.height,
-                    halfW: 0,
-                    halfH: 0,
-                    snapTargetsX: [],
-                    snapTargetsY: [],
-                    moved: true,
-                    wasAlreadyInMulti: false,
-                  };
-                  onDragStateChange?.(true);
-                }}
-                className="absolute -right-2 -bottom-2 w-3.5 h-3.5 rounded-full bg-white border-2 border-black shadow-md cursor-nwse-resize z-40"
-              />
-            )}
+            {isPrimarySelected && !layer.locked && onResizeLayer && (() => {
+              const startResize = (
+                handle: "nw" | "ne" | "sw" | "se" | "w" | "e" | "n" | "s",
+                e: React.PointerEvent<HTMLButtonElement>
+              ) => {
+                e.stopPropagation();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                const el = layerElsRef.current.get(layer.id);
+                const rect = el?.getBoundingClientRect();
+                const safeScale = Math.max(containerScale, 0.05);
+                const renderedWLog = rect ? rect.width / safeScale : layer.width;
+                const renderedHLog = rect ? rect.height / safeScale : layer.height;
+                let naturalTextW = 0;
+                if (layer.kind === "TEXT" && layer.text && typeof document !== "undefined") {
+                  const probe = document.createElement("canvas").getContext("2d");
+                  if (probe) {
+                    const safeFam = (layer.text.fontFamily || "Outfit").replace(/"/g, "");
+                    probe.font = `${layer.text.fontWeight} ${layer.text.fontSize}px "${safeFam}", "Outfit", "Inter", "Segoe UI", sans-serif`;
+                    const resolvedTxt = evaluateFormula(layer.text.content, telemetry, project.globals, now);
+                    const lsPx = layer.text.letterSpacing * layer.text.fontSize;
+                    for (const ln of resolvedTxt.split("\n")) {
+                      const chars = Array.from(ln);
+                      const w =
+                        Math.abs(lsPx) >= 0.25
+                          ? chars.reduce((acc, ch, i) => acc + probe.measureText(ch).width + (i < chars.length - 1 ? lsPx : 0), 0)
+                          : probe.measureText(ln).width;
+                      naturalTextW = Math.max(naturalTextW, Math.ceil(w));
+                    }
+                  }
+                }
+                dragRef.current = {
+                  mode: "RESIZE",
+                  resizeHandle: handle,
+                  id: layer.id,
+                  isText: layer.kind === "TEXT",
+                  isTopLevel,
+                  containerW: size.w,
+                  containerH: size.h,
+                  startClientX: e.clientX,
+                  startClientY: e.clientY,
+                  startX: layer.x,
+                  startY: layer.y,
+                  startW: layer.width,
+                  startH: layer.height,
+                  startFont: layer.text?.fontSize ?? 96,
+                  startTextMaxW: layer.text?.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : 0,
+                  startBoxW: layer.kind === "TEXT"
+                    ? (layer.text?.maxWidth && layer.text.maxWidth > 0 ? layer.text.maxWidth : renderedWLog)
+                    : layer.width,
+                  startBoxH: renderedHLog,
+                  naturalTextW,
+                  halfW: 0,
+                  halfH: 0,
+                  snapTargetsX: [],
+                  snapTargetsY: [],
+                  moved: true,
+                  wasAlreadyInMulti: false,
+                };
+                onDragStateChange?.(true);
+              };
+
+              const corners: Array<{
+                id: "nw" | "ne" | "sw" | "se";
+                cls: string;
+                cursor: string;
+              }> = [
+                { id: "nw", cls: "-left-2.5 -top-2.5", cursor: "cursor-nwse-resize" },
+                { id: "ne", cls: "-right-2.5 -top-2.5", cursor: "cursor-nesw-resize" },
+                { id: "sw", cls: "-left-2.5 -bottom-2.5", cursor: "cursor-nesw-resize" },
+                { id: "se", cls: "-right-2.5 -bottom-2.5", cursor: "cursor-nwse-resize" },
+              ];
+              const showSideHorizontal = layer.kind !== "GROUP";
+              const showSideVertical = layer.kind !== "TEXT" && layer.kind !== "GROUP";
+
+              return (
+                <>
+                  {corners.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      aria-label="Redimensionar proporcionalmente"
+                      title={
+                        layer.kind === "TEXT"
+                          ? "Arraste o canto para aumentar ou diminuir o texto mantendo a proporção"
+                          : "Arraste o canto para escalar proporcionalmente (Shift = livre)"
+                      }
+                      onPointerDown={(e) => startResize(c.id, e)}
+                      className={`absolute ${c.cls} w-3 h-3 rounded-full bg-white border-2 border-black shadow-md ${c.cursor} z-40 hover:scale-125 transition-transform`}
+                    />
+                  ))}
+                  {showSideHorizontal && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label="Ajustar largura"
+                        title={
+                          layer.kind === "TEXT"
+                            ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
+                            : "Arraste para ajustar a largura"
+                        }
+                        onPointerDown={(e) => startResize("w", e)}
+                        onDoubleClick={(e) => {
+                          if (layer.kind !== "TEXT") return;
+                          e.stopPropagation();
+                          onResizeLayer(layer.id, { textMaxWidth: null });
+                        }}
+                        className="absolute -left-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                      />
+                      <button
+                        type="button"
+                        aria-label="Ajustar largura"
+                        title={
+                          layer.kind === "TEXT"
+                            ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
+                            : "Arraste para ajustar a largura"
+                        }
+                        onPointerDown={(e) => startResize("e", e)}
+                        onDoubleClick={(e) => {
+                          if (layer.kind !== "TEXT") return;
+                          e.stopPropagation();
+                          onResizeLayer(layer.id, { textMaxWidth: null });
+                        }}
+                        className="absolute -right-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                      />
+                    </>
+                  )}
+                  {showSideVertical && (
+                    <>
+                      <button
+                        type="button"
+                        aria-label="Ajustar altura"
+                        title="Arraste para ajustar a altura"
+                        onPointerDown={(e) => startResize("n", e)}
+                        className="absolute -top-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                      />
+                      <button
+                        type="button"
+                        aria-label="Ajustar altura"
+                        title="Arraste para ajustar a altura"
+                        onPointerDown={(e) => startResize("s", e)}
+                        className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                      />
+                    </>
+                  )}
+                </>
+              );
+            })()}
           </>
         )}
       </div>
@@ -2113,3 +1747,4 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     </div>
   );
 };
+export type { Room3DEditBinding } from "./UnifiedCompositorParts";

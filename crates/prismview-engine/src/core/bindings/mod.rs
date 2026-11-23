@@ -23,6 +23,7 @@ use glam::Vec3;
 
 use super::signals::{SignalKind, SignalSnapshot, SignalSource};
 
+#[allow(unused_imports)]
 pub use layers::{GlassFx, LayerBindingSolver, LayerFx};
 pub use scene3d::{BindingSolver3d, InstanceAccess, PickHit};
 
@@ -68,6 +69,9 @@ pub enum BindingInput {
     HoverMesh,
     /// Pulso/alternância a cada clique na malha `sourceNode`.
     ClickMesh,
+    /// Valor de uma fórmula FX (`$df(m)$`, `$mi(pos)$`, `$sys(cpu)$`, globais...) normalizado por
+    /// `formulaMin..formulaMax`. Avaliada pelo host só quando o contexto FX muda (nunca por quadro).
+    Formula,
 }
 
 impl BindingInput {
@@ -76,6 +80,7 @@ impl BindingInput {
             "CURSOR_LOOK" => Self::CursorLook,
             "HOVER_MESH" => Self::HoverMesh,
             "CLICK_MESH" => Self::ClickMesh,
+            "FORMULA" => Self::Formula,
             other => Self::Signal(SignalSource::parse(other)?),
         })
     }
@@ -86,6 +91,8 @@ impl BindingInput {
             Self::Signal(s) => s.kind(),
             Self::CursorLook | Self::HoverMesh => SignalKind::MOUSE,
             Self::ClickMesh => SignalKind::DESKTOP_TAP,
+            // Dependências (mídia/telemetria/relógio) são resolvidas pelo host ao avaliar a fórmula.
+            Self::Formula => SignalKind::NONE,
         }
     }
 
@@ -118,6 +125,42 @@ pub fn spring_step(value: &mut f32, target: f32, alpha: f32) -> bool {
     *value != prev
 }
 
+/// Fórmula → 0..=1: `(v - min) / (max - min)` limitado; faixa degenerada = `v` limitado a 0..1.
+/// Espelho de `formulaUnit` (Estúdio, `types/prism.ts`).
+#[inline]
+pub fn formula_unit(value: f32, min: f32, max: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let (min, max) = (
+        if min.is_finite() { min } else { 0.0 },
+        if max.is_finite() { max } else { 1.0 },
+    );
+    let span = max - min;
+    let t = if span.abs() < 1e-9 { value } else { (value - min) / span };
+    t.clamp(0.0, 1.0)
+}
+
+/// Mola com volta circular em 0..1 (`formulaWrap`): segue o caminho mais curto (59 min → 0 gira
+/// para frente, não volta a hora inteira). Devolve `true` se mudou.
+#[inline]
+pub fn spring_step_wrapped(value: &mut f32, target: f32, alpha: f32) -> bool {
+    let target = if target.is_finite() { target.rem_euclid(1.0) } else { 0.0 };
+    let prev = *value;
+    let mut delta = target - *value;
+    if delta > 0.5 {
+        delta -= 1.0;
+    } else if delta < -0.5 {
+        delta += 1.0;
+    }
+    if delta.abs() < SETTLE_EPS {
+        *value = target;
+    } else {
+        *value = (*value + delta * alpha).rem_euclid(1.0);
+    }
+    *value != prev
+}
+
 /// Valor numérico com padrão quando ausente/zero/inválido (`b.strength || padrão` do TS).
 #[inline]
 pub fn or_default(v: f32, default: f32) -> f32 {
@@ -125,5 +168,36 @@ pub fn or_default(v: f32, default: f32) -> f32 {
         v
     } else {
         default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formula_unit_maps_and_clamps() {
+        // Ponteiro de minutos: `$df(m)$` 0..60 → 0..1.
+        assert_eq!(formula_unit(15.0, 0.0, 60.0), 0.25);
+        assert_eq!(formula_unit(90.0, 0.0, 60.0), 1.0);
+        assert_eq!(formula_unit(-3.0, 0.0, 60.0), 0.0);
+        // Faixa invertida também funciona (max < min).
+        assert_eq!(formula_unit(15.0, 60.0, 0.0), 0.75);
+        // Faixa degenerada: valor já em 0..1.
+        assert_eq!(formula_unit(0.4, 5.0, 5.0), 0.4);
+        assert_eq!(formula_unit(f32::NAN, 0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn wrapped_spring_takes_short_path() {
+        // 59 min (0,983) → 0 min: anda para frente cruzando 1,0 (não volta a hora inteira).
+        let mut v = 59.0 / 60.0;
+        let alpha = spring_alpha(0.2, 0.18, 1.0 / 60.0);
+        assert!(spring_step_wrapped(&mut v, 0.0, alpha));
+        assert!(v > 59.0 / 60.0 || v < 0.01, "andou para trás: {v}");
+        for _ in 0..600 {
+            spring_step_wrapped(&mut v, 0.0, alpha);
+        }
+        assert_eq!(v, 0.0);
     }
 }

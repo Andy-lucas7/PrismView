@@ -22,6 +22,8 @@ export interface BackdropSourceInfo {
   frameToken: number;
   /** True for animated canvas backdrops (e.g. SCENE_3D) that update via shared frame ticks */
   live?: boolean;
+  /** Optional opaque background below a transparent 3D canvas (composited on GPU before blur/refraction) */
+  underlay?: BackdropSourceInfo;
 }
 
 export interface OpticalGlassRenderParams {
@@ -39,6 +41,8 @@ export interface OpticalGlassRenderParams {
   scaleY: number;
   /** Optical parameters */
   blurPx: number;
+  /** Unscaled logical blurPx (0..80) so blurMix ramp matches native engine 1:1 across viewport sizes */
+  rawBlurPx?: number;
   refractionScale: number;
   bevelPx: number;
   radiusPx: number;
@@ -56,19 +60,25 @@ export interface OpticalGlassRenderParams {
   glyphCanvas?: HTMLCanvasElement | null;
   /** Blurred heightfield for the GPU Sobel pass that builds the glyph normal map. */
   glyphHeightCanvas?: HTMLCanvasElement | null;
+  /** Heightfield blur sigma (px in heightCanvas space) for slope-invariant Sobel gain. */
+  glyphHeightSigmaPx?: number;
+  /** CSS padding around glyph box so dome curvature matches tight native glyph bounds 1:1 */
+  glyphPadPx?: number;
   glyphKey?: string;
   pigmentRgba?: [number, number, number, number];
 }
 
-/** GPU Sobel: sharp alpha + blurred height -> packed R=nx, G=ny, B=edgeSlope, A=sharpAlpha (matches the old CPU pass). */
+/** GPU Sobel: sharp alpha + blurred height -> packed R=nx, G=ny, B=edgeSlope, A=sharpAlpha (parity with native glass_glyph.wgsl). */
 const GLYPH_PACK_FRAG_SRC = `#version 300 es
 precision highp float;
 uniform sampler2D uSharp;
 uniform sampler2D uHeight;
+uniform float uBevelSigma;
 out vec4 fragColor;
 
 float H(ivec2 p, ivec2 sz) {
-  return texelFetch(uHeight, clamp(p, ivec2(0), sz - ivec2(1)), 0).a;
+  if (p.x < 0 || p.y < 0 || p.x >= sz.x || p.y >= sz.y) return 0.0;
+  return texelFetch(uHeight, p, 0).a;
 }
 
 void main() {
@@ -91,8 +101,8 @@ void main() {
   float gx = (tl + 2.0 * l + bl) - (tr + 2.0 * r + br);
   float gy = (tl + 2.0 * t + tr) - (bl + 2.0 * b + br);
   float slope = length(vec2(gx, gy));
-  if (slope > 0.004) {
-    float gain = min(1.0, slope * 2.2);
+  if (slope > 0.002) {
+    float gain = min(1.0, slope * max(2.2, uBevelSigma * 0.9));
     vec2 n = vec2(gx, gy) / slope * gain;
     fragColor = vec4(clamp(128.0 + n * 126.0, 0.0, 255.0) / 255.0, gain, sharpA);
   } else {
@@ -119,7 +129,34 @@ void main() {
 }
 `;
 
-// Anti-aliased 4-tap bilinear 2x box/tent downsample (16 source texels averaged cleanly, zero aliasing)
+// Viewport-aligned backdrop compositor (composites underlay + transparent 3D canvas on GPU, zero CPU copy)
+const COMP_FRAG_SRC = `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D uTex;
+uniform vec2 uBgScale;
+uniform vec2 uBgOffset;
+uniform float uForceOpaque;
+out vec4 fragColor;
+
+void main() {
+  vec2 cssUv = vec2(vUv.x, 1.0 - vUv.y);
+  vec2 srcCss = cssUv * uBgScale + uBgOffset;
+  if (srcCss.x < 0.0 || srcCss.x > 1.0 || srcCss.y < 0.0 || srcCss.y > 1.0) {
+    fragColor = vec4(0.0);
+    return;
+  }
+  vec2 texUv = clamp(vec2(srcCss.x, 1.0 - srcCss.y), vec2(0.0005), vec2(0.9995));
+  vec4 c = texture(uTex, texUv);
+  if (uForceOpaque >= 0.5) {
+    fragColor = vec4(c.rgb, 1.0);
+  } else {
+    fragColor = c;
+  }
+}
+`;
+
+// Anti-aliased 4-tap bilinear 2x box/tent downsample (16 source texels averaged cleanly, preserves premultiplied RGBA)
 const DOWNSAMPLE_FRAG_SRC = `#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -128,11 +165,11 @@ uniform vec2 uHalfTexel;
 out vec4 fragColor;
 
 void main() {
-  vec3 c = texture(uTex, clamp(vUv + vec2(-uHalfTexel.x, -uHalfTexel.y), 0.001, 0.999)).rgb;
-  c += texture(uTex, clamp(vUv + vec2( uHalfTexel.x, -uHalfTexel.y), 0.001, 0.999)).rgb;
-  c += texture(uTex, clamp(vUv + vec2(-uHalfTexel.x,  uHalfTexel.y), 0.001, 0.999)).rgb;
-  c += texture(uTex, clamp(vUv + vec2( uHalfTexel.x,  uHalfTexel.y), 0.001, 0.999)).rgb;
-  fragColor = vec4(c * 0.25, 1.0);
+  vec4 c = texture(uTex, clamp(vUv + vec2(-uHalfTexel.x, -uHalfTexel.y), 0.001, 0.999));
+  c += texture(uTex, clamp(vUv + vec2( uHalfTexel.x, -uHalfTexel.y), 0.001, 0.999));
+  c += texture(uTex, clamp(vUv + vec2(-uHalfTexel.x,  uHalfTexel.y), 0.001, 0.999));
+  c += texture(uTex, clamp(vUv + vec2( uHalfTexel.x,  uHalfTexel.y), 0.001, 0.999));
+  fragColor = c * 0.25;
 }
 `;
 
@@ -147,19 +184,19 @@ out vec4 fragColor;
 
 void main() {
   float inv2s2 = 0.5 / max(uSigma * uSigma, 0.08);
-  vec3 sum = texture(uTex, vUv).rgb;
+  vec4 sum = texture(uTex, vUv);
   float wSum = 1.0;
 
   for (int i = 1; i <= 7; i++) {
     float fi = float(i);
     float w = exp(-fi * fi * inv2s2);
     vec2 off = uAxisStep * fi;
-    sum += (texture(uTex, clamp(vUv + off, 0.001, 0.999)).rgb
-          + texture(uTex, clamp(vUv - off, 0.001, 0.999)).rgb) * w;
+    sum += (texture(uTex, clamp(vUv + off, 0.001, 0.999))
+          + texture(uTex, clamp(vUv - off, 0.001, 0.999))) * w;
     wSum += 2.0 * w;
   }
 
-  fragColor = vec4(sum / wSum, 1.0);
+  fragColor = sum / wSum;
 }
 `;
 
@@ -197,6 +234,8 @@ uniform float uContrast;
 uniform float uSaturation;
 uniform float uOpacity;
 uniform vec4 uPigmentColor;
+uniform float uOpaqueBackdrop;
+uniform float uGlyphPadPx;
 
 out vec4 fragColor;
 
@@ -211,13 +250,16 @@ float hash12(vec2 p) {
   return fract((p3.x + p3.y) * p3.z);
 }
 
-vec3 sampleBackdrop(vec2 vpPx) {
+vec4 sampleBackdrop(vec2 vpPx) {
   vec2 cssUv = vpPx / max(uViewportSize, vec2(1.0));
   vec2 srcCss = cssUv * uBgScale + uBgOffset;
   vec2 texUv = clamp(vec2(srcCss.x, 1.0 - srcCss.y), vec2(0.0015), vec2(0.9985));
-  vec3 sharp = texture(uSharpTex, texUv).rgb;
+  bool opaqueBg = uOpaqueBackdrop >= 0.5;
+  vec4 sharp = texture(uSharpTex, texUv);
+  if (opaqueBg) sharp.a = 1.0;
   if (uBlurMix <= 0.001) return sharp;
-  vec3 blurred = texture(uBlurTex, texUv).rgb;
+  vec4 blurred = texture(uBlurTex, texUv);
+  if (opaqueBg) blurred.a = 1.0;
   return mix(sharp, blurred, uBlurMix);
 }
 
@@ -270,7 +312,11 @@ void main() {
     vec4 gSample = texture(uGlyphTex, vUv);
     alpha = gSample.a;
     if (alpha <= 0.004) discard;
-    normal = (gSample.rg * 2.0 - 1.0);
+    // Exact decode of 128/255 -> 0.0 + convex dome curvature matched to tight glyph bounds (1:1 native)
+    vec2 sobelN = clamp((gSample.rg * 255.0 - 128.0) / 126.0, vec2(-1.0), vec2(1.0));
+    vec2 innerHalf = max(uLayerSize * 0.5 - vec2(uGlyphPadPx), vec2(1.0));
+    vec2 domeN = clamp(localPx / innerHalf, vec2(-1.0), vec2(1.0));
+    normal = clamp(sobelN + domeN * 0.28, vec2(-1.0), vec2(1.0));
     edgeStrength = gSample.b;
     lensMag = edgeStrength;
     borderMask = smoothstep(0.35, 0.95, edgeStrength);
@@ -287,14 +333,14 @@ void main() {
   vec2 vpPx = uLayerCenter + rotPx;
 
   // Real optical lens displacement (in viewport pixels, rotated with layer)
-  vec2 dispLocal = -normal * uRefractionPx;
+  vec2 dispLocal = -normal * (uRefractionPx * 1.35);
   vec2 dispVp = vec2(
     dispLocal.x * c - dispLocal.y * s,
     dispLocal.x * s + dispLocal.y * c
   );
 
   // Sample refracted backdrop with optional 3-channel RGB prismatic dispersion
-  vec3 rgb;
+  vec4 bg;
   if (uChromaPx > 0.05) {
     float ca = clamp(uChromaPx * 0.075, 0.0, 0.45);
     vec2 dir = dispVp;
@@ -305,38 +351,44 @@ void main() {
         fallbackLocal.x * s + fallbackLocal.y * c
       );
     }
-    float rCh = sampleBackdrop(vpPx + dir * (1.0 + ca)).r;
-    float gCh = sampleBackdrop(vpPx + dir).g;
-    float bCh = sampleBackdrop(vpPx + dir * (1.0 - ca)).b;
-    rgb = vec3(rCh, gCh, bCh);
+    vec4 rS = sampleBackdrop(vpPx + dir * (1.0 + ca));
+    vec4 gS = sampleBackdrop(vpPx + dir);
+    vec4 bS = sampleBackdrop(vpPx + dir * (1.0 - ca));
+    bg = vec4(rS.r, gS.g, bS.b, clamp((rS.a + gS.a + bS.a) * (1.0 / 3.0), 0.0, 1.0));
   } else {
-    rgb = sampleBackdrop(vpPx + dispVp);
+    bg = sampleBackdrop(vpPx + dispVp);
   }
 
-  // Optical transmission: brightness, contrast, saturation
-  rgb *= uBrightness;
-  rgb = (rgb - 0.5) * uContrast + 0.5;
-  float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-  rgb = mix(vec3(luma), rgb, uSaturation);
+  // Optical transmission preserving premultiplied alpha (transparent 3D background stays transparent, never black)
+  vec4 res = vec4(0.0);
+  if (bg.a > 0.001) {
+    vec3 rgb = clamp(bg.rgb / bg.a, 0.0, 1.0);
+    rgb *= uBrightness;
+    rgb = (rgb - 0.5) * uContrast + 0.5;
+    float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb = clamp(mix(vec3(luma), rgb, uSaturation), 0.0, 1.0);
+    res = vec4(rgb * bg.a, bg.a);
+  }
 
-  // Glass Tint Veil (0% = colorless clear crystal, 80% = dense milky/smoked glass)
+  // Glass Tint Veil (Porter-Duff src-over: 0% = colorless clear crystal, 80% = dense milky/smoked glass)
   float diag = clamp(vUv.x * 0.5 + (1.0 - vUv.y) * 0.5, 0.0, 1.0);
   if (uFrostOpacity > 0.002) {
     float tintAmt = clamp(mix(uFrostOpacity * 1.18, uFrostOpacity * 0.82, diag), 0.0, 0.94);
-    rgb = mix(rgb, uTintColor, tintAmt);
+    res = vec4(uTintColor * tintAmt, tintAmt) + res * (1.0 - tintAmt);
   }
 
-  // Tactile frosted micro-grain (sandblasted crystal texture, deterministic & zero flicker)
-  if (uNoiseOpacity > 0.002) {
+  // Tactile frosted micro-grain scaled by actual glass coverage
+  if (uNoiseOpacity > 0.002 && res.a > 0.002) {
     float n1 = hash12(gl_FragCoord.xy + vec2(17.3, 41.7)) - 0.5;
     float n2 = hash12(floor(gl_FragCoord.xy * 0.5) + vec2(91.1, 13.7)) - 0.5;
     float grain = n1 * 0.65 + n2 * 0.35;
-    rgb += vec3(grain * uNoiseOpacity * 0.88);
+    res.rgb = clamp(res.rgb + vec3(grain * uNoiseOpacity * 0.88) * res.a, 0.0, res.a);
   }
 
-  // Foreground pigment mix for TEXT GLYPH mode (real Color Alpha 0..100%)
+  // Foreground pigment src-over for TEXT GLYPH mode (real Color Alpha 0..100%: transparent -> color)
   if (uMode == 1 && uPigmentColor.a > 0.001) {
-    rgb = mix(rgb, uPigmentColor.rgb, clamp(uPigmentColor.a, 0.0, 1.0));
+    float pa = clamp(uPigmentColor.a, 0.0, 1.0);
+    res = vec4(uPigmentColor.rgb * pa, pa) + res * (1.0 - pa);
   }
 
   // Directional top-left crystal specular highlight + bottom-right internal bounce
@@ -350,17 +402,20 @@ void main() {
     float bottomBounce = pow(max(0.0, -ndotl), 1.7) * edgeStrength * uSpecular * 0.30;
     float sheen = smoothstep(0.62, 0.0, diag) * uSpecular * (uMode == 0 ? 0.14 : 0.08);
     float bevelGlow = lensMag * uSpecular * 0.12;
-    rgb += vec3(1.0) * (topSpec + sheen + bevelGlow) + vec3(0.86, 0.90, 1.0) * bottomBounce;
+    vec3 specRgb = vec3(1.0) * (topSpec + sheen + bevelGlow) + vec3(0.86, 0.90, 1.0) * bottomBounce;
+    float specA = clamp(max(specRgb.r, max(specRgb.g, specRgb.b)), 0.0, 1.0);
+    res = vec4(res.rgb + specRgb, clamp(res.a + specA * (1.0 - res.a), 0.0, 1.0));
   }
 
-  // Crisp subtle tinted border along outer bevel
+  // Crisp subtle tinted border along outer bevel (src-over)
   if (uBorderOpacity > 0.005) {
     float rimFactor = uMode == 0 ? borderMask : borderMask * 0.65;
-    rgb = mix(rgb, uTintColor, clamp(rimFactor * uBorderOpacity, 0.0, 0.85));
+    float ba = clamp(rimFactor * uBorderOpacity, 0.0, 0.85);
+    res = vec4(uTintColor * ba, ba) + res * (1.0 - ba);
   }
 
-  float outAlpha = clamp(alpha * uOpacity, 0.0, 1.0);
-  fragColor = vec4(clamp(rgb, 0.0, 1.0) * outAlpha, outAlpha);
+  float mask = clamp(alpha * uOpacity, 0.0, 1.0);
+  fragColor = vec4(clamp(res.rgb, 0.0, 1.0) * mask, clamp(res.a, 0.0, 1.0) * mask);
 }
 `;
 
@@ -511,7 +566,23 @@ class OpticalGlassWebGLEngine {
     typeof OffscreenCanvas.prototype.transferToImageBitmap === "function";
 
   private packProgram: WebGLProgram | null = null;
-  private packLocs: { uSharp: WebGLUniformLocation | null; uHeight: WebGLUniformLocation | null } | null = null;
+  private packLocs: {
+    uSharp: WebGLUniformLocation | null;
+    uHeight: WebGLUniformLocation | null;
+    uBevelSigma: WebGLUniformLocation | null;
+  } | null = null;
+  private compProgram: WebGLProgram | null = null;
+  private compLocs: {
+    uTex: WebGLUniformLocation | null;
+    uBgScale: WebGLUniformLocation | null;
+    uBgOffset: WebGLUniformLocation | null;
+    uForceOpaque: WebGLUniformLocation | null;
+  } | null = null;
+  private compTex: WebGLTexture | null = null;
+  private compFbo: WebGLFramebuffer | null = null;
+  private compW = 0;
+  private compH = 0;
+  private compKey = "";
   private downProgram: WebGLProgram | null = null;
   private gaussProgram: WebGLProgram | null = null;
   private glassProgram: WebGLProgram | null = null;
@@ -600,11 +671,13 @@ class OpticalGlassWebGLEngine {
     const gaussProgram = this.linkProgram(gl, VERT_SRC, GAUSS_FRAG_SRC);
     const glassProgram = this.linkProgram(gl, VERT_SRC, GLASS_FRAG_SRC);
     const packProgram = this.linkProgram(gl, VERT_SRC, GLYPH_PACK_FRAG_SRC);
-    if (!downProgram || !gaussProgram || !glassProgram || !packProgram) {
+    const compProgram = this.linkProgram(gl, VERT_SRC, COMP_FRAG_SRC);
+    if (!downProgram || !gaussProgram || !glassProgram || !packProgram || !compProgram) {
       if (downProgram) gl.deleteProgram(downProgram);
       if (gaussProgram) gl.deleteProgram(gaussProgram);
       if (glassProgram) gl.deleteProgram(glassProgram);
       if (packProgram) gl.deleteProgram(packProgram);
+      if (compProgram) gl.deleteProgram(compProgram);
       return false;
     }
 
@@ -613,6 +686,14 @@ class OpticalGlassWebGLEngine {
     this.packLocs = {
       uSharp: gl.getUniformLocation(packProgram, "uSharp"),
       uHeight: gl.getUniformLocation(packProgram, "uHeight"),
+      uBevelSigma: gl.getUniformLocation(packProgram, "uBevelSigma"),
+    };
+    this.compProgram = compProgram;
+    this.compLocs = {
+      uTex: gl.getUniformLocation(compProgram, "uTex"),
+      uBgScale: gl.getUniformLocation(compProgram, "uBgScale"),
+      uBgOffset: gl.getUniformLocation(compProgram, "uBgOffset"),
+      uForceOpaque: gl.getUniformLocation(compProgram, "uForceOpaque"),
     };
     this.downProgram = downProgram;
     this.gaussProgram = gaussProgram;
@@ -665,6 +746,8 @@ class OpticalGlassWebGLEngine {
       "uSaturation",
       "uOpacity",
       "uPigmentColor",
+      "uOpaqueBackdrop",
+      "uGlyphPadPx",
     ];
     this.glassLocs = {};
     for (const n of names) {
@@ -697,6 +780,11 @@ class OpticalGlassWebGLEngine {
         this.sharpCache.clear();
         this.blurCache.clear();
         this.sharpTex = null;
+        this.compTex = null;
+        this.compFbo = null;
+        this.compW = 0;
+        this.compH = 0;
+        this.compKey = "";
       });
       canvas.addEventListener("webglcontextrestored", () => {
         this.contextLost = false;
@@ -735,7 +823,8 @@ class OpticalGlassWebGLEngine {
     gl: WebGL2RenderingContext,
     glyphKey: string,
     glyphCanvas: HTMLCanvasElement,
-    heightCanvas: HTMLCanvasElement
+    heightCanvas: HTMLCanvasElement,
+    bevelSigmaPx: number
   ): WebGLTexture | null {
     const existing = this.glyphTexCache.get(glyphKey);
     if (existing) {
@@ -782,6 +871,7 @@ class OpticalGlassWebGLEngine {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, heightSrc);
     gl.uniform1i(this.packLocs.uHeight, 1);
+    gl.uniform1f(this.packLocs.uBevelSigma, Math.max(1.5, bevelSigmaPx));
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -801,11 +891,12 @@ class OpticalGlassWebGLEngine {
   }
 
   private ensureMipPyramid(gl: WebGL2RenderingContext, srcW: number, srcH: number) {
-    // Cap mip-0 width at 1080px (FHD+ budget) so 4K wallpapers stay ultra-fast & crisp
+    // Cap mip-0 width at 1080px (FHD+ budget) so 4K wallpapers stay ultra-fast & crisp.
+    // 5 levels (1x, 1/2, 1/4, 1/8, 1/16) guarantee smooth monotonic blur all the way to 80px.
     const scale = srcW > 1080 ? 1080 / srcW : 1;
     const baseW = Math.max(64, Math.round(srcW * scale));
     const baseH = Math.max(64, Math.round(srcH * scale));
-    if (baseW === this.mipBaseW && baseH === this.mipBaseH && this.mips.length === 4) return;
+    if (baseW === this.mipBaseW && baseH === this.mipBaseH && this.mips.length === 5) return;
 
     // Clean up previous pyramid textures/FBOs
     for (const m of this.mips) {
@@ -820,7 +911,7 @@ class OpticalGlassWebGLEngine {
 
     let w = baseW;
     let h = baseH;
-    for (let lvl = 0; lvl < 4; lvl++) {
+    for (let lvl = 0; lvl < 5; lvl++) {
       const texA = this.createLinearTexture(gl)!;
       gl.bindTexture(gl.TEXTURE_2D, texA);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
@@ -836,8 +927,8 @@ class OpticalGlassWebGLEngine {
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texB, 0);
 
       this.mips.push({ w, h, texA, fboA, texB, fboB });
-      w = Math.max(32, Math.round(w * 0.5));
-      h = Math.max(32, Math.round(h * 0.5));
+      w = Math.max(16, Math.round(w * 0.5));
+      h = Math.max(16, Math.round(h * 0.5));
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -849,32 +940,29 @@ class OpticalGlassWebGLEngine {
     gl.deleteTexture(e.tex);
   }
 
-  private uploadBackdrop(gl: WebGL2RenderingContext, bg: BackdropSourceInfo): boolean {
+  private uploadSingleBackdrop(gl: WebGL2RenderingContext, bg: BackdropSourceInfo): WebGLTexture | null {
     const token = effectiveFrameToken(bg);
     const existing = this.sharpCache.get(bg.key);
 
     if (existing) {
-      // Refresh LRU order
       this.sharpCache.delete(bg.key);
       this.sharpCache.set(bg.key, existing);
-      this.sharpTex = existing.tex;
-      // 1.1: live canvases (3D scene) must re-upload on every new frame token, same as video.
-      if (existing.token === token) return true;
+      if (existing.token === token) return existing.tex;
     }
 
     if (bg.kind === "video") {
       const v = bg.element as HTMLVideoElement;
-      if (v.readyState < 2 || v.videoWidth <= 0 || v.videoHeight <= 0) return false;
+      if (v.readyState < 2 || v.videoWidth <= 0 || v.videoHeight <= 0) return null;
     } else if (bg.kind === "image") {
       const img = bg.element as HTMLImageElement;
-      if (!img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) return false;
+      if (!img.complete || img.naturalWidth <= 0 || img.naturalHeight <= 0) return null;
     }
 
     let entry = existing;
     let created = false;
     if (!entry) {
       const tex = this.createLinearTexture(gl);
-      if (!tex) return false;
+      if (!tex) return null;
       entry = { tex, token: -1 };
       created = true;
     }
@@ -882,9 +970,6 @@ class OpticalGlassWebGLEngine {
     try {
       gl.bindTexture(gl.TEXTURE_2D, entry.tex);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
-      // Transparent 3D canvases are premultiplied: keep them premultiplied on upload so edge pixels
-      // and the blur pyramid composite over black without a un-premultiply fringe/halo
-      // (the shaders only read .rgb).
       const premul = bg.kind === "canvas";
       if (premul) gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1);
       try {
@@ -894,11 +979,10 @@ class OpticalGlassWebGLEngine {
       }
     } catch {
       if (created) gl.deleteTexture(entry.tex);
-      return false;
+      return null;
     }
 
     entry.token = token;
-    this.sharpTex = entry.tex;
     if (created) {
       this.sharpCache.set(bg.key, entry);
       if (this.sharpCache.size > SHARP_TEX_CACHE_LIMIT) {
@@ -910,7 +994,140 @@ class OpticalGlassWebGLEngine {
         }
       }
     }
+    return entry.tex;
+  }
+
+  private ensureCompositeTarget(gl: WebGL2RenderingContext, w: number, h: number): boolean {
+    if (this.compTex && this.compFbo && this.compW === w && this.compH === h) return true;
+    if (this.compFbo) gl.deleteFramebuffer(this.compFbo);
+    if (this.compTex) gl.deleteTexture(this.compTex);
+    const tex = this.createLinearTexture(gl);
+    const fbo = gl.createFramebuffer();
+    if (!tex || !fbo) {
+      if (tex) gl.deleteTexture(tex);
+      if (fbo) gl.deleteFramebuffer(fbo);
+      this.compTex = null;
+      this.compFbo = null;
+      this.compW = 0;
+      this.compH = 0;
+      return false;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.compTex = tex;
+    this.compFbo = fbo;
+    this.compW = w;
+    this.compH = h;
+    this.compKey = "";
     return true;
+  }
+
+  /**
+   * Prepares the active sharp backdrop texture. When a transparent 3D canvas has an `underlay`
+   * (gradient, image, or video below it), composites both on the GPU into an opaque viewport-aligned
+   * texture so blur & refraction interact cleanly with the full background without sharp bleed-through.
+   */
+  private prepareBackdrop(
+    gl: WebGL2RenderingContext,
+    bg: BackdropSourceInfo,
+    viewportW: number,
+    viewportH: number
+  ): BackdropSourceInfo | null {
+    if (!bg.underlay || !this.compProgram || !this.compLocs) {
+      const tex = this.uploadSingleBackdrop(gl, bg);
+      if (!tex) return null;
+      this.sharpTex = tex;
+      return bg;
+    }
+
+    const underlay = bg.underlay;
+    const underlayTex = this.uploadSingleBackdrop(gl, underlay);
+    const fgTex = this.uploadSingleBackdrop(gl, bg);
+    if (!fgTex && !underlayTex) return null;
+    if (!fgTex && underlayTex) {
+      this.sharpTex = underlayTex;
+      return underlay;
+    }
+    if (fgTex && !underlayTex) {
+      this.sharpTex = fgTex;
+      return bg;
+    }
+
+    const scale = viewportW > 1080 ? 1080 / viewportW : 1;
+    const cw = Math.max(64, Math.round(viewportW * scale));
+    const ch = Math.max(64, Math.round(viewportH * scale));
+    if (!this.ensureCompositeTarget(gl, cw, ch)) {
+      this.sharpTex = fgTex;
+      return bg;
+    }
+
+    const fgTok = effectiveFrameToken(bg);
+    const ulTok = effectiveFrameToken(underlay);
+    const compKey = `${underlay.key}|${ulTok}|${Math.round(underlay.drawW)}x${Math.round(underlay.drawH)}|${bg.key}|${fgTok}|${Math.round(bg.drawW)}x${Math.round(bg.drawH)}|${cw}x${ch}`;
+    if (this.compKey !== compKey) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.compFbo);
+      gl.viewport(0, 0, cw, ch);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.useProgram(this.compProgram);
+      gl.bindVertexArray(this.vao);
+
+      // Pass 1: opaque underlay mapped into viewport space
+      gl.disable(gl.BLEND);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, underlayTex);
+      gl.uniform1i(this.compLocs.uTex, 0);
+      gl.uniform2f(
+        this.compLocs.uBgScale,
+        viewportW / Math.max(underlay.drawW, 1),
+        viewportH / Math.max(underlay.drawH, 1)
+      );
+      gl.uniform2f(
+        this.compLocs.uBgOffset,
+        -underlay.drawLeft / Math.max(underlay.drawW, 1),
+        -underlay.drawTop / Math.max(underlay.drawH, 1)
+      );
+      gl.uniform1f(this.compLocs.uForceOpaque, 1.0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // Pass 2: premultiplied transparent 3D canvas composited src-over the underlay
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindTexture(gl.TEXTURE_2D, fgTex);
+      gl.uniform2f(
+        this.compLocs.uBgScale,
+        viewportW / Math.max(bg.drawW, 1),
+        viewportH / Math.max(bg.drawH, 1)
+      );
+      gl.uniform2f(
+        this.compLocs.uBgOffset,
+        -bg.drawLeft / Math.max(bg.drawW, 1),
+        -bg.drawTop / Math.max(bg.drawH, 1)
+      );
+      gl.uniform1f(this.compLocs.uForceOpaque, 0.0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      gl.disable(gl.BLEND);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      this.compKey = compKey;
+    }
+
+    this.sharpTex = this.compTex;
+    return {
+      key: `comp|${underlay.key}|${bg.key}`,
+      kind: "image",
+      live: Boolean(bg.live || underlay.live),
+      element: bg.element,
+      intrinsicW: cw,
+      intrinsicH: ch,
+      drawLeft: 0,
+      drawTop: 0,
+      drawW: Math.max(1, viewportW),
+      drawH: Math.max(1, viewportH),
+      frameToken: fgTok * 31 + ulTok,
+    };
   }
 
   private updateBlurPyramid(gl: WebGL2RenderingContext, bg: BackdropSourceInfo, blurPx: number) {
@@ -918,8 +1135,8 @@ class OpticalGlassWebGLEngine {
     if (blurPx <= 0.1) return;
     this.ensureMipPyramid(gl, bg.intrinsicW, bg.intrinsicH);
 
-    // Quantize to 0.5px so multiple glass layers sharing the same blur share the cached FBO
-    const blurQuant = Math.round(Math.max(0.5, Math.min(80, blurPx)) * 2) / 2;
+    // Quantize to 0.25px so small Studio viewports stay smooth and match native 1:1
+    const blurQuant = Math.round(Math.max(0.25, Math.min(80, blurPx)) * 4) / 4;
     const cacheKey = `${bg.key}|${effectiveFrameToken(bg)}|${blurQuant}|${this.mipBaseW}x${this.mipBaseH}`;
     const cached = this.blurCache.get(cacheKey);
     if (cached) {
@@ -1052,8 +1269,9 @@ class OpticalGlassWebGLEngine {
     const rw = Math.max(2, Math.round(cssW * dpr * scaleDown));
     const rh = Math.max(2, Math.round(cssH * dpr * scaleDown));
 
-    if (!this.uploadBackdrop(gl, params.backdrop)) return false;
-    this.updateBlurPyramid(gl, params.backdrop, params.blurPx);
+    const activeBg = this.prepareBackdrop(gl, params.backdrop, params.viewportW, params.viewportH);
+    if (!activeBg) return false;
+    this.updateBlurPyramid(gl, activeBg, params.blurPx);
 
     let activeGlyphTex: WebGLTexture | null = this.sharpTex;
     if (params.mode === "glyph") {
@@ -1062,7 +1280,8 @@ class OpticalGlassWebGLEngine {
         gl,
         params.glyphKey,
         params.glyphCanvas,
-        params.glyphHeightCanvas
+        params.glyphHeightCanvas,
+        params.glyphHeightSigmaPx ?? 6
       );
       if (!activeGlyphTex) return false;
     }
@@ -1099,14 +1318,15 @@ class OpticalGlassWebGLEngine {
     gl.bindTexture(gl.TEXTURE_2D, activeGlyphTex);
     gl.uniform1i(this.glassLocs.uGlyphTex, 2);
 
-    const bg = params.backdrop;
+    const bg = activeBg;
     const bgScaleX = params.viewportW / Math.max(bg.drawW, 1);
     const bgScaleY = params.viewportH / Math.max(bg.drawH, 1);
     const bgOffsetX = -bg.drawLeft / Math.max(bg.drawW, 1);
     const bgOffsetY = -bg.drawTop / Math.max(bg.drawH, 1);
 
-    // Smooth micro-blur fade from 0px -> 1.5px; full true Gaussian above 1.5px
-    const blurMix = params.blurPx <= 0.1 ? 0 : Math.min(1, params.blurPx / 1.5);
+    // Smooth micro-blur fade from 0px -> 1.5px in logical px (1:1 parity with native blur_mix)
+    const mixBasis = params.rawBlurPx ?? params.blurPx;
+    const blurMix = mixBasis <= 0.1 ? 0 : Math.min(1, mixBasis / 1.5);
 
     gl.uniform1i(this.glassLocs.uMode, params.mode === "glyph" ? 1 : 0);
     gl.uniform2f(this.glassLocs.uViewportSize, params.viewportW, params.viewportH);
@@ -1140,6 +1360,8 @@ class OpticalGlassWebGLEngine {
 
     const pig = params.pigmentRgba ?? [1, 1, 1, 0];
     gl.uniform4f(this.glassLocs.uPigmentColor, pig[0] / 255, pig[1] / 255, pig[2] / 255, pig[3]);
+    gl.uniform1f(this.glassLocs.uOpaqueBackdrop, activeBg.kind === "canvas" ? 0.0 : 1.0);
+    gl.uniform1f(this.glassLocs.uGlyphPadPx, params.glyphPadPx ?? 0);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.disable(gl.SCISSOR_TEST);
