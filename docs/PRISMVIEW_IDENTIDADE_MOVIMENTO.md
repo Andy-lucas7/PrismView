@@ -16,26 +16,7 @@ Documento irmão de `PRISMLOCK_IDENTIDADE_MOVIMENTO.md`. Seções 0, 1 e as etap
 | **Aplicar** | Definir a View como wallpaper/lock ativo ou fixar o widget. |
 | Abas do Hub | `Wallpapers` · `Widgets` · `Templates` (PrismView) / `Telas` · `Widgets` (Prismlock) |
 
-**Tokens de movimento: fonte única** `docs/motion.tokens.json`, consumida por TS (PrismView) e Kotlin (Prismlock) via script de geração. Nenhum número de duração/easing fora dele.
-
-```json
-{
-  "duration": { "instant": 90, "fast": 160, "base": 280, "slow": 420, "hero": 650, "intro": 5200 },
-  "easing": {
-    "emphasized": [0.2, 0.0, 0.0, 1.0],
-    "decelerate": [0.05, 0.7, 0.1, 1.0],
-    "accelerate": [0.3, 0.0, 0.8, 0.15]
-  },
-  "spring": {
-    "tactile":  { "stiffness": 420, "damping": 34, "mass": 1 },
-    "carousel": { "stiffness": 260, "damping": 30, "mass": 1 },
-    "expand":   { "stiffness": 190, "damping": 26, "mass": 1 }
-  },
-  "blur":  { "enter": 12, "exit": 8 },
-  "scale": { "enter": 0.96, "carouselSide": 0.84 },
-  "gesture": { "commitDistance": 0.22, "commitVelocity": 900, "rubberBand": 0.35 }
-}
-```
+**Tokens de movimento e paleta: fonte única** `docs/motion.tokens.json` (durações, easings, springs, blur, escala, gesto e cores). Editar **só** ali. PrismView: `npm run gen:motion` gera `src/engine/motionTokens.gen.ts`, e `npm test` falha se o gerado ficar defasado ou se `prism.css`/`tailwind.config.js` divergirem da paleta. Prismlock: gerar `PrismMotion.kt` a partir do mesmo JSON e adicionar a mesma checagem (a fazer).
 
 **Regras de performance (inegociáveis)**
 1. Orçamento de quadro = `1000/Hz` do monitor (6,9 ms a 144 Hz, 8,3 ms a 120 Hz). Nunca fixar 60 fps: seguir o refresh real.

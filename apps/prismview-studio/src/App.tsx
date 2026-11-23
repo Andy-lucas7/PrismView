@@ -59,7 +59,7 @@ import { nativeCompatIssues } from "./utils/nativeCompat";
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
-import { UnifiedCompositor } from "./components/UnifiedCompositor";
+import { HubThumbnail } from "./components/HubThumbnail";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -68,19 +68,6 @@ import {
   usePowerState,
 } from "./engine/powerGovernor";
 import { applyMotionCssVars } from "./engine/motion";
-
-/** 4.7: Hub thumbnail. Fixed telemetry + memo => cards do not re-render on the 1.5 s telemetry tick. */
-const HubThumbnail = React.memo(function HubThumbnail({ project }: { project: PrismProject }) {
-  return (
-    <UnifiedCompositor
-      project={project}
-      telemetry={DEFAULT_TELEMETRY}
-      paused
-      isThumbnail
-      interactive={false}
-    />
-  );
-});
 
 function useLiveTelemetry(): LiveTelemetry {
   const [telemetry, setTelemetry] = useState<LiveTelemetry>(DEFAULT_TELEMETRY);

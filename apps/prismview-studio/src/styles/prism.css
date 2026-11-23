@@ -333,3 +333,12 @@ input[type="range"].prism-slider::-webkit-slider-thumb:hover {
     scroll-behavior: auto !important;
   }
 }
+
+/* Miniatura do Hub entrando (após montar o compositor). */
+.prism-thumb-in {
+  animation: prism-thumb-in var(--motion-slow, 420ms) var(--ease-decelerate, cubic-bezier(0.05, 0.7, 0.1, 1)) both;
+}
+@keyframes prism-thumb-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

@@ -1,0 +1,76 @@
+// GERADO por scripts/gen-motion.mjs a partir de docs/motion.tokens.json. Não editar.
+export const TOKENS = {
+  "version": 1,
+  "duration": {
+    "instant": 90,
+    "fast": 160,
+    "base": 280,
+    "slow": 420,
+    "hero": 650,
+    "intro": 5200
+  },
+  "easing": {
+    "emphasized": [
+      0.2,
+      0,
+      0,
+      1
+    ],
+    "decelerate": [
+      0.05,
+      0.7,
+      0.1,
+      1
+    ],
+    "accelerate": [
+      0.3,
+      0,
+      0.8,
+      0.15
+    ],
+    "press": [
+      0.22,
+      1,
+      0.36,
+      1
+    ]
+  },
+  "spring": {
+    "tactile": {
+      "stiffness": 400,
+      "damping": 32,
+      "mass": 0.9
+    },
+    "carousel": {
+      "stiffness": 260,
+      "damping": 30,
+      "mass": 1
+    },
+    "expand": {
+      "stiffness": 190,
+      "damping": 26,
+      "mass": 1
+    }
+  },
+  "blur": {
+    "enter": 12,
+    "exit": 8
+  },
+  "scale": {
+    "enter": 0.96,
+    "exit": 0.98,
+    "carouselSide": 0.84
+  },
+  "gesture": {
+    "commitDistance": 0.22,
+    "commitVelocity": 900,
+    "rubberBand": 0.35
+  },
+  "color": {
+    "pureBlack": "#000000",
+    "carbon": "#0D0D0F",
+    "surface": "#141418",
+    "mutedZinc": "#A1A1AA",
+    "trackZinc": "#27272A"
+  }
+} as const;
