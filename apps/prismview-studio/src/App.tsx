@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { AnimatePresence, animate, motion, MotionConfig, useMotionValue, useReducedMotion, useTransform } from "framer-motion";
@@ -2127,8 +2128,8 @@ const StudioHubApp: React.FC = () => {
 
       {/* Main Content Area */}
       <div className="relative z-10 flex-1 flex flex-col min-w-0 overflow-hidden">
-        {brokenProjects.length > 0 && (
-          <div
+        <AnimatePresence initial={false}>{brokenProjects.length > 0 && (
+          <motion.div {...COLLAPSE}><div
             role="alert"
             className="mx-7 mt-4 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-xs text-amber-100 shrink-0"
           >
@@ -2156,20 +2157,20 @@ const StudioHubApp: React.FC = () => {
                 <X size={14} />
               </button>
             </div>
-            {brokenDetailsOpen && (
-              <ul className="mt-2 space-y-1 text-[11px] text-amber-100/80">
+            <AnimatePresence initial={false}>{brokenDetailsOpen && (
+              <motion.ul {...COLLAPSE} className="mt-2 space-y-1 text-[11px] text-amber-100/80">
                 {brokenProjects.map((b) => (
                   <li key={b.file} className="break-all">
                     <span className="font-mono">{b.file}</span> —{" "}
                     {b.restored ? "restaurado do backup" : "movido para projects/_corrompidos"}: {b.error}
                   </li>
                 ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {runtime.legacy_migration_notice && (
-          <div
+              </motion.ul>
+            )}</AnimatePresence>
+          </div></motion.div>
+        )}</AnimatePresence>
+        <AnimatePresence initial={false}>{runtime.legacy_migration_notice && (
+          <motion.div {...COLLAPSE}><div
             role="alert"
             className="mx-7 mt-4 flex items-start gap-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-xs text-amber-100 shrink-0"
           >
@@ -2182,26 +2183,26 @@ const StudioHubApp: React.FC = () => {
             >
               <X size={14} />
             </button>
-          </div>
-        )}
+          </div></motion.div>
+        )}</AnimatePresence>
 
         {/* Contextual Top Bar */}
         <header className="px-7 pt-5 pb-3 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3 shrink-0">
           <div>
-            <h1 className="font-display text-lg font-semibold text-white">
+            <h1 className="font-display text-lg font-semibold text-white"><SwapText id={hubTab}>
               {hubTab === "WALLPAPERS"
                 ? "Meus Wallpapers"
                 : hubTab === "WIDGETS"
                   ? "Meus Widgets"
                   : "Modelos Prontos"}
-            </h1>
-            <p className="text-xs text-[#A1A1AA]">
+            </SwapText></h1>
+            <p className="text-xs text-[#A1A1AA]"><SwapText id={hubTab}>
               {hubTab === "WALLPAPERS"
                 ? "Sua biblioteca de wallpapers 2D, vídeo e 3D com pausa automática em tela cheia."
                 : hubTab === "WIDGETS"
                   ? "Fixe sobre qualquer papel de parede ou importe dentro de um wallpaper no Estúdio."
                   : "Comece rápido com composições 2D, vidro óptico, widgets ou cenas 3D interativas."}
-            </p>
+            </SwapText></p>
           </div>
 
           <div className="flex items-center gap-2.5">
@@ -2263,8 +2264,9 @@ const StudioHubApp: React.FC = () => {
         {/* Scrollable Workspace Body */}
         <main className="flex-1 overflow-y-auto px-7 py-5">
           <HubStillWarmer projects={warmProjects} />
+          <AnimatePresence mode="wait" initial={false}>
           {hubTab === "WALLPAPERS" && (
-            <div className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WALLPAPERS" {...TAB} className="max-w-7xl mx-auto space-y-5">
               {/* Filter Chips + Multi-Monitor Selector */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2430,11 +2432,11 @@ const StudioHubApp: React.FC = () => {
                   );
                 }}
               />
-            </div>
+            </motion.div>
           )}
 
           {hubTab === "WIDGETS" && (
-            <div className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WIDGETS" {...TAB} className="max-w-7xl mx-auto space-y-5">
               {runtime.pinned_widget_ids.length >= 3 && (
                 <div className="rounded-xl border border-amber-400/30 bg-amber-400/[0.06] px-3.5 py-2.5 text-[11px] text-amber-200/90">
                   Cada widget fixado roda em uma janela WebView própria (dezenas de MB de RAM cada).{" "}
@@ -2602,11 +2604,11 @@ const StudioHubApp: React.FC = () => {
                   );
                 }}
               />
-            </div>
+            </motion.div>
           )}
 
           {hubTab === "TEMPLATES" && (
-            <div className="max-w-7xl mx-auto space-y-6 pb-6">
+            <motion.div key="TEMPLATES" {...TAB} className="max-w-7xl mx-auto space-y-6 pb-6">
               {/* Category Filter Bar + Restore Defaults */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2760,8 +2762,8 @@ const StudioHubApp: React.FC = () => {
                     Meta: ≤ 1% CPU · GPU Ultra-Leve
                   </span>
                 </button>
-                {blenderGuideOpen && (
-                  <div className="px-5 pb-5 pt-1 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs border-t border-white/10">
+                <AnimatePresence initial={false}>{blenderGuideOpen && (
+                  <motion.div {...COLLAPSE}><div className="px-5 pb-5 pt-1 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs border-t border-white/10">
                     <div className="rounded-xl bg-white/[0.03] border border-white/10 p-3 space-y-1">
                       <span className="font-mono-fx text-[10px] text-white/60">01 · FORMATO</span>
                       <p className="font-medium text-white">Exporte como glTF Binary (.glb)</p>
@@ -2791,11 +2793,12 @@ const StudioHubApp: React.FC = () => {
                         <code className="font-mono-fx text-white">Screen</code> para capa de música ao vivo.
                       </p>
                     </div>
-                  </div>
-                )}
+                  </div></motion.div>
+                )}</AnimatePresence>
               </div>
-            </div>
+            </motion.div>
           )}
+          </AnimatePresence>
         </main>
       </div>
 

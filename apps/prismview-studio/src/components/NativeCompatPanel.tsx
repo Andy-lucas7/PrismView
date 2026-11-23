@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+import { COLLAPSE } from "./motion/Presence";
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
 
@@ -26,8 +28,8 @@ export const NativeCompatPanel: React.FC<{
         </span>
         {open ? <ChevronDown className="w-3.5 h-3.5" aria-hidden /> : <ChevronRight className="w-3.5 h-3.5" aria-hidden />}
       </button>
-      {open && (
-        <ul className="px-3 pb-2.5 space-y-1.5">
+      <AnimatePresence initial={false}>{open && (
+        <motion.ul {...COLLAPSE} className="px-3 pb-2.5 space-y-1.5">
           {issues.map((issue, i) => (
             <li key={`${issue.layerId}:${i}`} className="flex items-start gap-2 text-[11px] text-amber-100/85">
               <span className="flex-1 leading-relaxed">{issue.message}</span>
@@ -40,8 +42,8 @@ export const NativeCompatPanel: React.FC<{
               </button>
             </li>
           ))}
-        </ul>
-      )}
+        </motion.ul>
+      )}</AnimatePresence>
     </section>
   );
 };

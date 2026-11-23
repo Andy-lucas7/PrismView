@@ -1,4 +1,6 @@
 import { NativeCompatPanel } from "./NativeCompatPanel";
+import { AnimatePresence, motion } from "framer-motion";
+import { COLLAPSE, TAB_LITE } from "./motion/Presence";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -636,7 +638,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
         </div>
 
         {/* Tab Body */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-3.5">
+        <div className="flex-1 overflow-y-auto p-4">
+          <AnimatePresence mode="wait" initial={false}>
+          <motion.div key={layerTab} className="space-y-3.5" {...TAB_LITE}>
           {layerTab === "CONTENT" && (
             <>
               {selectedLayer.kind === "TEXT" && selectedLayer.text && (
@@ -3269,8 +3273,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   >
                     {showOptics ? "▾ Ocultar dispersão prismática" : "▸ Dispersão prismática opcional (RGB)"}
                   </button>
-                  {showOptics && (
-                    <div className="space-y-2.5 pl-2 border-l border-white/10">
+                  <AnimatePresence initial={false}>{showOptics && (
+                    <motion.div {...COLLAPSE}><div className="space-y-2.5 pl-2 border-l border-white/10">
                       <InspectorSlider
                         label="Dispersão RGB"
                         value={selectedLayer.glass.chromaticAberration}
@@ -3286,8 +3290,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           }))
                         }
                       />
-                    </div>
-                  )}
+                    </div></motion.div>
+                  )}</AnimatePresence>
                 </div>
               )}
 
@@ -3616,6 +3620,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </div>
             </>
           )}
+          </motion.div>
+          </AnimatePresence>
         </div>
       </div>
     );
@@ -3647,11 +3653,15 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
         ))}
       </div>
 
-      {mode === "SCENE"
-        ? renderSceneTab()
-        : mode === "GLOBALS"
-        ? renderGlobalsTab()
-        : renderLayerTab()}
+      <AnimatePresence mode="wait" initial={false}>
+        <motion.div key={mode} className="flex min-h-0 flex-1 flex-col" {...TAB_LITE}>
+          {mode === "SCENE"
+            ? renderSceneTab()
+            : mode === "GLOBALS"
+            ? renderGlobalsTab()
+            : renderLayerTab()}
+        </motion.div>
+      </AnimatePresence>
     </aside>
   );
 };
