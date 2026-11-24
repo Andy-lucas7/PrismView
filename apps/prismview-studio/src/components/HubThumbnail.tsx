@@ -60,6 +60,7 @@ export function useProjectStills(project: PrismProject) {
       if (hubStills.has(StillCache.key(project.id, layerId, sig))) return;
       const prev = timers.current.get(layerId);
       if (prev !== undefined) window.clearTimeout(prev);
+      const delayMs = typeof HTMLVideoElement !== "undefined" && el instanceof HTMLVideoElement ? 50 : CAPTURE_DEBOUNCE_MS;
       timers.current.set(
         layerId,
         window.setTimeout(() => {
@@ -67,7 +68,7 @@ export function useProjectStills(project: PrismProject) {
           void captureStill(el).then((url) => {
             if (url) hubStills.set(StillCache.key(project.id, layerId, sig), url);
           });
-        }, CAPTURE_DEBOUNCE_MS)
+        }, delayMs)
       );
     },
     [project.id, sig]

@@ -459,27 +459,45 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
   const ref = useRef<HTMLVideoElement | null>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
+  const speedRef = useRef(speed);
+  speedRef.current = speed;
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
   const onMediaElRef = useRef(onMediaEl);
   onMediaElRef.current = onMediaEl;
   const onMediaReadyRef = useRef(onMediaReady);
   onMediaReadyRef.current = onMediaReady;
   const url = resolveMediaUrl(src);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setLoadError(null);
-  }, [url]);
+  const [loadError, setLoadError] = useState<{ url: string; message: string } | null>(null);
+  const activeError = loadError && loadError.url === url ? loadError.message : null;
 
   useEffect(() => {
     const el = ref.current;
+    if (!el || !url) return;
+    // React 18 StrictMode re-runs effects on the same DOM <video> after running cleanup;
+    // restore `src` and playback props so the remounted element doesn't stay blank.
+    if (el.getAttribute("src") !== url) {
+      el.src = url;
+    }
+    el.playbackRate = Math.max(0.25, Math.min(3, speedRef.current || 1));
+    el.muted = mutedRef.current;
+    el.volume = mutedRef.current ? 0 : Math.max(0, Math.min(1, volumeRef.current));
     onMediaElRef.current?.(el);
+    if (el.readyState >= 2) {
+      onMediaReadyRef.current?.();
+    }
+    if (pausedRef.current) {
+      el.pause();
+    } else {
+      el.play().catch(() => {});
+    }
     return () => {
       onMediaElRef.current?.(null);
-      if (el) {
-        el.pause();
-        el.removeAttribute("src");
-        el.load();
-      }
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
     };
   }, [url]);
 
@@ -509,10 +527,10 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
     );
   }
 
-  if (loadError) {
+  if (activeError) {
     return (
       <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0D0D0F] border border-dashed border-amber-400/35 px-4 text-center text-xs text-amber-200/90">
-        <span>Não foi possível pré-visualizar este vídeo no Studio ({loadError}).</span>
+        <span>Não foi possível pré-visualizar este vídeo no Studio ({activeError}).</span>
         <span className="text-[10px] text-[#A1A1AA]">Ao aplicar, o motor nativo reproduz normalmente via Media Foundation.</span>
       </div>
     );
@@ -539,8 +557,9 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
         onMediaReadyRef.current?.();
       }}
       onError={(e) => {
+        if (!e.currentTarget.getAttribute("src")) return;
         const code = e.currentTarget.error?.code;
-        setLoadError(code ? `código ${code}` : "formato não suportado pelo WebView");
+        setLoadError({ url, message: code ? `código ${code}` : "formato não suportado pelo WebView" });
       }}
       style={{ objectFit, borderRadius: `${clipRadius}px` }}
       className="w-full h-full pointer-events-none"

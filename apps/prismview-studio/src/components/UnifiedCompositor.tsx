@@ -1209,6 +1209,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               }}
               eager={isThumbnail}
               onMediaReady={() => {
+                videoFrameTokenRef.current += 1;
                 setMediaRev((r) => r + 1);
                 if (isThumbnail && onThumbFrame) {
                   const el = mediaElementsRef.current.get(layer.id);

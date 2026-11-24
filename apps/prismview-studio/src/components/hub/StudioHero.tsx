@@ -2,6 +2,7 @@ import React from "react";
 import { motion, useTransform, type MotionValue } from "framer-motion";
 import type { PrismProject } from "../../types/prism";
 import { HUB_MOCK_TELEMETRY } from "../../engine/hubMock";
+import { useProjectStills } from "../HubThumbnail";
 import { UnifiedCompositor } from "../UnifiedCompositor";
 
 export interface HeroRect {
@@ -59,6 +60,7 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
   const wAspect = isWidget ? project.widget.width / project.widget.height : 1;
   // Largura da caixa do widget em unidades locais (o card a mostra com `innerRect.width` px de tela).
   const widgetW = isWidget ? Math.min(vw * 0.9, (innerRect ? innerRect.width : Math.min(340, r.width - 32)) / s) : 0;
+  const { stills } = useProjectStills(project);
 
   return (
     <motion.div
@@ -72,11 +74,11 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
           style={{ backgroundImage: "radial-gradient(rgba(255,255,255,0.08) 1px, transparent 1px)", backgroundSize: `${16 / s}px ${16 / s}px` }}
         >
           <div style={{ width: widgetW, aspectRatio: String(wAspect) }}>
-            <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" interactive={false} />
+            <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" stillFrames={stills} interactive={false} />
           </div>
         </div>
       ) : (
-        <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" interactive={false} />
+        <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" stillFrames={stills} interactive={false} />
       )}
     </motion.div>
   );
