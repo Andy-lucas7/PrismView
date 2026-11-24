@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo, useRef, useState } from "react";
-import { LayoutGroup, motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import { GalleryHorizontal, LayoutGrid } from "lucide-react";
-import { SPRING } from "../../engine/motion";
+import { BLUR, DURATION, EASE, SPRING, sec } from "../../engine/motion";
 import { HubCardContext } from "./HubCardContext";
 import { ViewCarousel } from "./ViewCarousel";
 
@@ -68,6 +68,7 @@ export function HubLayout<T>({
     }
   }, []);
 
+  const reduced = Boolean(useReducedMotion());
   const gridCtx = useMemo(() => ({ effects }), [effects]);
   // View central lembrada: ao voltar da grade o carrossel já abre nela, sem animação de entrada.
   const centerKeyRef = useRef<string | undefined>(initialKey);
@@ -112,8 +113,14 @@ export function HubLayout<T>({
         </div>
       </div>
 
-      {/* Morph: o mesmo card (layoutId) viaja entre carrossel e grade; só o contêiner troca. */}
-      <LayoutGroup id="hub-view">
+      {/* Troca em fade + blur curto só no contêiner (o morph por layoutId remedia cada card com
+          miniatura WebGL e travava; também refazia a medição a cada re-render, gerando "pulinhos"). */}
+      <motion.div
+        key={view}
+        initial={reduced ? false : { opacity: 0, filter: `blur(${BLUR.exit}px)` }}
+        animate={{ opacity: 1, filter: "blur(0px)" }}
+        transition={{ duration: sec(DURATION.base), ease: [...EASE.decelerate] }}
+      >
         {view === "carousel" ? (
           <ViewCarousel
             key="carousel"
@@ -148,7 +155,7 @@ export function HubLayout<T>({
             </div>
           </HubCardContext.Provider>
         )}
-      </LayoutGroup>
+      </motion.div>
     </div>
   );
 }

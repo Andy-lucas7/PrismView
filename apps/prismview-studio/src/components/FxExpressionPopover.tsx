@@ -73,7 +73,7 @@ export const FxExpressionPopover: React.FC<FxExpressionPopoverProps> = ({
       animate={{ opacity: 1, x: 0, scale: 1 }}
       exit={{ opacity: 0, x: 10, scale: 0.97 }}
       transition={SPRING_TACTILE}
-      className="fixed top-20 right-[376px] z-50 w-[360px] frosted-chrome frosted-chrome-panel prismatic-edge p-4 flex flex-col gap-3"
+      className="fixed top-20 right-[376px] z-50 w-[360px] prism-glass-pop p-4 flex flex-col gap-3"
     >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 min-w-0">

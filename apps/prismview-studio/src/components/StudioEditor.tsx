@@ -22,6 +22,7 @@ import {
   Grid3x3,
   GripVertical,
   Image as ImageIcon,
+  BookOpen,
   Keyboard,
   Layers,
   Lock,
@@ -121,6 +122,8 @@ interface StudioEditorProps {
   /** Ctrl+S / "Tentar de novo": grava o pendente e o que falhou. */
   onSaveNow?: () => void;
   onBack: () => void;
+  /** Abre a Ajuda (documentação do app e das fórmulas ƒx). */
+  onOpenHelp?: () => void;
   onApply: () => void;
   onExport: () => void;
   /** Aplicar/fixar em andamento: trava o botão contra clique duplo. */
@@ -188,6 +191,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   saveStatus,
   onSaveNow,
   onBack,
+  onOpenHelp,
   onApply,
   onExport,
   applying = false,
@@ -1670,6 +1674,16 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Keyboard className="w-3.5 h-3.5" />
           </button>
+          {onOpenHelp && (
+            <button aria-label="Ajuda e documentação (F1)"
+              type="button"
+              onClick={onOpenHelp}
+              title="Ajuda e documentação (F1)"
+              className="w-7 h-7 rounded-full flex items-center justify-center transition text-[#A1A1AA] hover:text-white hover:bg-white/15"
+            >
+              <BookOpen className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -1767,7 +1781,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
       {/* Shortcuts Cheat-Sheet Popover */}
       <AnimatePresence initial={false}>{shortcutsOpen && (
-        <motion.div {...POP} className="fixed top-20 left-[304px] z-50 w-80 frosted-chrome frosted-chrome-panel p-4 space-y-2.5 text-xs shadow-2xl">
+        <motion.div {...POP} className="fixed top-20 left-[304px] z-50 w-80 prism-glass-pop p-4 space-y-2.5 text-xs">
           <div className="flex items-center justify-between border-b border-white/10 pb-2">
             <span className="font-semibold text-white">Atalhos & Seleção do Estúdio</span>
             <button
@@ -1796,6 +1810,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               ["Sala 3D · G / R / S / F", "Mover / Girar / Escalar / Focar"],
               ["Sala 3D · Ctrl+D / Delete", "Duplicar / Remover objeto"],
               ["Ctrl+Shift+P", "HUD de desempenho"],
+              ["F1", "Ajuda e documentação"],
             ].map(([k, desc]) => (
               <div key={k} className="flex items-center justify-between gap-2">
                 <span className="font-mono-fx text-[10px] text-white/90 bg-white/10 px-1.5 py-0.5 rounded">
@@ -2146,7 +2161,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </div>
           )}
           {room3dMode && (
-            <div className="pointer-events-none absolute top-3 left-3 z-40 frosted-chrome rounded-xl px-2.5 py-1.5 text-[10px] text-[#D4D4D8] leading-relaxed">
+            <div className="pointer-events-none absolute top-3 left-3 z-40 prism-glass-pop !rounded-xl px-2.5 py-1.5 text-[10px] text-[#D4D4D8] leading-relaxed">
               Botão dir. + WASD/QE: voar · Meio/Alt+arrastar: pan · Alt+Clique: peça · Scroll: zoom · Clique: selecionar
             </div>
           )}
@@ -2190,7 +2205,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </div>
           )}
           <AnimatePresence initial={false}>{hudOpen && (
-            <motion.div {...POP} className="pointer-events-none absolute top-3 right-3 z-40 frosted-chrome rounded-xl px-3 py-2 text-[10px] font-mono-fx text-white/90 space-y-0.5 min-w-[180px]">
+            <motion.div {...POP} className="pointer-events-none absolute top-3 right-3 z-40 prism-glass-pop !rounded-xl px-3 py-2 text-[10px] font-mono-fx text-white/90 space-y-0.5 min-w-[180px]">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold">
                 <Gauge className="w-3.5 h-3.5" /> HUD de desempenho
               </div>

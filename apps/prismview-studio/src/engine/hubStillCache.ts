@@ -28,6 +28,11 @@ export class StillCache {
     return url;
   }
 
+  /** Lê sem tocar na ordem LRU (seguro para `getSnapshot`). */
+  peek(key: string): string | undefined {
+    return this.map.get(key);
+  }
+
   has(key: string): boolean {
     return this.map.has(key);
   }

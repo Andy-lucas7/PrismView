@@ -60,8 +60,7 @@ function useDismiss(open: boolean, close: () => void, refs: React.RefObject<HTML
   }, [open, close]);
 }
 
-const POPOVER_CLS =
-  "fixed z-[300] overflow-hidden rounded-xl border border-white/12 bg-[#0D0D0F]/95 shadow-[0_18px_48px_rgba(0,0,0,0.7)] backdrop-blur-xl";
+const POPOVER_CLS = "fixed z-[300] overflow-hidden prism-glass-pop";
 
 /* ───────────────────────── Select (substitui <select> nativo) ───────────────────────── */
 
@@ -69,18 +68,20 @@ interface Opt {
   value: string;
   label: React.ReactNode;
   disabled: boolean;
+  /** Estilo do `<option>` (ex.: `fontFamily`), aplicado à linha do menu. */
+  style?: React.CSSProperties;
 }
 
 function collectOptions(children: React.ReactNode, out: Opt[] = []): Opt[] {
   React.Children.forEach(children, (child) => {
     if (!React.isValidElement(child)) return;
-    const props = child.props as { value?: unknown; disabled?: boolean; children?: React.ReactNode };
+    const props = child.props as { value?: unknown; disabled?: boolean; children?: React.ReactNode; style?: React.CSSProperties };
     if (child.type === React.Fragment || child.type === "optgroup") {
       collectOptions(props.children, out);
     } else if (child.type === "option") {
       const label = props.children;
       const text = typeof label === "string" || typeof label === "number" ? String(label) : "";
-      out.push({ value: props.value === undefined ? text : String(props.value), label, disabled: Boolean(props.disabled) });
+      out.push({ value: props.value === undefined ? text : String(props.value), label, disabled: Boolean(props.disabled), style: props.style });
     }
   });
   return out;
@@ -213,6 +214,7 @@ export const Select: React.FC<SelectProps> = ({ value, onChange, children, class
                     aria-selected={selected}
                     data-i={i}
                     disabled={o.disabled}
+                    style={o.style}
                     onMouseEnter={() => setActive(i)}
                     onClick={() => commit(i)}
                     className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[11px] transition-colors disabled:opacity-40 ${

@@ -2,10 +2,10 @@
  * Shader da intro (GLSL ES 3.00). Base: AGSL `HERO_BEAM_AGSL` do Prismlock (quatro holofotes
  * convergindo + holofotes orbitais atrás do título), traduzido e refinado:
  *  - dither (sem faixas nos degradês escuros), resolução independente do monitor;
- *  - fase de DERRETIMENTO (`uMelt`): em vez do "furo" radial do Prismlock, o hero derrete como vidro
- *    a partir do botão: o campo de derretimento (distância + blobs + listras verticais) abre
- *    transparência, o conteúdo escorre para baixo perto da borda, a borda vira vidro (brilho
- *    especular + dispersão cromática) e a luz atravessa até o Hub por baixo.
+ *  - fase de DERRETIMENTO (`uMelt`): em vez do "furo" radial do Prismlock, o hero se dissolve em
+ *    blur a partir do botão: o campo (distância + blobs suaves) abre transparência com borda difusa,
+ *    o conteúdo desce pouco, o título é desfocado por viés de mip e a luz atravessa até o Hub.
+ *    Custo: 1 chamada de hero(), fbm de 2 oitavas, sem dispersão cromática.
  * Saída em alfa pré-multiplicado (canvas `premultipliedAlpha`).
  */
 export const HERO_VERT = `#version 300 es
@@ -46,7 +46,7 @@ float vnoise(vec2 p) {
 float fbm(vec2 p) {
   float v = 0.0;
   float a = 0.5;
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 2; i++) {
     v += a * vnoise(p);
     p = p * 2.03 + vec2(17.1, 9.7);
     a *= 0.5;
@@ -139,10 +139,10 @@ vec3 hero(vec2 fragCoord) {
   return clamp(introCol + ambientCol, 0.0, 1.0);
 }
 
-vec4 titleAt(vec2 fc) {
+vec4 titleAt(vec2 fc, float blurBias) {
   vec2 tc = (fc - uTitleRect.xy) / uTitleRect.zw;
   if (uTitleOn < 0.5 || tc.x < 0.0 || tc.y < 0.0 || tc.x > 1.0 || tc.y > 1.0) return vec4(0.0);
-  return texture(uTitle, tc);
+  return texture(uTitle, tc, blurBias); // viés de mip = desfoque barato do título durante o derretimento
 }
 
 void main() {
@@ -151,41 +151,32 @@ void main() {
 
   vec2 f2 = fc;
   float alpha = 1.0;
-  float glassK = 0.0;
+  float glow = 0.0;
   float sag = 0.0;
   if (uMelt > 0.0005) {
+    // Derretimento suave: campo largo (distância + 2 oitavas de blob, sem listras), borda difusa
+    // em vez de linha, deslocamento pequeno; o desfoque domina (título por viés de mip, luz já é macia).
     vec2 pn = fc / minDim;
     float maxR = length(max(uMeltOrigin, uRes - uMeltOrigin));
     float dist = length(fc - uMeltOrigin) / maxR;
-    float streak = vnoise(vec2(pn.x * 11.0, pn.y * 1.1 + 3.0));
-    float blobs = fbm(pn * 3.4 + 5.0);
-    float field = dist * 0.60 + blobs * 0.30 + streak * 0.20;
-    float th = uMelt * 1.12 - 0.08;
+    float blobs = fbm(pn * 2.6 + 5.0);
+    float field = dist * 0.66 + blobs * 0.34;
+    float th = uMelt * 1.18 - 0.14;
     float edge = field - th;
-    float k = edge < 0.0 ? 1.0 : 1.0 - smoothstep(0.0, 0.42, edge);
+    float k = edge < 0.0 ? 1.0 : 1.0 - smoothstep(0.0, 0.5, edge);
     sag = k * k;
-    float ease = smoothstep(0.0, 0.25, uMelt);
-    float dy = sag * minDim * (0.05 + 0.22 * streak) * ease;
-    float dx = (vnoise(pn * 7.0 + uMelt * 2.0) - 0.5) * sag * minDim * 0.035 * ease;
-    f2 = fc - vec2(dx, dy);
-    float band = 0.075;
-    alpha = smoothstep(0.0, band, edge);
-    glassK = 4.0 * alpha * (1.0 - alpha);
+    float ease = smoothstep(0.0, 0.3, uMelt);
+    f2 = fc - vec2(0.0, sag * minDim * 0.045 * ease);
+    alpha = smoothstep(0.0, 0.2, edge);
+    glow = 4.0 * alpha * (1.0 - alpha);
   }
 
-  vec3 base;
-  if (sag > 0.01) {
-    float ca = sag * uMelt * minDim * 0.006;
-    base = vec3(hero(f2 + vec2(ca, 0.0)).r, hero(f2).g, hero(f2 - vec2(ca, 0.0)).b);
-  } else {
-    base = hero(f2);
-  }
-  vec4 tt = titleAt(f2);
+  vec3 base = hero(f2);
+  vec4 tt = titleAt(f2, sag * 4.5);
   base = base * (1.0 - tt.a) + tt.rgb;
 
-  vec3 sheen = vec3(0.86, 0.93, 1.0) * glassK * 0.42;
-  vec3 rgb = base * alpha + sheen;
-  float a = clamp(alpha + glassK * 0.42, 0.0, 1.0);
+  vec3 rgb = base * alpha + vec3(0.86, 0.93, 1.0) * glow * 0.14;
+  float a = clamp(alpha + glow * 0.14, 0.0, 1.0);
   float dither = (hash21(gl_FragCoord.xy + fract(uTime * 13.0)) - 0.5) / 255.0;
   rgb += dither * a;
   outColor = vec4(clamp(rgb, 0.0, 1.0), a);

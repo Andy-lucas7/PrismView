@@ -3,10 +3,8 @@ import {
   AnimatePresence,
   animate,
   motion,
-  useMotionTemplate,
   useMotionValue,
   useReducedMotion,
-  useSpring,
   useTransform,
   type AnimationPlaybackControls,
   type MotionValue,
@@ -70,41 +68,11 @@ const Slot = React.memo(function Slot({
   const y = useTransform(d, (v) => smooth(Math.min(Math.abs(v), 1)) * 14);
   const scale = useTransform(d, slotScale);
   const opacity = useTransform(d, slotOpacity);
-  const baseRotY = useTransform(d, (v) => -clamp(v, -1.4, 1.4) * 13);
+  const rotY = useTransform(d, (v) => -clamp(v, -1.4, 1.4) * 13);
   const blur = useTransform(d, (v) => (effects && !reduced ? `blur(${(Math.min(Math.abs(v), 2) * 1.3).toFixed(2)}px)` : "none"));
   const dim = useTransform(d, (v) => Math.min(Math.abs(v), 1) * 0.26);
   const z = useTransform(d, (v) => Math.round(100 - Math.abs(v) * 10));
 
-  // Tilt + spotlight (só o card central, ponteiro; sem re-render).
-  const tx = useMotionValue(0);
-  const ty = useMotionValue(0);
-  const sx = useSpring(tx, SPRING.tactile);
-  const sy = useSpring(ty, SPRING.tactile);
-  const rotY = useTransform([baseRotY, sy], ([a, b]: number[]) => a + b);
-  const mx = useMotionValue(0);
-  const my = useMotionValue(0);
-  const glow = useSpring(useMotionValue(0), SPRING.carousel);
-  const spotlight = useMotionTemplate`radial-gradient(520px circle at ${mx}px ${my}px, rgba(255,255,255,0.11), transparent 62%)`;
-  const innerRef = useRef<HTMLDivElement | null>(null);
-  const tiltOn = isCenter && !reduced;
-
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (!tiltOn || e.pointerType === "touch") return;
-    const r = innerRef.current?.getBoundingClientRect();
-    if (!r || r.width < 2) return;
-    const px = (e.clientX - r.left) / r.width;
-    const py = (e.clientY - r.top) / r.height;
-    mx.set(e.clientX - r.left);
-    my.set(e.clientY - r.top);
-    ty.set((px - 0.5) * 4.4);
-    tx.set(-(py - 0.5) * 3.2);
-    glow.set(1);
-  };
-  const onPointerLeave = () => {
-    tx.set(0);
-    ty.set(0);
-    glow.set(0);
-  };
   const ctx = useMemo(() => ({ rank, effects }), [rank, effects]);
   const inertProps = isCenter ? {} : ({ inert: "" } as Record<string, string>);
 
@@ -121,25 +89,15 @@ const Slot = React.memo(function Slot({
       }}
     >
       <motion.div
-        ref={innerRef}
         role="group"
         aria-roledescription="slide"
         aria-label={`${index + 1} de ${total}`}
         aria-hidden={!isCenter}
         {...inertProps}
-        onPointerMove={onPointerMove}
-        onPointerLeave={onPointerLeave}
         className="relative will-change-transform"
-        style={{ x, y, scale, opacity, rotateY: rotY, rotateX: sx, filter: blur, transformOrigin: "50% 60%" }}
+        style={{ x, y, scale, opacity, rotateY: rotY, filter: blur, transformOrigin: "50% 60%" }}
       >
         <HubCardContext.Provider value={ctx}>{children}</HubCardContext.Provider>
-        {tiltOn && (
-          <motion.div
-            aria-hidden
-            className="pointer-events-none absolute inset-0 rounded-[18px]"
-            style={{ background: spotlight, opacity: glow, mixBlendMode: "plus-lighter" }}
-          />
-        )}
         <motion.div aria-hidden className="pointer-events-none absolute inset-0 rounded-[18px] bg-black" style={{ opacity: dim }} />
         {!isCenter && (
           <button
@@ -422,6 +380,50 @@ export function ViewCarousel<T>({
   // ── progresso
   const trackPct = n > 0 ? 100 / n : 100;
   const thumbLeft = useTransform(pos, (v) => `${(clamp(v, 0, Math.max(1, n - 1)) / Math.max(1, n - 1)) * (100 - trackPct)}%`);
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const trackDrag = useRef<{ id: number; moved: boolean } | null>(null);
+  /** x do ponteiro → posição contínua do carrossel (inversa de `thumbLeft`: o polegar fica centrado no ponteiro). */
+  const posFromTrack = (clientX: number) => {
+    const r = trackRef.current?.getBoundingClientRect();
+    const cnt = nRef.current;
+    if (!r || r.width < 2 || cnt < 2) return pos.get();
+    const f = (clientX - r.left) / r.width;
+    return clamp(((f - 0.5 / cnt) / (1 - 1 / cnt)) * (cnt - 1), 0, cnt - 1);
+  };
+  const onTrackDown = (e: React.PointerEvent) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    e.preventDefault();
+    animRef.current?.stop();
+    stopJank();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    trackDrag.current = { id: e.pointerId, moved: false };
+    goTo(Math.round(posFromTrack(e.clientX)));
+  };
+  const onTrackMove = (e: React.PointerEvent) => {
+    const d = trackDrag.current;
+    if (!d || e.pointerId !== d.id) return;
+    if (!d.moved) {
+      d.moved = true;
+      animRef.current?.stop();
+      stopJank();
+    }
+    pos.set(posFromTrack(e.clientX));
+  };
+  const onTrackUp = (e: React.PointerEvent) => {
+    const d = trackDrag.current;
+    if (!d || e.pointerId !== d.id) return;
+    trackDrag.current = null;
+    if (d.moved) goTo(Math.round(pos.get()));
+  };
+  const onTrackKey = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowRight" || e.key === "ArrowUp") goTo(targetRef.current + 1);
+    else if (e.key === "ArrowLeft" || e.key === "ArrowDown") goTo(targetRef.current - 1);
+    else if (e.key === "Home") goTo(0);
+    else if (e.key === "End") goTo(nRef.current - 1);
+    else return;
+    e.preventDefault();
+    e.stopPropagation();
+  };
 
   if (n === 0) return null;
   const lo = Math.max(0, center - WINDOW);
@@ -483,13 +485,29 @@ export function ViewCarousel<T>({
 
       {n > 1 && (
         <div className="mx-auto mt-2 flex w-full max-w-md items-center gap-3 px-4">
-          <div className="relative h-[3px] flex-1 overflow-hidden rounded-full bg-white/10">
-            <motion.div
-              className="absolute top-0 h-full rounded-full bg-white/80"
-              style={{ width: `${trackPct}%`, left: thumbLeft }}
-            />
+          <div
+            ref={trackRef}
+            role="slider"
+            tabIndex={0}
+            aria-label="Posição no carrossel"
+            aria-valuemin={1}
+            aria-valuemax={n}
+            aria-valuenow={center + 1}
+            onPointerDown={onTrackDown}
+            onPointerMove={onTrackMove}
+            onPointerUp={onTrackUp}
+            onPointerCancel={onTrackUp}
+            onKeyDown={onTrackKey}
+            className="group relative flex h-5 flex-1 cursor-pointer touch-none items-center"
+          >
+            <div className="relative h-[3px] w-full overflow-hidden rounded-full bg-white/10 transition-[height] duration-150 group-hover:h-[5px]">
+              <motion.div
+                className="absolute top-0 h-full rounded-full bg-white/80"
+                style={{ width: `${trackPct}%`, left: thumbLeft }}
+              />
+            </div>
           </div>
-          <span className="relative inline-flex h-4 w-14 items-center justify-end font-mono-fx text-[11px] tabular-nums text-[#A1A1AA]">
+          <span className="relative inline-flex h-4 w-14 items-center justify-end gap-1 font-mono-fx text-[11px] tabular-nums text-[#A1A1AA]">
             <AnimatePresence mode="popLayout" initial={false}>
               <motion.span
                 key={center}
@@ -498,9 +516,10 @@ export function ViewCarousel<T>({
                 exit={{ opacity: 0, y: -8, filter: reduced ? "none" : `blur(${BLUR.exit}px)` }}
                 transition={{ duration: sec(DURATION.base), ease: [...EASE.emphasized] }}
               >
-                {center + 1} / {n}
+                {center + 1}
               </motion.span>
             </AnimatePresence>
+            <span aria-hidden>/ {n}</span>
           </span>
         </div>
       )}

@@ -26,16 +26,26 @@ function useIsFull(id: string): boolean {
 export function useProjectStills(project: PrismProject) {
   const sig = useMemo(() => stillSignature(project), [project]);
   const layerIds = useMemo(() => stillLayerIds(project), [project]);
-  useSyncExternalStore(
+  // Snapshot só das URLs deste projeto: um still novo de outro card não re-renderiza este.
+  const stillsKey = useSyncExternalStore(
     (cb) => hubStills.subscribe(cb),
-    () => hubStills.version(),
-    () => 0
+    () => {
+      let k = "";
+      for (const lid of layerIds) k += `${hubStills.peek(StillCache.key(project.id, lid, sig)) ?? ""}
+`;
+      return k;
+    },
+    () => ""
   );
-  const stills: Record<string, string> = {};
-  for (const lid of layerIds) {
-    const url = hubStills.get(StillCache.key(project.id, lid, sig));
-    if (url) stills[lid] = url;
-  }
+  const stills = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const lid of layerIds) {
+      const url = hubStills.get(StillCache.key(project.id, lid, sig));
+      if (url) out[lid] = url;
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stillsKey, layerIds, project.id, sig]);
   const timers = useRef(new Map<string, number>());
   useEffect(
     () => () => {
@@ -46,6 +56,8 @@ export function useProjectStills(project: PrismProject) {
   );
   const onThumbFrame = useCallback(
     (layerId: string, el: HTMLCanvasElement | HTMLVideoElement) => {
+      // Já tem still desta assinatura: não recaptura a cada quadro (evita laço captura → notifica → re-render).
+      if (hubStills.has(StillCache.key(project.id, layerId, sig))) return;
       const prev = timers.current.get(layerId);
       if (prev !== undefined) window.clearTimeout(prev);
       timers.current.set(

@@ -137,7 +137,8 @@ body,
   padding: 0;
   background: var(--prism-pure-black);
   color: var(--prism-white);
-  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-family: "Outfit", "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-weight: 300;
   user-select: none;
   overflow: hidden;
 }
@@ -180,6 +181,19 @@ html.prism-transparent #root {
   box-shadow:
     0 24px 64px rgba(0, 0, 0, 0.72),
     inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+/* Popover/menu de vidro único (Select, ColorInput, configurações, atalhos, HUD, menu de contexto). */
+.prism-glass-pop {
+  background: rgba(14, 14, 18, 0.58);
+  backdrop-filter: blur(24px) saturate(140%);
+  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 18px;
+  box-shadow:
+    0 18px 48px rgba(0, 0, 0, 0.5),
+    0 2px 10px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
 }
 
 .frosted-chrome-card {

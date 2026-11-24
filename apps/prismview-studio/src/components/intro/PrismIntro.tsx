@@ -6,7 +6,7 @@ import { HERO_FRAG, HERO_VERT } from "./heroShader";
 
 /** Linha do tempo (igual à do Prismlock): 5,2 s lineares; fases em frações do total. */
 const TIMELINE_S = DURATION.intro / 1000;
-const MELT_S = 1.9;
+const MELT_S = 1.6;
 const PHRASES = ["OPTICAL GLASS", "ELASTIC TYPE", "LIVE WALLPAPERS"];
 const BRAND_P = "P";
 const BRAND_REST = "rismView";
@@ -225,7 +225,9 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
         }
         return;
       }
-      const w = Math.max(2, Math.min(1920, Math.round(size.w * scale)));
+      const m = melt.get();
+      // Durante o derretimento renderiza menor (o desfoque esconde a perda): 0,75× da escala normal.
+      const w = Math.max(2, Math.min(1920, Math.round(size.w * (m > 0.0005 ? scale * 0.75 : scale))));
       const h = Math.max(2, Math.round((size.h * w) / size.w));
       if (canvas.width !== w || canvas.height !== h) {
         canvas.width = w;
@@ -240,7 +242,6 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
       gl.uniform2f(loc.titleCenter, w * 0.5, lerp(h * 0.42, h * 0.28, sw));
       gl.uniform1f(loc.time, tt);
       gl.uniform1f(loc.amb, ((now % 9000) / 9000) * Math.PI * 2);
-      const m = melt.get();
       gl.uniform1f(loc.melt, m);
       const b = btnRef.current?.getBoundingClientRect();
       gl.uniform2f(loc.origin, (b ? b.left + b.width / 2 : size.w * 0.5) * k, (b ? b.top + b.height / 2 : size.h * 0.8) * k);

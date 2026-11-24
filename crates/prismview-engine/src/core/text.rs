@@ -518,7 +518,6 @@ impl TextSystem {
             0.0
         };
         let letter_spacing_px = letter_spacing_em * size;
-        let use_letter_spacing = letter_spacing_px.abs() >= 0.25;
 
         let (matched_family, matched_weight, matched_stretch, matched_style) =
             match_face_attrs(fs.db(), family.as_deref(), spec.weight);
@@ -539,173 +538,12 @@ impl TextSystem {
             None
         };
 
-        slot.spaced_glyphs.clear();
-        let (width, height) = if use_letter_spacing {
-            let metrics = Metrics::new(size, line_height);
-            let mut per_line: Vec<(f32, Vec<(Buffer, f32)>)> = Vec::new();
-            let mut max_w = wrap_width.unwrap_or(0.0);
-            let mut char_buf = [0u8; 4];
-
-            let measure_str = |fs: &mut FontSystem, text: &str| -> f32 {
-                let mut cursor = 0.0f32;
-                let mut w = 0.0f32;
-                let mut cb = [0u8; 4];
-                for ch in text.chars() {
-                    let s = ch.encode_utf8(&mut cb);
-                    let mut b = Buffer::new(fs, metrics);
-                    b.set_wrap(fs, Wrap::None);
-                    b.set_size(fs, None, None);
-                    b.set_text(fs, s, attrs, Shaping::Advanced);
-                    b.shape_until_scroll(fs, false);
-                    let (mut cw, _, _) = measure(&b);
-                    if cw <= 0.0 && ch.is_whitespace() {
-                        cw = size * 0.28;
-                    }
-                    let x = cursor.max(0.0);
-                    w = w.max(x + cw);
-                    cursor = x + cw + letter_spacing_px;
-                }
-                w
-            };
-
-            let mut wrapped_lines: Vec<String> = Vec::new();
-            if let Some(limit) = wrap_width {
-                for para in spec.text.split('\n') {
-                    if para.is_empty() {
-                        wrapped_lines.push(String::new());
-                        continue;
-                    }
-                    let mut current = String::new();
-                    for word in para.split_inclusive(|c: char| c.is_whitespace()) {
-                        let word_trimmed = word.trim_end();
-                        if current.is_empty() {
-                            if measure_str(fs, word_trimmed) <= limit {
-                                current.push_str(word);
-                            } else {
-                                // Palavra mais larga que a caixa: quebra por caractere.
-                                for ch in word.chars() {
-                                    let mut cand = current.clone();
-                                    cand.push(ch);
-                                    if !current.is_empty() && measure_str(fs, &cand) > limit {
-                                        wrapped_lines.push(current.trim_end().to_string());
-                                        current.clear();
-                                    }
-                                    current.push(ch);
-                                }
-                            }
-                        } else {
-                            let mut cand = current.clone();
-                            cand.push_str(word_trimmed);
-                            if measure_str(fs, &cand) <= limit {
-                                current.push_str(word);
-                            } else {
-                                wrapped_lines.push(current.trim_end().to_string());
-                                current.clear();
-                                if measure_str(fs, word_trimmed) <= limit {
-                                    current.push_str(word);
-                                } else {
-                                    for ch in word.chars() {
-                                        let mut cand2 = current.clone();
-                                        cand2.push(ch);
-                                        if !current.is_empty() && measure_str(fs, &cand2) > limit {
-                                            wrapped_lines.push(current.trim_end().to_string());
-                                            current.clear();
-                                        }
-                                        current.push(ch);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !current.is_empty() {
-                        wrapped_lines.push(current.trim_end().to_string());
-                    }
-                }
-            } else {
-                for line in spec.text.split('\n') {
-                    wrapped_lines.push(line.to_string());
-                }
-            }
-
-            for line in &wrapped_lines {
-                let mut cursor = 0.0f32;
-                let mut line_w = 0.0f32;
-                let mut items = Vec::new();
-                for ch in line.chars() {
-                    let s = ch.encode_utf8(&mut char_buf);
-                    let mut b = Buffer::new(fs, metrics);
-                    b.set_wrap(fs, Wrap::None);
-                    b.set_size(fs, None, None);
-                    b.set_text(fs, s, attrs, Shaping::Advanced);
-                    b.shape_until_scroll(fs, false);
-                    let (mut cw, _, _) = measure(&b);
-                    if cw <= 0.0 && ch.is_whitespace() {
-                        cw = size * 0.28;
-                    }
-                    let x = cursor.max(0.0);
-                    line_w = line_w.max(x + cw);
-                    if !ch.is_whitespace() {
-                        items.push((b, x));
-                    }
-                    cursor = x + cw + letter_spacing_px;
-                }
-                max_w = max_w.max(line_w);
-                per_line.push((line_w, items));
-            }
-            let total_h = (per_line.len().max(1) as f32) * line_height;
-            for (li, (line_w, items)) in per_line.into_iter().enumerate() {
-                let align_dx = match spec.align {
-                    TextAlignment::Start => 0.0,
-                    TextAlignment::Center => (max_w - line_w) * 0.5,
-                    TextAlignment::End => max_w - line_w,
-                };
-                let y = li as f32 * line_height;
-                for (b, x) in items {
-                    slot.spaced_glyphs.push((b, x + align_dx, y));
-                }
-            }
-            (max_w, total_h)
-        } else {
-            slot.buffer.set_metrics(fs, Metrics::new(size, line_height));
-            let align = match spec.align {
-                TextAlignment::Start => Align::Left,
-                TextAlignment::Center => Align::Center,
-                TextAlignment::End => Align::Right,
-            };
-            if let Some(limit) = wrap_width {
-                slot.buffer.set_wrap(fs, Wrap::WordOrGlyph);
-                slot.buffer.set_size(fs, Some(limit), None);
-                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
-                for line in slot.buffer.lines.iter_mut() {
-                    line.set_align(Some(align));
-                }
-                slot.buffer.shape_until_scroll(fs, false);
-                let (w, mut h, lines) = measure(&slot.buffer);
-                if lines == 0 {
-                    h = line_height;
-                }
-                (limit.max(w), h)
-            } else {
-                slot.buffer.set_wrap(fs, Wrap::None);
-                slot.buffer.set_size(fs, None, None);
-                slot.buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
-                slot.buffer.shape_until_scroll(fs, false);
-
-                let (w, mut h, lines) = measure(&slot.buffer);
-                if lines == 0 {
-                    h = line_height;
-                }
-                if lines > 1 && spec.align != TextAlignment::Start {
-                    // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
-                    slot.buffer.set_size(fs, Some(w.ceil()), None);
-                    for line in slot.buffer.lines.iter_mut() {
-                        line.set_align(Some(align));
-                    }
-                    slot.buffer.shape_until_scroll(fs, false);
-                }
-                (w, h)
-            }
-        };
+        let (width, height) = shape_layout(
+            fs,
+            &mut slot.buffer,
+            &mut slot.spaced_glyphs,
+            &ShapeParams { spec, size, line_height, letter_spacing_px, attrs, wrap_width },
+        );
 
         slot.key.store(spec);
         slot.font_gen = font_gen;
@@ -983,6 +821,201 @@ fn round_up(value: u32, step: u32) -> u32 {
     value.div_ceil(step).saturating_mul(step)
 }
 
+/// Parâmetros já saneados do layout de um texto (tudo em px físicos).
+struct ShapeParams<'a> {
+    spec: &'a TextSpec<'a>,
+    size: f32,
+    line_height: f32,
+    letter_spacing_px: f32,
+    attrs: Attrs<'a>,
+    wrap_width: Option<f32>,
+}
+
+/// Layout puro (sem GPU): quebra de linha, espaçamento e alinhamento. Devolve a caixa
+/// `(largura, altura)` em px físicos. Separado de `TextSystem::update` para ser testável
+/// sem `wgpu::Device` (paridade de caixa com o Estúdio).
+fn shape_layout(
+    fs: &mut FontSystem,
+    buffer: &mut Buffer,
+    spaced_glyphs: &mut Vec<(Buffer, f32, f32)>,
+    p: &ShapeParams<'_>,
+) -> (f32, f32) {
+    let ShapeParams { spec, size, line_height, letter_spacing_px, attrs, wrap_width } = *p;
+    let use_letter_spacing = letter_spacing_px.abs() >= 0.25;
+    spaced_glyphs.clear();
+    if use_letter_spacing {
+        let metrics = Metrics::new(size, line_height);
+        let mut per_line: Vec<(f32, Vec<(Buffer, f32)>)> = Vec::new();
+        let mut max_w = wrap_width.unwrap_or(0.0);
+        let mut char_buf = [0u8; 4];
+
+        let measure_str = |fs: &mut FontSystem, text: &str| -> f32 {
+            let mut cursor = 0.0f32;
+            let mut w = 0.0f32;
+            let mut cb = [0u8; 4];
+            for ch in text.chars() {
+                let s = ch.encode_utf8(&mut cb);
+                let mut b = Buffer::new(fs, metrics);
+                b.set_wrap(fs, Wrap::None);
+                b.set_size(fs, None, None);
+                b.set_text(fs, s, attrs, Shaping::Advanced);
+                b.shape_until_scroll(fs, false);
+                let (mut cw, _, _) = measure(&b);
+                if cw <= 0.0 && ch.is_whitespace() {
+                    cw = size * 0.28;
+                }
+                let x = cursor.max(0.0);
+                w = w.max(x + cw);
+                cursor = x + cw + letter_spacing_px;
+            }
+            w
+        };
+
+        let mut wrapped_lines: Vec<String> = Vec::new();
+        if let Some(limit) = wrap_width {
+            // Quebra só entre palavras (espaços), com a mesma tolerância do caminho sem
+            // espaçamento. Palavra que não cabe sozinha fica inteira na linha e estende a
+            // caixa (`max_w`), nunca é partida no meio.
+            let fit_limit = limit + wrap_tolerance(limit, size);
+            for para in spec.text.split('\n') {
+                if para.is_empty() {
+                    wrapped_lines.push(String::new());
+                    continue;
+                }
+                let mut current = String::new();
+                for word in para.split_inclusive(|c: char| c.is_whitespace()) {
+                    if current.is_empty() {
+                        current.push_str(word);
+                        continue;
+                    }
+                    let mut cand = current.clone();
+                    cand.push_str(word.trim_end());
+                    if measure_str(fs, &cand) <= fit_limit {
+                        current.push_str(word);
+                    } else {
+                        wrapped_lines.push(current.trim_end().to_string());
+                        current.clear();
+                        current.push_str(word);
+                    }
+                }
+                if !current.is_empty() {
+                    wrapped_lines.push(current.trim_end().to_string());
+                }
+            }
+        } else {
+            for line in spec.text.split('\n') {
+                wrapped_lines.push(line.to_string());
+            }
+        }
+
+        for line in &wrapped_lines {
+            let mut cursor = 0.0f32;
+            let mut line_w = 0.0f32;
+            let mut items = Vec::new();
+            for ch in line.chars() {
+                let s = ch.encode_utf8(&mut char_buf);
+                let mut b = Buffer::new(fs, metrics);
+                b.set_wrap(fs, Wrap::None);
+                b.set_size(fs, None, None);
+                b.set_text(fs, s, attrs, Shaping::Advanced);
+                b.shape_until_scroll(fs, false);
+                let (mut cw, _, _) = measure(&b);
+                if cw <= 0.0 && ch.is_whitespace() {
+                    cw = size * 0.28;
+                }
+                let x = cursor.max(0.0);
+                line_w = line_w.max(x + cw);
+                if !ch.is_whitespace() {
+                    items.push((b, x));
+                }
+                cursor = x + cw + letter_spacing_px;
+            }
+            // O CSS soma o `letter-spacing` também depois do último caractere da linha:
+            // mesma largura de caixa e mesmo centro de alinhamento que o Estúdio.
+            if !line.is_empty() {
+                line_w = (line_w + letter_spacing_px).max(0.0);
+            }
+            max_w = max_w.max(line_w);
+            per_line.push((line_w, items));
+        }
+        let total_h = (per_line.len().max(1) as f32) * line_height;
+        for (li, (line_w, items)) in per_line.into_iter().enumerate() {
+            let align_dx = match spec.align {
+                TextAlignment::Start => 0.0,
+                TextAlignment::Center => (max_w - line_w) * 0.5,
+                TextAlignment::End => max_w - line_w,
+            };
+            let y = li as f32 * line_height;
+            for (b, x) in items {
+                spaced_glyphs.push((b, x + align_dx, y));
+            }
+        }
+        (max_w, total_h)
+    } else {
+        buffer.set_metrics(fs, Metrics::new(size, line_height));
+        let align = match spec.align {
+            TextAlignment::Start => Align::Left,
+            TextAlignment::Center => Align::Center,
+            TextAlignment::End => Align::Right,
+        };
+        if let Some(limit) = wrap_width {
+            // `Wrap::Word` (nunca no meio da palavra, ex. "00:06") com tolerância: as métricas
+            // do motor saem um pouco maiores que as do navegador (sem `tnum`, arredondamentos).
+            // Palavra que não cabe sozinha transborda a linha e estende a caixa.
+            let layout_w = limit + wrap_tolerance(limit, size);
+            buffer.set_wrap(fs, Wrap::Word);
+            buffer.set_size(fs, Some(layout_w), None);
+            buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
+            for line in buffer.lines.iter_mut() {
+                line.set_align(Some(align));
+            }
+            buffer.shape_until_scroll(fs, false);
+            let (w, mut h, lines) = measure(&buffer);
+            if lines == 0 {
+                h = line_height;
+            }
+            let box_w = limit.max(w);
+            if (box_w - layout_w).abs() > 0.5 {
+                // Alinhar (centro/fim) dentro da caixa final; as quebras não mudam porque
+                // nenhuma linha passa de `w <= box_w`.
+                buffer.set_size(fs, Some(box_w.ceil()), None);
+                buffer.shape_until_scroll(fs, false);
+            }
+            (box_w, h)
+        } else {
+            buffer.set_wrap(fs, Wrap::None);
+            buffer.set_size(fs, None, None);
+            buffer.set_text(fs, spec.text, attrs, Shaping::Advanced);
+            buffer.shape_until_scroll(fs, false);
+
+            let (w, mut h, lines) = measure(&buffer);
+            if lines == 0 {
+                h = line_height;
+            }
+            if lines > 1 && spec.align != TextAlignment::Start {
+                // Alinhar dentro da largura da própria caixa (centro/fim entre linhas).
+                buffer.set_size(fs, Some(w.ceil()), None);
+                for line in buffer.lines.iter_mut() {
+                    line.set_align(Some(align));
+                }
+                buffer.shape_until_scroll(fs, false);
+            }
+            (w, h)
+        }
+    }
+}
+
+/// Folga relativa à caixa (`maxWidth`) e em `em` do corpo ao decidir se uma palavra cabe na linha.
+/// O navegador do Estúdio usa números tabulares (`tnum`) e arredondamentos próprios; o
+/// cosmic-text 0.12 não expõe features OpenType, então as medidas do motor saem levemente maiores.
+const WRAP_TOLERANCE_REL: f32 = 0.03;
+const WRAP_TOLERANCE_EM: f32 = 0.08;
+
+/// Largura extra aceita além de `limit` antes de mandar a palavra para a linha de baixo.
+fn wrap_tolerance(limit: f32, size: f32) -> f32 {
+    (limit * WRAP_TOLERANCE_REL).max(size * WRAP_TOLERANCE_EM)
+}
+
 /// (largura máxima, altura total, nº de linhas de layout).
 fn measure(buffer: &Buffer) -> (f32, f32, usize) {
     let mut width = 0.0f32;
@@ -1217,6 +1250,236 @@ mod tests {
             used_face.families.iter().any(|(n, _)| n.eq_ignore_ascii_case("Impact")),
             "expected Impact, got {:?}",
             used_face.families
+        );
+    }
+
+    #[test]
+    fn wrap_tolerance_scales_with_box_and_font() {
+        // Caixa grande: domina a parte relativa.
+        assert!((wrap_tolerance(1000.0, 10.0) - 30.0).abs() < 1e-3);
+        // Caixa pequena com fonte grande: domina a parte em em.
+        assert!((wrap_tolerance(100.0, 200.0) - 16.0).abs() < 1e-3);
+        assert!(wrap_tolerance(0.0, 0.0) >= 0.0);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn word_wrap_keeps_clock_whole_in_a_narrow_box() {
+        let paths = crate::platform::windows::resolve_font_files("Segoe UI");
+        if paths.is_empty() {
+            return;
+        }
+        let mut fs = FontSystem::new_with_locale_and_db(
+            TEXT_ATLAS_LOCALE.to_string(),
+            fontdb::Database::new(),
+        );
+        for p in &paths {
+            let _ = fs.db_mut().load_font_file(p);
+        }
+        let fam = find_family(fs.db(), "Segoe UI").expect("Segoe UI family loaded");
+        let attrs = Attrs::new().family(Family::Name(&fam));
+        let runs_at = |fs: &mut FontSystem, wrap: Wrap, width: Option<f32>| -> (usize, f32) {
+            let mut buf = Buffer::new(fs, Metrics::new(120.0, 120.0 * 1.06));
+            buf.set_wrap(fs, wrap);
+            buf.set_size(fs, width, None);
+            buf.set_text(fs, "00:06", attrs, Shaping::Advanced);
+            buf.shape_until_scroll(fs, false);
+            let (w, _, lines) = measure(&buf);
+            (lines, w)
+        };
+        let (_, natural) = runs_at(&mut fs, Wrap::None, None);
+        assert!(natural > 40.0, "relógio sem largura: {natural}");
+        // Caixa bem menor que o texto: `Word` mantém "00:06" inteiro e a caixa passa a ser o texto.
+        let (lines_word, w_word) = runs_at(&mut fs, Wrap::Word, Some(natural * 0.5));
+        assert_eq!(lines_word, 1, "Word não pode quebrar dentro de 00:06");
+        assert!(w_word >= natural * 0.99, "largura {w_word} < natural {natural}");
+        // Controle: o modo antigo partia a palavra no meio.
+        let (lines_glyph, _) = runs_at(&mut fs, Wrap::WordOrGlyph, Some(natural * 0.5));
+        assert!(lines_glyph > 1, "o controle WordOrGlyph deveria quebrar");
+    }
+
+    // ── Paridade de caixa Estúdio × motor (casos em `prism-core/src/text_layout_cases.json`) ──
+
+    #[derive(Debug, Clone, Default, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CaseFields {
+        name: Option<String>,
+        text: Option<String>,
+        font_family: Option<String>,
+        weight: Option<u16>,
+        letter_spacing_em: Option<f32>,
+        align: Option<String>,
+        size_px: Option<f32>,
+        max_width_em: Option<f32>,
+        expect_lines: Option<usize>,
+        min_lines: Option<usize>,
+        max_lines: Option<usize>,
+        box_at_least_max: Option<bool>,
+        box_at_least_natural: Option<bool>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ScaleInvariance {
+        text: String,
+        sizes_px: Vec<f32>,
+        tolerance: f32,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CasesFile {
+        defaults: CaseFields,
+        cases: Vec<CaseFields>,
+        scale_invariance: ScaleInvariance,
+    }
+
+    const LAYOUT_CASES_JSON: &str = include_str!("../../../prism-core/src/text_layout_cases.json");
+
+    /// Sistema de fontes só com as famílias embutidas no Estúdio (resultado igual em qualquer PC).
+    fn bundled_font_system() -> FontSystem {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/prismview-studio/src-tauri/fonts");
+        let mut fs = FontSystem::new_with_locale_and_db(
+            TEXT_ATLAS_LOCALE.to_string(),
+            fontdb::Database::new(),
+        );
+        let mut loaded = 0;
+        for entry in std::fs::read_dir(&dir).expect("pasta src-tauri/fonts") {
+            let path = entry.expect("entrada").path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ttf") {
+                fs.db_mut().load_font_file(&path).expect("fonte embutida legível");
+                loaded += 1;
+            }
+        }
+        assert!(loaded > 0, "nenhuma fonte embutida em {}", dir.display());
+        fs
+    }
+
+    /// Mesmo caminho de `TextSystem::update` (família/peso/linha 1.06), sem GPU.
+    /// Devolve `(largura da caixa, altura, nº de linhas)`.
+    fn shape_case(
+        fs: &mut FontSystem,
+        family: &str,
+        weight: u16,
+        text: &str,
+        size: f32,
+        letter_spacing_em: f32,
+        align: TextAlignment,
+        wrap_width: Option<f32>,
+    ) -> (f32, f32, usize) {
+        let fam = find_family(fs.db(), family).unwrap_or_else(|| panic!("família {family}"));
+        let (matched, mw, ms, my) = match_face_attrs(fs.db(), Some(&fam), weight);
+        let name = matched.unwrap_or(fam);
+        let attrs = Attrs::new()
+            .family(Family::Name(&name))
+            .weight(mw)
+            .stretch(ms)
+            .style(my)
+            .color(Color::rgb(255, 255, 255));
+        let line_height = size * 1.06;
+        let spec = TextSpec {
+            text,
+            font_id: family,
+            size_px: size,
+            weight,
+            line_spacing: 0.0,
+            letter_spacing_em,
+            align,
+            max_width_px: wrap_width.unwrap_or(0.0),
+            stretch: 1.0,
+            stem_compensation: 1.0,
+        };
+        let mut buffer = Buffer::new(fs, Metrics::new(16.0, 20.0));
+        let mut spaced = Vec::new();
+        let (w, h) = shape_layout(
+            fs,
+            &mut buffer,
+            &mut spaced,
+            &ShapeParams {
+                spec: &spec,
+                size,
+                line_height,
+                letter_spacing_px: letter_spacing_em * size,
+                attrs,
+                wrap_width,
+            },
+        );
+        (w, h, (h / line_height).round().max(1.0) as usize)
+    }
+
+    fn parse_align(s: &str) -> TextAlignment {
+        match s {
+            "left" | "start" => TextAlignment::Start,
+            "right" | "end" => TextAlignment::End,
+            _ => TextAlignment::Center,
+        }
+    }
+
+    #[test]
+    fn studio_and_engine_text_boxes_stay_in_parity() {
+        let file: CasesFile = serde_json::from_str(LAYOUT_CASES_JSON).expect("JSON de casos válido");
+        let mut fs = bundled_font_system();
+        let d = &file.defaults;
+        for c in &file.cases {
+            let name = c.name.as_deref().unwrap_or("?");
+            let text = c.text.as_deref().expect("text");
+            let family = c.font_family.as_deref().or(d.font_family.as_deref()).expect("fontFamily");
+            let weight = c.weight.or(d.weight).expect("weight");
+            let ls = c.letter_spacing_em.or(d.letter_spacing_em).unwrap_or(0.0);
+            let size = c.size_px.or(d.size_px).expect("sizePx");
+            let align = parse_align(c.align.as_deref().or(d.align.as_deref()).unwrap_or("center"));
+            let max_px = c.max_width_em.map(|em| em * size);
+
+            let (natural_w, _, _) = shape_case(&mut fs, family, weight, text, size, ls, align, None);
+            let (w, _, lines) = shape_case(&mut fs, family, weight, text, size, ls, align, max_px);
+
+            if let Some(n) = c.expect_lines {
+                assert_eq!(lines, n, "[{name}] linhas");
+            }
+            if let Some(n) = c.min_lines {
+                assert!(lines >= n, "[{name}] {lines} linhas < mínimo {n}");
+            }
+            if let Some(n) = c.max_lines {
+                assert!(lines <= n, "[{name}] {lines} linhas > máximo {n}");
+            }
+            if c.box_at_least_max == Some(true) {
+                let m = max_px.expect("boxAtLeastMax exige maxWidthEm");
+                assert!(w >= m - 0.5, "[{name}] caixa {w} menor que maxWidth {m}");
+            }
+            if c.box_at_least_natural == Some(true) {
+                assert!(
+                    w >= natural_w * 0.99,
+                    "[{name}] caixa {w} não comporta o texto natural {natural_w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn engine_text_width_scales_linearly_with_font_size() {
+        let file: CasesFile = serde_json::from_str(LAYOUT_CASES_JSON).expect("JSON de casos válido");
+        let s = &file.scale_invariance;
+        let d = &file.defaults;
+        let mut fs = bundled_font_system();
+        let family = d.font_family.as_deref().expect("fontFamily");
+        let weight = d.weight.expect("weight");
+        let ratios: Vec<f32> = s
+            .sizes_px
+            .iter()
+            .map(|&size| {
+                let (w, _, _) =
+                    shape_case(&mut fs, family, weight, &s.text, size, 0.0, TextAlignment::Center, None);
+                w / size
+            })
+            .collect();
+        let (lo, hi) = ratios
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+        assert!(
+            (hi - lo) / hi <= s.tolerance,
+            "largura/tamanho não é constante: {ratios:?} (tolerância {})",
+            s.tolerance
         );
     }
 

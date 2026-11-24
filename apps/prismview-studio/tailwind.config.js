@@ -11,6 +11,9 @@ export default {
         mutedZinc: "#A1A1AA",
         trackZinc: "#27272A",
       },
+      fontFamily: {
+        sans: ['"Outfit"', '"Inter"', '"Segoe UI"', "system-ui", "sans-serif"],
+      },
       borderRadius: {
         panel: "26px",
         card: "16px",

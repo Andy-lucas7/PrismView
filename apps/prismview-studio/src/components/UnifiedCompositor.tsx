@@ -841,11 +841,23 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           }
         }}
         onPointerDown={(e) => {
-          if (!interactive || test3dMode || roomActive || layer.locked) return;
+          if (!interactive || test3dMode || roomActive) return;
           const isModSelect = e.ctrlKey || e.metaKey || e.altKey;
           // Allow direct child selection with Alt+Click or when already selected
           if (!isTopLevel && !selectedSet.has(layer.id) && !e.altKey) return;
           e.stopPropagation();
+
+          // Camada bloqueada continua sólida para o clique (seleciona, nunca deixa o clique atravessar
+          // para o item de baixo), mas não inicia arraste.
+          if (layer.locked) {
+            if (isModSelect || !selectedSet.has(layer.id)) {
+              onSelectLayer?.(layer.id, {
+                ctrlKey: e.ctrlKey || e.metaKey,
+                altKey: e.altKey,
+              });
+            }
+            return;
+          }
 
           if (isModSelect) {
             onSelectLayer?.(layer.id, {
@@ -906,14 +918,9 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           if (interactive) {
             if (test3dMode || roomActive) return;
             if (!isTopLevel && !selectedSet.has(layer.id) && !e.altKey) return;
+            // A seleção (inclusive de camada bloqueada) já foi tratada no pointerdown; aqui só
+            // impede que o clique chegue ao fundo e limpe a seleção.
             e.stopPropagation();
-            // On locked layers (where pointerDown returned early), handle selection here including modifiers
-            if (layer.locked) {
-              onSelectLayer?.(layer.id, {
-                ctrlKey: e.ctrlKey || e.metaKey,
-                altKey: e.altKey,
-              });
-            }
             return;
           }
           if (!isThumbnail && layer.clickAction && layer.clickAction !== "NONE") {
@@ -944,10 +951,13 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           mixBlendMode: g.enabled ? undefined : layer.blendMode,
           willChange: hasParallax && !paused ? "transform" : undefined,
           // Sala 3D: 2D layers stop hit-testing; only the edited 3D canvas opts back in
-          // Camada bloqueada no editor é intangível: cliques/arrastes atravessam até o que está embaixo
-          pointerEvents: roomActive || (interactive && layer.locked) ? "none" : undefined,
+          // Camada bloqueada no editor ainda recebe o clique (seleciona sem mover): o hit-test segue
+          // sempre a ordem visual, nunca atravessa para o item de baixo.
+          pointerEvents: roomActive ? "none" : undefined,
           cursor: interactive
-            ? isTopLevel || selectedLayerId === layer.id
+            ? layer.locked
+              ? "default"
+              : isTopLevel || selectedLayerId === layer.id
               ? "grab"
               : "default"
             : !isThumbnail && layer.clickAction && layer.clickAction !== "NONE"

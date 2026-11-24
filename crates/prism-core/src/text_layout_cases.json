@@ -1,0 +1,18 @@
+{
+  "_doc": "Casos de layout de texto Estúdio × motor. O teste Rust (`prismview-engine`, core/text.rs) mede a caixa com as fontes embutidas e o teste TS (`tests/textLayoutParity.test.ts`) valida este arquivo e o contrato do Estúdio (CSS). Tamanhos em px lógicos; `maxWidthEm`/`sizePx` evitam depender de métricas absolutas de fonte. Mudou um lado, mude o outro.",
+  "defaults": { "fontFamily": "Outfit", "weight": 300, "letterSpacingEm": 0, "align": "center", "sizePx": 200 },
+  "cases": [
+    { "name": "relogio-sem-caixa", "text": "18:45", "expectLines": 1 },
+    { "name": "relogio-caixa-estreita-nunca-quebra", "text": "00:06", "maxWidthEm": 0.8, "expectLines": 1, "boxAtLeastMax": true, "boxAtLeastNatural": true },
+    { "name": "relogio-caixa-justa", "text": "00:06", "maxWidthEm": 2.45, "expectLines": 1, "boxAtLeastMax": true },
+    { "name": "relogio-com-espacamento-letras", "text": "00:06", "letterSpacingEm": 0.08, "maxWidthEm": 0.8, "expectLines": 1, "boxAtLeastMax": true, "boxAtLeastNatural": true },
+    { "name": "relogio-espacamento-negativo", "text": "00:06", "letterSpacingEm": -0.04, "maxWidthEm": 0.8, "expectLines": 1, "boxAtLeastMax": true },
+    { "name": "frase-quebra-em-espacos", "text": "Solus lesus salvat", "sizePx": 80, "maxWidthEm": 5.0, "minLines": 2, "maxLines": 3, "boxAtLeastMax": true },
+    { "name": "frase-com-espacamento-quebra-em-espacos", "text": "Solus lesus salvat", "sizePx": 80, "letterSpacingEm": 0.06, "maxWidthEm": 5.0, "minLines": 2, "maxLines": 3, "boxAtLeastMax": true },
+    { "name": "palavra-longa-estende-a-caixa", "text": "Supercalifragilistico", "sizePx": 80, "maxWidthEm": 3.0, "expectLines": 1, "boxAtLeastMax": true, "boxAtLeastNatural": true },
+    { "name": "quebra-explicita", "text": "primeira\nsegunda", "sizePx": 80, "expectLines": 2 },
+    { "name": "quebra-explicita-com-caixa", "text": "primeira\nsegunda", "sizePx": 80, "maxWidthEm": 8.0, "expectLines": 2, "boxAtLeastMax": true },
+    { "name": "mono-telemetria", "text": "CPU 12%  ·  RAM 48%", "fontFamily": "JetBrains Mono", "weight": 400, "sizePx": 40, "expectLines": 1 }
+  ],
+  "scaleInvariance": { "text": "18:45", "sizesPx": [60, 120, 240], "tolerance": 0.02 }
+}

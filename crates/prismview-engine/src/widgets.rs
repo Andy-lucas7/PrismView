@@ -547,10 +547,7 @@ impl WidgetRuntime {
     /// Desenha e apresenta (alpha pré-multiplicado, fundo transparente).
     pub fn render(&mut self, gpu: &GpuContext, ctx: &mut EvalContext) -> FrameStatus {
         let (w, h) = self.surface.size();
-        let ui_scale = match self.scene.logical_size {
-            Some([lw, lh]) if lw > 0.0 && lh > 0.0 => (w as f32 / lw).min(h as f32 / lh),
-            _ => 1.0,
-        };
+        let ui_scale = self.scene.ui_scale(w as f32, h as f32).unwrap_or(1.0);
         std::mem::swap(&mut ctx.globals, &mut self.globals);
         let status = self.renderer.render(
             gpu,

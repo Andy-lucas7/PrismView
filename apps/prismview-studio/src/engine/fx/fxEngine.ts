@@ -55,6 +55,17 @@ export const DEFAULT_FX_WEATHER: FxWeather = {
   is_day: true,
 };
 
+/**
+ * Funções reconhecidas pelo parser (`df` em `Parser.call`, as demais em `Parser.evalFn`) e por
+ * `fx.rs`. A Ajuda (`fxDocs.ts`) tem um verbete por nome: o tipo `FxFunctionName` faz o `tsc`
+ * falhar se um nome novo não for documentado, e `tests/fxDocs.test.ts` confere `case`s do
+ * parser e do Rust contra esta lista.
+ */
+export const FX_FUNCTION_NAMES = [
+  "df", "tf", "gv", "rm", "sys", "si", "bi", "mi", "wi", "ai", "if", "ce", "tc", "mu", "fl",
+] as const;
+export type FxFunctionName = (typeof FX_FUNCTION_NAMES)[number];
+
 export interface FxContext {
   now: Date;
   telemetry: FxTelemetry;

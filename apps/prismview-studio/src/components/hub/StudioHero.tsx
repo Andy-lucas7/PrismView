@@ -53,6 +53,9 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
     return `inset(${(insetY * k).toFixed(2)}px ${(insetX * k).toFixed(2)}px ${(insetY * k).toFixed(2)}px ${(insetX * k).toFixed(2)}px round ${(rad0 * k).toFixed(2)}px)`;
   });
 
+  // Dissolução: blur curto acompanha a queda da opacidade (só no fim; 0 enquanto opaco = sem filtro).
+  const filter = useTransform(opacity, (o) => (o >= 0.999 ? "none" : `blur(${((1 - o) * 6).toFixed(2)}px)`));
+
   const isWidget = project.packageType === "WIDGET";
   const wAspect = isWidget ? project.widget.width / project.widget.height : 1;
   // Largura da caixa do widget em unidades locais (o card a mostra com `innerRect.width` px de tela).
@@ -62,7 +65,7 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
     <motion.div
       aria-hidden
       className="pointer-events-none fixed left-0 top-0 z-[400] overflow-hidden bg-pureBlack"
-      style={{ width: vw, height: vh, transformOrigin: "0 0", transform, clipPath: clip, opacity, willChange: "transform, clip-path, opacity" }}
+      style={{ width: vw, height: vh, transformOrigin: "0 0", transform, clipPath: clip, opacity, filter, willChange: "transform, clip-path, opacity" }}
     >
       {isWidget ? (
         <div

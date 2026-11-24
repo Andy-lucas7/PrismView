@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select, ColorInput } from "./components/ui/Controls";
 import { BlurText, COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { AnimatePresence, animate, motion, MotionConfig, useMotionValue, useReducedMotion, useTransform } from "framer-motion";
 import {
+  BookOpen,
   Box,
   ChevronDown,
   ChevronRight,
@@ -67,6 +68,9 @@ import { StudioHero, type HeroRect } from "./components/hub/StudioHero";
 import { PrismIntro } from "./components/intro/PrismIntro";
 import { setIntroHold, useIntroDecision, writeSeenMarker } from "./engine/introGate";
 import { StudioEditor } from "./components/StudioEditor";
+
+/** Ajuda: carregada só na primeira abertura (conteúdo e busca não pesam no início). */
+const HelpPanel = React.lazy(() => import("./components/HelpPanel"));
 import {
   POWER_PREFERENCE_LABELS,
   POWER_STATE_HINTS,
@@ -565,6 +569,14 @@ const StudioHubApp: React.FC = () => {
   const [syncWindowsWallpaper, setSyncWindowsWallpaper] = useState(false);
   const [syncWinBusy, setSyncWinBusy] = useState(false);
   const [optionsOpen, setOptionsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  /** Vira true na 1ª abertura e fica: o painel mantém sua animação de saída. */
+  const [helpMounted, setHelpMounted] = useState(false);
+  const openHelp = useCallback(() => {
+    setHelpMounted(true);
+    setHelpOpen(true);
+  }, []);
+  const closeHelp = useCallback(() => setHelpOpen(false), []);
   const optionsRef = useRef<HTMLDivElement | null>(null);
   const optionsPanelRef = useRef<HTMLDivElement | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -1537,6 +1549,18 @@ const StudioHubApp: React.FC = () => {
     };
   }, [optionsOpen]);
 
+  // F1 abre a Ajuda (fechar com F1/Esc é tratado dentro do próprio painel, em captura).
+  useEffect(() => {
+    if (introPhase === "play" || introPhase === "melt") return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key !== "F1" || ev.ctrlKey || ev.altKey || ev.shiftKey || ev.metaKey) return;
+      ev.preventDefault();
+      openHelp();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [introPhase, openHelp]);
+
   useEffect(() => {
     if (!createModalOpen) return;
     const onKeyDown = (ev: KeyboardEvent) => {
@@ -1702,15 +1726,38 @@ const StudioHubApp: React.FC = () => {
     heroOpacity.set(0);
     afterFrames(2, () => {
       animate(heroOpacity, 1, { duration: sec(DURATION.instant) });
-      animate(heroP, 1, heroEase).then(() => {
-        setEditing(project); // monta o Studio por baixo do hero já em tela cheia
-        // Só revela quando o Studio terminou de montar e a thread principal está ociosa (em PC lento o
-        // card fica parado em tela cheia, sem tela preta e sem engasgar o fade).
-        afterFrames(2, () =>
-          whenIdle(() => {
-            animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
-          })
-        );
+      // Sem tela cheia parada: ao passar de ~70% do progresso o Studio monta por baixo e, quando a
+      // thread ficar ociosa, o hero se dissolve (opacity + blur curto) enquanto ainda termina de crescer.
+      let mounted = false;
+      let dissolved = false;
+      let grown = false;
+      const tryFinish = () => {
+        if (grown && dissolved) finish();
+      };
+      const dissolve = () => {
+        animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(() => {
+          dissolved = true;
+          tryFinish();
+        });
+      };
+      const mountStudio = () => {
+        if (mounted) return;
+        mounted = true;
+        // Fora do tick da animação: o mount é pesado e não pode rodar dentro do onUpdate.
+        requestAnimationFrame(() => {
+          setEditing(project);
+          afterFrames(2, () => whenIdle(dissolve));
+        });
+      };
+      animate(heroP, 1, {
+        ...heroEase,
+        onUpdate: (v) => {
+          if (v >= 0.7) mountStudio();
+        },
+      }).then(() => {
+        grown = true;
+        mountStudio();
+        tryFinish();
       });
     });
   }
@@ -1788,6 +1835,7 @@ const StudioHubApp: React.FC = () => {
             void flushPendingSave().then(flushFailedSaves);
           }}
           onBack={closeStudio}
+          onOpenHelp={openHelp}
           applying={busy !== null && (busy.startsWith("apply:") || busy.startsWith("pin:"))}
           exporting={busy !== null && busy.startsWith("export:")}
           onApply={() => {
@@ -2005,6 +2053,15 @@ const StudioHubApp: React.FC = () => {
               {runtime.paused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
               {runtime.paused ? "Retomar" : "Pausar"}
             </button>
+            <button
+              type="button"
+              onClick={openHelp}
+              aria-label="Ajuda e documentação (F1)"
+              title="Ajuda e documentação (F1)"
+              className="rounded-xl p-2 text-xs flex items-center justify-center transition frosted-chrome text-[#A1A1AA] hover:text-white hover:border-white/30"
+            >
+              <BookOpen className="w-4 h-4" />
+            </button>
             <div ref={optionsRef} className="relative">
               <button aria-label="Opções do PrismView e da Engine"
                 type="button"
@@ -2024,7 +2081,7 @@ const StudioHubApp: React.FC = () => {
                 createPortal(
                   <div
                     ref={optionsPanelRef}
-                    className="fixed left-4 bottom-16 z-[80] w-80 frosted-chrome-popover frosted-chrome-panel rounded-2xl p-4 space-y-3.5"
+                    className="fixed left-4 bottom-16 z-[80] w-80 prism-glass-pop p-4 space-y-3.5"
                   >
                   <div className="flex items-center justify-between border-b border-white/10 pb-2">
                     <span className="text-xs font-semibold text-white">Opções do Aplicativo</span>
@@ -2382,7 +2439,7 @@ const StudioHubApp: React.FC = () => {
                   const isActive = runtime.active_wallpaper_id === wp.id;
                   const wpKind = classifyWallpaperKind(wp);
                   return (
-                    <motion.article key={wp.id} layoutId={`hub-card-WP-${wp.id}`}
+                    <motion.article key={wp.id}
                       className="prism-hub-card flex flex-col">
                       <div
                         data-hub-card={wp.id}
@@ -2526,7 +2583,7 @@ const StudioHubApp: React.FC = () => {
                   const pinned = runtime.pinned_widget_ids.includes(w.id);
                   const isLocked = runtime.locked_widget_ids.includes(w.id);
                   return (
-                    <motion.article key={w.id} layoutId={`hub-card-WG-${w.id}`}
+                    <motion.article key={w.id}
                       className="prism-hub-card flex flex-col">
                       <div
                         data-hub-card={w.id}
@@ -2725,8 +2782,7 @@ const StudioHubApp: React.FC = () => {
                   return (
                     <motion.article
                       key={tpl.id}
-                      layoutId={`hub-card-TP-${tpl.id}`}
-                      className="prism-hub-card overflow-hidden flex flex-col justify-between"
+                                      className="prism-hub-card overflow-hidden flex flex-col justify-between"
                     >
                       <div>
                         <div
@@ -3119,6 +3175,11 @@ const StudioHubApp: React.FC = () => {
         />
       )}
       {hero && <StudioHero project={hero.project} rect={hero.rect} innerRect={hero.innerRect} p={heroP} opacity={heroOpacity} />}
+      {helpMounted && (
+        <Suspense fallback={null}>
+          <HelpPanel open={helpOpen} onClose={closeHelp} />
+        </Suspense>
+      )}
     </>
   );
 };

@@ -681,11 +681,11 @@ impl NativeApp {
 
         self.pending_win_wallpaper = None;
         let (w, h) = output.surface.size();
-        let logical = self.scene.as_ref().and_then(|s| s.logical_size);
-        let ui_scale = match logical {
-            Some([lw, lh]) if lw > 0.0 && lh > 0.0 => (w as f32 / lw).min(h as f32 / lh),
-            _ => output.scale,
-        };
+        let ui_scale = self
+            .scene
+            .as_ref()
+            .and_then(|s| s.ui_scale(w as f32, h as f32))
+            .unwrap_or(output.scale);
         let clear = self.clear_color;
         let Some((sw, sh, rgb)) = self
             .renderer
@@ -1715,19 +1715,16 @@ impl NativeApp {
         let mut device_lost = false;
         let mut renderer = self.renderer.as_mut().filter(|r| r.has_scene());
         // Cena vinda do Estúdio: escala = `containerScale` (espaço lógico → px da saída).
-        let logical = self.scene.as_ref().and_then(|s| s.logical_size);
+        let scene = self.scene.as_ref();
 
         for output in self.outputs.iter_mut() {
             if host.monitor_visibility(&output.monitor_id) != DesktopVisibility::Visible {
                 continue; // coberto/bloqueado: volta no VisibilityChanged
             }
-            let ui_scale = match logical {
-                Some([lw, lh]) if lw > 0.0 && lh > 0.0 => {
-                    let (w, h) = output.surface.size();
-                    (w as f32 / lw).min(h as f32 / lh)
-                }
-                _ => output.scale,
-            };
+            let (sw, sh) = output.surface.size();
+            let ui_scale = scene
+                .and_then(|s| s.ui_scale(sw as f32, sh as f32))
+                .unwrap_or(output.scale);
             let status = match renderer.as_deref_mut() {
                 Some(r) => r.render(
                     gpu,

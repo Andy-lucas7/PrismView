@@ -955,9 +955,47 @@ impl Default for PrismScene {
     }
 }
 
+/// Lado curto da base lógica dos wallpapers no Estúdio (`UnifiedCompositor.tsx`).
+pub const WALLPAPER_LOGICAL_SIDE: f32 = 1080.0;
+/// Base mínima do lado longo da base adaptativa (`Math.max(960, ...)` do Estúdio).
+const WALLPAPER_LOGICAL_MIN_LONG: f32 = 960.0;
+
 impl PrismScene {
     pub fn is_widget(&self) -> bool {
         self.package_type == PackageKind::Widget
+    }
+
+    /// Escala de UI (espaço lógico → px da saída) para uma superfície `w × h` em px físicos.
+    /// `None` = a cena não declara `logical_size` (usar o fator de DPI do monitor).
+    ///
+    /// Widgets: `min(w/lw, h/lh)`. Wallpapers (`logical_size` = 1080×1080): reproduz **exatamente**
+    /// o `containerScale` do Estúdio, cuja base se adapta ao aspecto do monitor (retrato: largura
+    /// 1080; paisagem: altura 1080, largura `max(960, 1080·aspecto)`). Um `min(w,h)/1080` simples
+    /// diverge em telas quase quadradas (aspecto 0,95–1), deixando o texto menor que no Estúdio.
+    pub fn ui_scale(&self, w: f32, h: f32) -> Option<f32> {
+        let [lw, lh] = self.logical_size?;
+        if !(lw > 0.0 && lh > 0.0 && w > 0.0 && h > 0.0) {
+            return None;
+        }
+        let wallpaper_basis = !self.is_widget()
+            && (lw - WALLPAPER_LOGICAL_SIDE).abs() < 0.5
+            && (lh - WALLPAPER_LOGICAL_SIDE).abs() < 0.5;
+        if !wallpaper_basis {
+            return Some((w / lw).min(h / lh));
+        }
+        let aspect = w / h;
+        let (bw, bh) = if h > w * 1.05 {
+            (
+                WALLPAPER_LOGICAL_SIDE,
+                (WALLPAPER_LOGICAL_SIDE / aspect.max(0.25)).round().max(WALLPAPER_LOGICAL_MIN_LONG),
+            )
+        } else {
+            (
+                (WALLPAPER_LOGICAL_SIDE * aspect).round().max(WALLPAPER_LOGICAL_MIN_LONG),
+                WALLPAPER_LOGICAL_SIDE,
+            )
+        };
+        Some((w / bw).min(h / bh))
     }
 
     pub fn globals_map(&self) -> HashMap<String, String> {
@@ -1441,6 +1479,78 @@ pub enum IpcResponse {
     Status { engine: EngineStatus },
     Widgets { widgets: Vec<NativeWidgetSpec> },
     Error { message: String },
+}
+
+#[cfg(test)]
+mod ui_scale_tests {
+    use super::*;
+
+    /// Cópia literal da regra de `UnifiedCompositor.tsx` (`logicalW/H` + `scale`), em f64.
+    fn studio_container_scale(w: f64, h: f64) -> f64 {
+        let portrait = h > w * 1.05;
+        let aspect = w / h.max(1.0);
+        let lw = if portrait { 1080.0 } else { (1080.0 * aspect).round().max(960.0) };
+        let lh = if portrait { (1080.0 / aspect.max(0.25)).round().max(960.0) } else { 1080.0 };
+        (w / lw.max(1.0)).min(h / lh.max(1.0))
+    }
+
+    fn wallpaper() -> PrismScene {
+        PrismScene { logical_size: Some([1080.0, 1080.0]), ..PrismScene::default() }
+    }
+
+    #[test]
+    fn wallpaper_scale_matches_studio_for_common_and_odd_monitors() {
+        let scene = wallpaper();
+        let screens = [
+            (1920.0, 1080.0),
+            (2560.0, 1440.0),
+            (3840.0, 2160.0),
+            (3440.0, 1440.0),
+            (1080.0, 1920.0),
+            (1440.0, 2560.0),
+            (1280.0, 1024.0),
+            (1024.0, 1024.0),
+            (1000.0, 1040.0), // quase quadrada: aspecto 0,96 (não é retrato, é > 0,952)
+            (1050.0, 1000.0),
+            (800.0, 3600.0), // retrato extremo
+        ];
+        for (w, h) in screens {
+            let got = scene.ui_scale(w as f32, h as f32).expect("escala") as f64;
+            let want = studio_container_scale(w, h);
+            assert!((got - want).abs() < 1e-3, "{w}x{h}: motor {got} × Estúdio {want}");
+        }
+    }
+
+    #[test]
+    fn near_square_screen_no_longer_shrinks_text() {
+        // 1000×1040: o `min(w,h)/1080` antigo dava 0,926; o Estúdio usa 0,963.
+        let got = wallpaper().ui_scale(1000.0, 1040.0).expect("escala");
+        assert!((got - 1040.0 / 1080.0).abs() < 1e-3, "{got}");
+    }
+
+    #[test]
+    fn widget_scale_is_plain_min_of_logical_size() {
+        let scene = PrismScene {
+            package_type: PackageKind::Widget,
+            logical_size: Some([480.0, 240.0]),
+            ..PrismScene::default()
+        };
+        assert!((scene.ui_scale(960.0, 480.0).expect("escala") - 2.0).abs() < 1e-6);
+        assert!((scene.ui_scale(960.0, 240.0).expect("escala") - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn without_logical_size_or_surface_there_is_no_scale() {
+        assert_eq!(PrismScene::default().ui_scale(1920.0, 1080.0), None);
+        assert_eq!(wallpaper().ui_scale(0.0, 1080.0), None);
+        assert_eq!(wallpaper().ui_scale(1920.0, f32::NAN), None);
+    }
+
+    #[test]
+    fn non_standard_logical_size_keeps_plain_min() {
+        let scene = PrismScene { logical_size: Some([1920.0, 1080.0]), ..PrismScene::default() };
+        assert!((scene.ui_scale(3840.0, 2160.0).expect("escala") - 2.0).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]
