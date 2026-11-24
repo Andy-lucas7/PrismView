@@ -64,6 +64,8 @@ const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
 import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
 import { HubLayout, readHubView, writeHubView, type HubView } from "./components/hub/HubLayout";
 import { StudioHero, type HeroRect } from "./components/hub/StudioHero";
+import { PrismIntro } from "./components/intro/PrismIntro";
+import { setIntroHold, useIntroDecision, writeSeenMarker } from "./engine/introGate";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -502,6 +504,18 @@ const StudioHubApp: React.FC = () => {
   type StudioPhase = "idle" | "opening" | "closing";
   const reduceMotion = Boolean(useReducedMotion());
   const [phase, setPhase] = useState<StudioPhase>("idle");
+  // ── intro (1× por sessão do Windows): hero → derrete como vidro → Hub
+  const introSkip = reduceMotion || power.state === "FROZEN";
+  const intro = useIntroDecision({ disabled: introSkip });
+  const [introPhase, setIntroPhase] = useState<"wait" | "play" | "melt" | "done">("wait");
+  useEffect(() => {
+    if (intro.decision === "play" && introPhase === "wait") setIntroPhase("play");
+    else if (intro.decision === "skip" && introPhase === "wait") setIntroPhase("done");
+  }, [intro.decision, introPhase]);
+  const holdHub = introPhase === "wait" || introPhase === "play";
+  useEffect(() => {
+    setIntroHold(holdHub);
+  }, [holdHub]);
   const phaseRef = useRef<StudioPhase>("idle");
   const pendingCloseRef = useRef(false);
   const closeStudioRef = useRef<() => void>(() => {});
@@ -2282,7 +2296,8 @@ const StudioHubApp: React.FC = () => {
 
         {/* Scrollable Workspace Body */}
         <main className="flex-1 overflow-y-auto px-7 py-5">
-          <HubStillWarmer projects={warmProjects} />
+          {!holdHub && <HubStillWarmer projects={warmProjects} />}
+          {!holdHub && (
           <AnimatePresence mode="wait" initial={false}>
           {hubTab === "WALLPAPERS" && (
             <motion.div key="WALLPAPERS" {...TAB} className="max-w-7xl mx-auto space-y-5">
@@ -2820,6 +2835,7 @@ const StudioHubApp: React.FC = () => {
             </motion.div>
           )}
           </AnimatePresence>
+          )}
         </main>
       </div>
 
@@ -3073,6 +3089,17 @@ const StudioHubApp: React.FC = () => {
         </motion.div>
       )}
       {studioTree}
+      {(introPhase === "play" || introPhase === "melt") && (
+        <PrismIntro
+          lowPower={power.state !== "NORMAL"}
+          onEnterStart={() => {
+            writeSeenMarker(intro.marker);
+            setIntroPhase("melt");
+            setIntroHold(false);
+          }}
+          onDone={() => setIntroPhase("done")}
+        />
+      )}
       {hero && <StudioHero project={hero.project} rect={hero.rect} innerRect={hero.innerRect} p={heroP} opacity={heroOpacity} />}
     </>
   );

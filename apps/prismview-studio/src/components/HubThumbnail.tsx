@@ -5,6 +5,7 @@ import { HubLiveBudget } from "../engine/hubLiveBudget";
 import { StillCache } from "../engine/hubStillCache";
 import { captureStill, hubStills, stillLayerIds, stillSignature } from "../engine/hubStillCapture";
 import { UnifiedCompositor } from "./UnifiedCompositor";
+import { useIntroHold } from "../engine/introGate";
 import { HubCardContext } from "./hub/HubCardContext";
 
 /** Miniaturas `full` (vidro/3D/vídeo vivos): só 3 por vez (centro + 2 laterais). Teto Chromium ~16 WebGL. */
@@ -84,7 +85,8 @@ export const HubThumbnail = React.memo(function HubThumbnail({
   const ctx = useContext(HubCardContext);
   const fixedRank = rank ?? ctx.rank;
   const full = useIsFull(project.id) && ctx.effects;
-  const effective = fixedRank ?? visRank;
+  const hold = useIntroHold();
+  const effective = hold ? null : fixedRank ?? visRank;
   const { stills, onThumbFrame } = useProjectStills(project);
 
   useEffect(() => {
