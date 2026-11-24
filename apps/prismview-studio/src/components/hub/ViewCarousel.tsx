@@ -171,7 +171,7 @@ const Ambient = React.memo(function Ambient({ index, pos, color }: { index: numb
 export interface ViewCarouselProps<T> {
   items: T[];
   getKey: (item: T) => string;
-  renderItem: (item: T) => React.ReactNode;
+  renderItem: (item: T, index: number) => React.ReactNode;
   /** Cor CSS usada no brilho ambiente atrás do card (opcional). */
   getAmbient?: (item: T) => string;
   /** Enter no card central. */
@@ -183,10 +183,12 @@ export interface ViewCarouselProps<T> {
   ariaLabel?: string;
   /** Card central inicial (pula a animação de entrada: usado ao voltar do Studio). */
   initialKey?: string;
+  /** Avisa a View central (para o HubLayout lembrar ao alternar para a grade e voltar). */
+  onCenterKey?: (key: string) => void;
 }
 
 export function ViewCarousel<T>({
-  items, getKey, renderItem, getAmbient, onActivate, effects, onJank, ariaLabel = "Views", initialKey,
+  items, getKey, renderItem, getAmbient, onActivate, effects, onJank, ariaLabel = "Views", initialKey, onCenterKey,
 }: ViewCarouselProps<T>) {
   const n = items.length;
   const reduced = Boolean(useReducedMotion());
@@ -244,7 +246,10 @@ export function ViewCarousel<T>({
         if (c !== centerRef.current) {
           centerRef.current = c;
           const it = itemsRef.current[c];
-          if (it !== undefined) activeKeyRef.current = getKeyRef.current(it);
+          if (it !== undefined) {
+            activeKeyRef.current = getKeyRef.current(it);
+            onCenterKeyRef.current?.(activeKeyRef.current);
+          }
           setCenter(c);
         }
       }),
@@ -252,6 +257,8 @@ export function ViewCarousel<T>({
   );
   const getKeyRef = useRef(getKey);
   getKeyRef.current = getKey;
+  const onCenterKeyRef = useRef(onCenterKey);
+  onCenterKeyRef.current = onCenterKey;
 
   // ── lista mudou (filtro/adição/remoção): mantém a View ativa pela chave
   useEffect(() => {
@@ -435,7 +442,7 @@ export function ViewCarousel<T>({
         entering={enteringRef.current}
         total={n}
         onSelect={goTo}
-        children={renderItem(it)}
+        children={renderItem(it, i)}
       />
     );
   }

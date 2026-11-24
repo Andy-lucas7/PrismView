@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Select, ColorInput } from "./components/ui/Controls";
-import { COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
+import { BlurText, COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { AnimatePresence, animate, motion, MotionConfig, useMotionValue, useReducedMotion, useTransform } from "framer-motion";
@@ -500,6 +500,18 @@ const StudioHubApp: React.FC = () => {
   }, []);
   const [hubTab, setHubTab] = useState<HubTab>("WALLPAPERS");
   const [hubView, setHubView] = useState<HubView>(readHubView);
+  // Troca de aba do Hub sem AnimatePresence: sai (160 ms), troca o conteúdo e entra. (O modo "wait" travava com a grade.)
+  const [shownTab, setShownTab] = useState<HubTab>(hubTab);
+  const [tabLeaving, setTabLeaving] = useState(false);
+  useEffect(() => {
+    if (hubTab === shownTab) return;
+    setTabLeaving(true);
+    const id = window.setTimeout(() => {
+      setShownTab(hubTab);
+      setTabLeaving(false);
+    }, DURATION.fast + 10);
+    return () => window.clearTimeout(id);
+  }, [hubTab, shownTab]);
   // ── transição Hub ⇄ Studio (card cresce até a tela cheia; ver StudioHero)
   type StudioPhase = "idle" | "opening" | "closing";
   const reduceMotion = Boolean(useReducedMotion());
@@ -1733,6 +1745,7 @@ const StudioHubApp: React.FC = () => {
     afterFrames(2, () => {
       animate(heroOpacity, 1, { duration: sec(DURATION.instant) }).then(() => {
         setHubTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
+        setShownTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
         setEditing(null); // desmonta o Studio (coberto) e monta o Hub por baixo
         afterFrames(3, () => {
           let { rect, innerRect } = cardRects(proj.id);
@@ -1864,18 +1877,19 @@ const StudioHubApp: React.FC = () => {
                     setHubTab(item.id);
                     setHubQuery("");
                   }}
-                  className={`w-full px-3 py-2 rounded-xl text-xs flex items-center justify-between transition ${
-                    active
-                      ? "bg-white text-black font-semibold shadow-sm"
-                      : "text-[#D4D4D8] hover:text-white hover:bg-white/[0.06]"
+                  className={`relative w-full px-3 py-2 rounded-xl text-xs flex items-center justify-between transition ${
+                    active ? "text-black font-semibold" : "text-[#D4D4D8] hover:text-white hover:bg-white/[0.06]"
                   }`}
                 >
-                  <span className="flex items-center gap-2.5">
+                  {active && (
+                    <motion.span layoutId="hub-nav-pill" transition={SPRING.tactile} className="absolute inset-0 rounded-xl bg-white shadow-sm" />
+                  )}
+                  <span className="relative flex items-center gap-2.5">
                     <Icon className="w-3.5 h-3.5" />
                     {item.label}
                   </span>
                   <span
-                    className={`text-[10px] font-mono-fx px-1.5 py-0.5 rounded-full ${
+                    className={`relative text-[10px] font-mono-fx px-1.5 py-0.5 rounded-full ${
                       active ? "bg-black/15 text-black" : "bg-white/[0.06] text-[#A1A1AA]"
                     }`}
                   >
@@ -1897,18 +1911,19 @@ const StudioHubApp: React.FC = () => {
                 setHubTab("TEMPLATES");
                 setHubQuery("");
               }}
-              className={`w-full px-3 py-2 rounded-xl text-xs flex items-center justify-between transition ${
-                hubTab === "TEMPLATES"
-                  ? "bg-white text-black font-semibold shadow-sm"
-                  : "text-[#D4D4D8] hover:text-white hover:bg-white/[0.06]"
+              className={`relative w-full px-3 py-2 rounded-xl text-xs flex items-center justify-between transition ${
+                hubTab === "TEMPLATES" ? "text-black font-semibold" : "text-[#D4D4D8] hover:text-white hover:bg-white/[0.06]"
               }`}
             >
-              <span className="flex items-center gap-2.5">
+              {hubTab === "TEMPLATES" && (
+                <motion.span layoutId="hub-nav-pill" transition={SPRING.tactile} className="absolute inset-0 rounded-xl bg-white shadow-sm" />
+              )}
+              <span className="relative flex items-center gap-2.5">
                 <Compass className="w-3.5 h-3.5" />
                 Modelos Prontos
               </span>
               <span
-                className={`text-[10px] font-mono-fx px-1.5 py-0.5 rounded-full ${
+                className={`relative text-[10px] font-mono-fx px-1.5 py-0.5 rounded-full ${
                   hubTab === "TEMPLATES" ? "bg-black/15 text-black" : "bg-white/[0.06] text-[#A1A1AA]"
                 }`}
               >
@@ -2298,9 +2313,9 @@ const StudioHubApp: React.FC = () => {
         <main className="flex-1 overflow-y-auto px-7 py-5">
           {!holdHub && <HubStillWarmer projects={warmProjects} />}
           {!holdHub && (
-          <AnimatePresence mode="wait" initial={false}>
-          {hubTab === "WALLPAPERS" && (
-            <motion.div key="WALLPAPERS" {...TAB} className="max-w-7xl mx-auto space-y-5">
+          <>
+          {shownTab === "WALLPAPERS" && (
+            <motion.div key="WALLPAPERS" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-5">
               {/* Filter Chips + Multi-Monitor Selector */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2363,11 +2378,12 @@ const StudioHubApp: React.FC = () => {
                 onActivate={(x) => openStudio(x)}
                 lowPower={power.state !== "NORMAL"}
                 ariaLabel="Wallpapers"
-                renderItem={(wp) => {
+                renderItem={(wp, hubIndex) => {
                   const isActive = runtime.active_wallpaper_id === wp.id;
                   const wpKind = classifyWallpaperKind(wp);
                   return (
-                    <article key={wp.id} className="prism-hub-card flex flex-col">
+                    <motion.article key={wp.id} layoutId={`hub-card-WP-${wp.id}`}
+                      className="prism-hub-card flex flex-col">
                       <div
                         data-hub-card={wp.id}
                         onClick={() => openStudio(wp)}
@@ -2390,7 +2406,7 @@ const StudioHubApp: React.FC = () => {
                       <div className="p-4 flex flex-col gap-3">
                         <div className="flex items-center justify-between gap-2">
                           <div className="min-w-0">
-                            <h3 className="text-sm font-semibold text-white truncate">{wp.title}</h3>
+                            <h3 className="text-sm font-semibold text-white truncate"><BlurText text={wp.title} /></h3>
                             <span className="text-[11px] text-[#A1A1AA]">
                               {wp.layers.length} {wp.layers.length === 1 ? "camada" : "camadas"}
                             </span>
@@ -2462,15 +2478,15 @@ const StudioHubApp: React.FC = () => {
                           </button>
                         </div>
                       </div>
-                    </article>
+                    </motion.article>
                   );
                 }}
               />
             </motion.div>
           )}
 
-          {hubTab === "WIDGETS" && (
-            <motion.div key="WIDGETS" {...TAB} className="max-w-7xl mx-auto space-y-5">
+          {shownTab === "WIDGETS" && (
+            <motion.div key="WIDGETS" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-5">
               {runtime.pinned_widget_ids.length >= 3 && (
                 <div className="rounded-xl border border-amber-400/30 bg-amber-400/[0.06] px-3.5 py-2.5 text-[11px] text-amber-200/90">
                   Cada widget fixado roda em uma janela WebView própria (dezenas de MB de RAM cada).{" "}
@@ -2506,11 +2522,12 @@ const StudioHubApp: React.FC = () => {
                 onActivate={(x) => openStudio(x)}
                 lowPower={power.state !== "NORMAL"}
                 ariaLabel="Widgets"
-                renderItem={(w) => {
+                renderItem={(w, hubIndex) => {
                   const pinned = runtime.pinned_widget_ids.includes(w.id);
                   const isLocked = runtime.locked_widget_ids.includes(w.id);
                   return (
-                    <article key={w.id} className="prism-hub-card flex flex-col">
+                    <motion.article key={w.id} layoutId={`hub-card-WG-${w.id}`}
+                      className="prism-hub-card flex flex-col">
                       <div
                         data-hub-card={w.id}
                         onClick={() => openStudio(w)}
@@ -2537,7 +2554,7 @@ const StudioHubApp: React.FC = () => {
                       <div className="p-4 flex flex-col gap-3">
                         <div className="flex items-center justify-between gap-2">
                           <div className="min-w-0">
-                            <h3 className="text-sm font-semibold text-white truncate">{w.title}</h3>
+                            <h3 className="text-sm font-semibold text-white truncate"><BlurText text={w.title} /></h3>
                             <span className="text-[11px] font-mono-fx text-[#A1A1AA]">
                               {w.widget.width}×{w.widget.height}px · {w.layers.length} camadas
                             </span>
@@ -2634,15 +2651,15 @@ const StudioHubApp: React.FC = () => {
                           </button>
                         </div>
                       </div>
-                    </article>
+                    </motion.article>
                   );
                 }}
               />
             </motion.div>
           )}
 
-          {hubTab === "TEMPLATES" && (
-            <motion.div key="TEMPLATES" {...TAB} className="max-w-7xl mx-auto space-y-6 pb-6">
+          {shownTab === "TEMPLATES" && (
+            <motion.div key="TEMPLATES" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-6 pb-6">
               {/* Category Filter Bar + Restore Defaults */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2688,7 +2705,7 @@ const StudioHubApp: React.FC = () => {
                 getAmbient={(x) => hubAmbient(x.project)}
                 lowPower={power.state !== "NORMAL"}
                 ariaLabel="Modelos"
-                renderItem={({ project: tpl, category, subtitle, badges }) => {
+                renderItem={({ project: tpl, category, subtitle, badges }, hubIndex) => {
                   const isWidgetTpl = tpl.packageType === "WIDGET";
                   const openOrCloneTemplate = async (applyDirectly: boolean) => {
                     const existing = projects.find((p) => p.id === tpl.id);
@@ -2706,8 +2723,9 @@ const StudioHubApp: React.FC = () => {
                     }
                   };
                   return (
-                    <article
+                    <motion.article
                       key={tpl.id}
+                      layoutId={`hub-card-TP-${tpl.id}`}
                       className="prism-hub-card overflow-hidden flex flex-col justify-between"
                     >
                       <div>
@@ -2736,7 +2754,7 @@ const StudioHubApp: React.FC = () => {
                           </span>
                         </div>
                         <div className="p-4 space-y-2">
-                          <h3 className="text-sm font-semibold text-white">{tpl.title}</h3>
+                          <h3 className="text-sm font-semibold text-white"><BlurText text={tpl.title} /></h3>
                           <p className="text-xs text-[#A1A1AA] leading-relaxed">{subtitle}</p>
                           <div className="flex flex-wrap gap-1.5 pt-1">
                             {badges.map((b) => (
@@ -2772,7 +2790,7 @@ const StudioHubApp: React.FC = () => {
                           <Sliders className="w-3.5 h-3.5" /> Personalizar
                         </button>
                       </div>
-                    </article>
+                    </motion.article>
                   );
                 }}
               />
@@ -2834,7 +2852,7 @@ const StudioHubApp: React.FC = () => {
               </div>
             </motion.div>
           )}
-          </AnimatePresence>
+          </>
           )}
         </main>
       </div>

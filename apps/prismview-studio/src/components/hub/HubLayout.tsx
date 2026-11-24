@@ -1,7 +1,7 @@
-import React, { useCallback, useMemo, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import { LayoutGroup, motion } from "framer-motion";
 import { GalleryHorizontal, LayoutGrid } from "lucide-react";
-import { BLUR, DURATION, EASE, SPRING, sec } from "../../engine/motion";
+import { SPRING } from "../../engine/motion";
 import { HubCardContext } from "./HubCardContext";
 import { ViewCarousel } from "./ViewCarousel";
 
@@ -42,7 +42,7 @@ export interface HubLayoutProps<T> {
   onViewChange: (v: HubView) => void;
   items: T[];
   getKey: (item: T) => string;
-  renderItem: (item: T) => React.ReactNode;
+  renderItem: (item: T, index: number) => React.ReactNode;
   getAmbient?: (item: T) => string;
   onActivate?: (item: T) => void;
   /** Economia de energia ativa (ECO/ULTRA/FROZEN): sem vidro/blur nas miniaturas. */
@@ -56,7 +56,6 @@ export interface HubLayoutProps<T> {
 export function HubLayout<T>({
   view, onViewChange, items, getKey, renderItem, getAmbient, onActivate, lowPower = false, ariaLabel, initialKey,
 }: HubLayoutProps<T>) {
-  const reduced = Boolean(useReducedMotion());
   const [effectsOk, setEffectsOk] = useState(readEffects);
   const effects = effectsOk && !lowPower;
 
@@ -70,9 +69,17 @@ export function HubLayout<T>({
   }, []);
 
   const gridCtx = useMemo(() => ({ effects }), [effects]);
+  // View central lembrada: ao voltar da grade o carrossel já abre nela, sem animação de entrada.
+  const centerKeyRef = useRef<string | undefined>(initialKey);
+  const [lastKey, setLastKey] = useState<string | undefined>(initialKey);
+  const onCenterKey = useCallback((k: string) => {
+    centerKeyRef.current = k;
+  }, []);
+  const changeView = (v: HubView) => {
+    setLastKey(centerKeyRef.current);
+    onViewChange(v);
+  };
   if (items.length === 0) return null;
-
-  const enter = { opacity: 0, scale: 0.985, filter: reduced ? "none" : `blur(${BLUR.exit}px)` };
   return (
     <div>
       <div className="mb-1 flex justify-end">
@@ -87,13 +94,13 @@ export function HubLayout<T>({
                 aria-checked={active}
                 title={label}
                 onClick={() => {
-                  if (!active) onViewChange(id);
+                  if (!active) changeView(id);
                 }}
                 className={`relative grid h-8 w-9 place-items-center rounded-full transition-colors ${active ? "text-black" : "text-[#A1A1AA] hover:text-white"}`}
               >
                 {active && (
                   <motion.span
-                    layoutId="hub-view-pill"
+                    layoutId={`hub-view-pill-${ariaLabel ?? "x"}`}
                     transition={SPRING.tactile}
                     className="absolute inset-0 rounded-full bg-white"
                   />
@@ -105,45 +112,43 @@ export function HubLayout<T>({
         </div>
       </div>
 
-      <AnimatePresence mode="wait" initial={false}>
+      {/* Morph: o mesmo card (layoutId) viaja entre carrossel e grade; só o contêiner troca. */}
+      <LayoutGroup id="hub-view">
         {view === "carousel" ? (
-          <motion.div
+          <ViewCarousel
             key="carousel"
-            initial={enter}
-            animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-            exit={enter}
-            transition={{ duration: sec(DURATION.base), ease: [...EASE.emphasized] }}
-          >
-            <ViewCarousel
-              items={items}
-              getKey={getKey}
-              renderItem={renderItem}
-              getAmbient={getAmbient}
-              onActivate={onActivate}
-              effects={effects}
-              onJank={onJank}
-              ariaLabel={ariaLabel}
-              initialKey={initialKey}
-            />
-          </motion.div>
+            items={items}
+            getKey={getKey}
+            renderItem={renderItem}
+            getAmbient={getAmbient}
+            onActivate={onActivate}
+            effects={effects}
+            onJank={onJank}
+            ariaLabel={ariaLabel}
+            initialKey={lastKey}
+            onCenterKey={onCenterKey}
+          />
         ) : (
-          <motion.div
-            key="grid"
-            initial={enter}
-            animate={{ opacity: 1, scale: 1, filter: "blur(0px)" }}
-            exit={enter}
-            transition={{ duration: sec(DURATION.base), ease: [...EASE.emphasized] }}
-          >
-            <HubCardContext.Provider value={gridCtx}>
-              <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
-                {items.map((it) => (
-                  <React.Fragment key={getKey(it)}>{renderItem(it)}</React.Fragment>
-                ))}
-              </div>
-            </HubCardContext.Provider>
-          </motion.div>
+          <HubCardContext.Provider value={gridCtx}>
+            <div
+              key="grid"
+              className="prism-spot grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3"
+              onPointerMove={(e) => {
+                // Spotlight que segue o ponteiro no card sob ele (CSS vars; sem re-render).
+                const card = (e.target as HTMLElement).closest<HTMLElement>(".prism-hub-card");
+                if (!card) return;
+                const r = card.getBoundingClientRect();
+                card.style.setProperty("--mx", `${e.clientX - r.left}px`);
+                card.style.setProperty("--my", `${e.clientY - r.top}px`);
+              }}
+            >
+              {items.map((it, i) => (
+                <React.Fragment key={getKey(it)}>{renderItem(it, i)}</React.Fragment>
+              ))}
+            </div>
+          </HubCardContext.Provider>
         )}
-      </AnimatePresence>
+      </LayoutGroup>
     </div>
   );
 }
