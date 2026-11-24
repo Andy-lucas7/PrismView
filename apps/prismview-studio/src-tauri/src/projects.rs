@@ -191,6 +191,7 @@ pub(crate) fn save_project_inner(project: Value) -> Result<Value, String> {
         .ok_or("Projeto sem id")?;
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
     atomic_fs::write_atomic(&project_path(id), json.as_bytes(), true)?;
+    allow_project_media(&project);
     Ok(project)
 }
 

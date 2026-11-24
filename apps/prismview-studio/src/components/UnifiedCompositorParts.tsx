@@ -459,7 +459,29 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
   const ref = useRef<HTMLVideoElement | null>(null);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
+  const onMediaElRef = useRef(onMediaEl);
+  onMediaElRef.current = onMediaEl;
+  const onMediaReadyRef = useRef(onMediaReady);
+  onMediaReadyRef.current = onMediaReady;
   const url = resolveMediaUrl(src);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoadError(null);
+  }, [url]);
+
+  useEffect(() => {
+    const el = ref.current;
+    onMediaElRef.current?.(el);
+    return () => {
+      onMediaElRef.current?.(null);
+      if (el) {
+        el.pause();
+        el.removeAttribute("src");
+        el.load();
+      }
+    };
+  }, [url]);
 
   useEffect(() => {
     const el = ref.current;
@@ -467,7 +489,7 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
     el.playbackRate = Math.max(0.25, Math.min(3, speed || 1));
     el.muted = muted;
     el.volume = muted ? 0 : Math.max(0, Math.min(1, volume));
-  }, [speed, muted, volume]);
+  }, [speed, muted, volume, url]);
 
   useEffect(() => {
     const el = ref.current;
@@ -487,19 +509,19 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
     );
   }
 
+  if (loadError) {
+    return (
+      <div className="w-full h-full flex flex-col items-center justify-center gap-1 bg-[#0D0D0F] border border-dashed border-amber-400/35 px-4 text-center text-xs text-amber-200/90">
+        <span>Não foi possível pré-visualizar este vídeo no Studio ({loadError}).</span>
+        <span className="text-[10px] text-[#A1A1AA]">Ao aplicar, o motor nativo reproduz normalmente via Media Foundation.</span>
+      </div>
+    );
+  }
+
   return (
     <video
-      ref={(el) => {
-        // 2.7: on unmount React passes null — release the decoder/buffers of the previous element
-        const prev = ref.current;
-        if (!el && prev) {
-          prev.pause();
-          prev.removeAttribute("src");
-          prev.load();
-        }
-        ref.current = el;
-        onMediaEl?.(el);
-      }}
+      key={url}
+      ref={ref}
       src={url}
       crossOrigin={supportsCorsUrl(url) ? "anonymous" : undefined}
       autoPlay={!paused}
@@ -508,12 +530,17 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
       muted={muted}
       playsInline
       onLoadedData={(e) => {
+        setLoadError(null);
         if (pausedRef.current) {
           e.currentTarget.pause();
         } else {
           e.currentTarget.play().catch(() => {});
         }
-        onMediaReady?.();
+        onMediaReadyRef.current?.();
+      }}
+      onError={(e) => {
+        const code = e.currentTarget.error?.code;
+        setLoadError(code ? `código ${code}` : "formato não suportado pelo WebView");
       }}
       style={{ objectFit, borderRadius: `${clipRadius}px` }}
       className="w-full h-full pointer-events-none"
