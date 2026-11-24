@@ -96,9 +96,10 @@ test("cada atalho listado existe no código que o implementa", () => {
 
 test("atalhos do editor no popover do Studio estão na Ajuda", () => {
   const listed = new Set(SHORTCUT_GROUPS.flatMap((g) => g.rows.map((r) => r.keys)));
-  for (const keys of ["Ctrl+Shift+P", "F1"]) assert.ok(listed.has(keys), `Ajuda sem ${keys}`);
-  // O popover do editor cita F1: ele precisa continuar abrindo a Ajuda.
-  assert.ok(sources.editor.includes('["F1", "Ajuda e documentação"]'));
+  for (const keys of ["Ctrl+Shift+P", "F1", "Ctrl+\\"]) assert.ok(listed.has(keys), `Ajuda sem ${keys}`);
+  // O botão do editor leva à Ajuda (a tabela de atalhos vive só nela): precisa continuar existindo.
+  assert.ok(sources.editor.includes("Ajuda, fórmulas e atalhos (F1)"));
+  assert.ok(!sources.editor.includes("Atalhos & Seleção do Estúdio"), "o popover de atalhos duplicado voltou");
 });
 
 test("normalizeSearch ignora acentos e caixa", () => {

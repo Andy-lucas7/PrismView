@@ -23,12 +23,13 @@ import {
   GripVertical,
   Image as ImageIcon,
   BookOpen,
-  Keyboard,
   Layers,
   Lock,
   Magnet,
   MousePointerClick,
   Move,
+  PanelRightClose,
+  PanelRightOpen,
   Redo2,
   Rotate3d,
   Scaling,
@@ -68,6 +69,8 @@ import {
 import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
 import { friendlyError } from "../utils/friendlyError";
+import { readPanelOpen, stageRightInset, writePanelOpen } from "../utils/panelSplit";
+import { StudioSidePanel } from "./studio/StudioSidePanel";
 import { collectOpenAppReview } from "../utils/importReview";
 import { SaveStatus, SaveStatusChip } from "./SaveStatusChip";
 import { nativeCompatIssues } from "../utils/nativeCompat";
@@ -104,6 +107,18 @@ import {
   InspectorMode,
   StudioInspector,
 } from "./StudioInspector";
+
+/** Tipos de camada que a barra do painel cria (ordem de exibição). */
+const ADD_LAYER_BUTTONS: { kind: LayerKind; label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
+  { kind: "VIDEO", label: "vídeo", Icon: Film },
+  { kind: "IMAGE", label: "imagem PNG", Icon: ImageIcon },
+  { kind: "SVG", label: "SVG / ícone", Icon: Shapes },
+  { kind: "TEXT", label: "texto / ƒx", Icon: Type },
+  { kind: "GLASS", label: "vidro", Icon: Sparkles },
+  { kind: "PROGRESS", label: "barra", Icon: Layers },
+  { kind: "SCENE_3D", label: "cena 3D", Icon: Box },
+  { kind: "GROUP", label: "grupo", Icon: FolderPlus },
+];
 
 interface StudioEditorProps {
   project: PrismProject;
@@ -209,7 +224,17 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   ]);
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>("LAYER");
   const [widgetPickerOpen, setWidgetPickerOpen] = useState(false);
-  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  // Painel único (propriedades + camadas): aberto/recolhido lembrado entre sessões.
+  const [panelOpen, setPanelOpen] = useState<boolean>(() =>
+    readPanelOpen(typeof window === "undefined" ? null : window.localStorage)
+  );
+  const togglePanel = useCallback(() => {
+    setPanelOpen((open) => {
+      const next = !open;
+      writePanelOpen(typeof window === "undefined" ? null : window.localStorage, next);
+      return next;
+    });
+  }, []);
   const [fxTarget, setFxTarget] = useState<FxTargetRequest | null>(null);
   const [statusHint, setStatusHint] = useState<string | null>(null);
   const [treeDrag, setTreeDrag] = useState<TreeDragState | null>(null);
@@ -745,6 +770,18 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     [duplicateRoomObject, removeRoomObject, room3dMode, setViewMode]
   );
 
+  // Ctrl+ recolhe/mostra o painel de propriedades e camadas (funciona também com foco em campos).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === "\\" || e.code === "Backslash")) {
+        e.preventDefault();
+        togglePanel();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePanel]);
+
   // Performance HUD toggle (works in every Studio mode)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1092,13 +1129,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       setSelectedIds(all);
       flashHint(`${all.length} camadas selecionadas (Ctrl+A)`);
     },
-    onDeselect: () => {
-      if (shortcutsOpen) {
-        setShortcutsOpen(false);
-        return;
-      }
-      setSelectedIds([]);
-    },
+    onDeselect: () => setSelectedIds([]),
     onGroup: handleGroupSelected,
     onUngroup: handleUngroupSelected,
     onBringForward: () => moveZ(selectedIdsRef.current, 1),
@@ -1540,59 +1571,73 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           </div>
 
           <div
-            className={`flex items-center gap-0.5 shrink-0 transition-opacity ${
-              isSelected || layer.hidden || layer.locked
-                ? "opacity-95"
-                : "opacity-45 group-hover:opacity-100"
-            }`}
+            className="flex items-center gap-0.5 shrink-0"
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => e.stopPropagation()}
           >
-            <button aria-label="Trazer para frente (Ctrl+])"
-              onClick={() => moveZ([layer.id], 1)}
-              title="Trazer para frente (Ctrl+])"
-              className="p-1 hover:text-white"
+            {/* Ordem, duplicar e excluir só aparecem no hover, no foco ou na linha selecionada;
+                ocultar e travar são estado da camada e ficam sempre à vista. */}
+            <div
+              className={`flex items-center gap-0.5 transition-opacity focus-within:opacity-100 ${
+                isSelected ? "opacity-95" : "opacity-0 group-hover:opacity-100"
+              }`}
             >
-              <ArrowUp className="w-3 h-3" />
-            </button>
-            <button aria-label="Enviar para trás (Ctrl+[)"
-              onClick={() => moveZ([layer.id], -1)}
-              title="Enviar para trás (Ctrl+[)"
-              className="p-1 hover:text-white"
-            >
-              <ArrowDown className="w-3 h-3" />
-            </button>
+              <button
+                type="button"
+                aria-label={`Trazer ${layer.name} para frente (Ctrl+])`}
+                onClick={() => moveZ([layer.id], 1)}
+                title="Trazer para frente (Ctrl+])"
+                className="p-1 hover:text-white"
+              >
+                <ArrowUp className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                aria-label={`Enviar ${layer.name} para trás (Ctrl+[)`}
+                onClick={() => moveZ([layer.id], -1)}
+                title="Enviar para trás (Ctrl+[)"
+                className="p-1 hover:text-white"
+              >
+                <ArrowDown className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                aria-label={`Duplicar ${layer.name} (Ctrl+D)`}
+                onClick={() => duplicateLayers([layer.id])}
+                title="Duplicar (Ctrl+D)"
+                className="p-1 hover:text-white"
+              >
+                <Copy className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                aria-label={`Excluir ${layer.name} (Del)`}
+                onClick={() => deleteLayers([layer.id])}
+                title="Excluir (Del)"
+                className="p-1 hover:text-white"
+              >
+                <Trash2 className="w-3 h-3" />
+              </button>
+            </div>
             <button
-              onClick={() =>
-                patchLayer(layer.id, (l) => ({ ...l, hidden: !l.hidden }), "discrete")
-              }
+              type="button"
+              aria-label={layer.hidden ? `Mostrar ${layer.name} (Ctrl+Shift+H)` : `Ocultar ${layer.name} (Ctrl+Shift+H)`}
+              aria-pressed={Boolean(layer.hidden)}
+              onClick={() => patchLayer(layer.id, (l) => ({ ...l, hidden: !l.hidden }), "discrete")}
               title="Mostrar / Ocultar (Ctrl+Shift+H)"
-              className="p-1 hover:text-white"
+              className={`p-1 hover:text-white ${layer.hidden ? "text-white" : ""}`}
             >
               {layer.hidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
             </button>
             <button
-              onClick={() =>
-                patchLayer(layer.id, (l) => ({ ...l, locked: !l.locked }), "discrete")
-              }
+              type="button"
+              aria-label={layer.locked ? `Destravar ${layer.name} (Ctrl+L)` : `Travar ${layer.name} (Ctrl+L)`}
+              aria-pressed={Boolean(layer.locked)}
+              onClick={() => patchLayer(layer.id, (l) => ({ ...l, locked: !l.locked }), "discrete")}
               title="Travar / Destravar (Ctrl+L)"
-              className="p-1 hover:text-white"
+              className={`p-1 hover:text-white ${layer.locked ? "text-white" : ""}`}
             >
               {layer.locked ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
-            </button>
-            <button aria-label="Duplicar (Ctrl+D)"
-              onClick={() => duplicateLayers([layer.id])}
-              title="Duplicar (Ctrl+D)"
-              className="p-1 hover:text-white"
-            >
-              <Copy className="w-3 h-3" />
-            </button>
-            <button aria-label="Excluir (Del)"
-              onClick={() => deleteLayers([layer.id])}
-              title="Excluir (Del)"
-              className="p-1 hover:text-white"
-            >
-              <Trash2 className="w-3 h-3" />
             </button>
           </div>
         </div>
@@ -1610,6 +1655,145 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       </motion.div>
     );
   };
+
+  // Metade de baixo do painel único: criar, agrupar e reordenar camadas.
+  const layersPanel = (
+  <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="px-3 pt-2.5 pb-2 border-b border-white/10 space-y-2">
+        <div
+          className="flex items-center justify-between"
+          title="Arraste as linhas para mudar a ordem (Z) ou soltar dentro de um grupo"
+        >
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#A1A1AA] flex items-center gap-1.5">
+            <Layers className="w-3.5 h-3.5 text-white" />
+            Camadas ({totalLayersCount})
+          </span>
+          <span className="text-[10px] text-[#71717A]">Arraste para reordenar</span>
+        </div>
+        {/* Criar camada: uma fileira de ícones (nome no tooltip e no leitor de tela) */}
+        <div role="toolbar" aria-label="Adicionar camada" className="flex items-center gap-1">
+          {ADD_LAYER_BUTTONS.map(({ kind, label, Icon }) => (
+            <button
+              key={kind}
+              type="button"
+              onClick={() => addNewLayer(kind)}
+              aria-label={`Adicionar ${label}`}
+              title={`Adicionar ${label}`}
+              className="prism-pill-idle rounded-lg w-8 h-8 flex items-center justify-center"
+            >
+              <Icon className="w-3.5 h-3.5" />
+            </button>
+          ))}
+          {project.packageType === "WALLPAPER" && (
+            <button
+              type="button"
+              onClick={() => setWidgetPickerOpen((v) => !v)}
+              aria-label="Importar widget (.widget.prism)"
+              aria-expanded={widgetPickerOpen}
+              title="Importar widget (.widget.prism) como grupo editável"
+              className={`rounded-lg w-8 h-8 flex items-center justify-center ${widgetPickerOpen ? "prism-pill-active" : "prism-pill-idle"}`}
+            >
+              <Upload className="w-3.5 h-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Multi-Selection / Group Quick Action Bar */}
+      {(validSelectedIds.length > 1 || selectedLayer?.kind === "GROUP") && (
+        <div className="px-3 py-2 border-b border-white/10 bg-white/[0.04] flex items-center justify-between gap-1.5">
+          <span className="text-[10px] font-medium text-white/85 truncate">
+            {validSelectedIds.length > 1
+              ? `${validSelectedIds.length} selecionadas`
+              : "Grupo selecionado"}
+          </span>
+          <div className="flex items-center gap-1 shrink-0">
+            {validSelectedIds.length > 1 && (
+              <button
+                type="button"
+                onClick={handleGroupSelected}
+                title="Agrupar selecionadas (Ctrl+G)"
+                className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
+              >
+                <FolderPlus className="w-3 h-3" /> Agrupar
+              </button>
+            )}
+            {selectedLayer?.kind === "GROUP" && (
+              <button
+                type="button"
+                onClick={handleUngroupSelected}
+                title="Desagrupar (Ctrl+Shift+G)"
+                className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
+              >
+                <Ungroup className="w-3 h-3" /> Desagrupar
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Widget Importer Drawer inside Left Tree */}
+      <AnimatePresence initial={false}>{widgetPickerOpen && (
+        <motion.div {...COLLAPSE}><div className="p-3 border-b border-white/10 bg-black/50 space-y-2">
+          <span className="block text-[10px] uppercase tracking-wider text-[#A1A1AA]">
+            Inserir como Grupo Editável
+          </span>
+          {availableWidgets.map((w) => (
+            <button
+              key={w.id}
+              onClick={() => importWidgetAsGroup(w)}
+              className="w-full text-left px-3 py-2 rounded-xl bg-white/5 hover:bg-white hover:text-black text-[11px] transition truncate"
+            >
+              + {w.title} ({w.layers.length} camadas)
+            </button>
+          ))}
+          <button
+            onClick={importWidgetFromDisk}
+            className="w-full px-3 py-1.5 rounded-xl border border-white/15 text-[11px] text-[#A1A1AA] hover:text-white flex items-center justify-center gap-1.5"
+          >
+            <Upload className="w-3 h-3" /> Escolher .widget.prism do Disco
+          </button>
+        </div></motion.div>
+      )}</AnimatePresence>
+
+      {/* Ordered Stack (Front-most on top) */}
+      <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
+        {treeDrag?.active && treeDrag.hasNestedSource && (
+          <div
+            data-layer-root-drop="top"
+            className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
+              treeDrag.placement === "root-top"
+                ? "border-white bg-white/20 text-white"
+                : "border-white/25 text-[#A1A1AA]"
+            }`}
+          >
+            Soltar na Raiz (Topo / Frente)
+          </div>
+        )}
+
+        <AnimatePresence initial={false}>
+          {[...project.layers]
+            .reverse()
+            .map((layer, revIdx) =>
+              renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
+            )}
+        </AnimatePresence>
+
+        {treeDrag?.active && treeDrag.hasNestedSource && (
+          <div
+            data-layer-root-drop="bottom"
+            className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
+              treeDrag.placement === "root-bottom"
+                ? "border-white bg-white/20 text-white"
+                : "border-white/25 text-[#A1A1AA]"
+            }`}
+          >
+            Soltar na Raiz (Fundo / Atrás)
+          </div>
+        )}
+      </div>
+  </div>
+  );
 
   return (
     <div className="relative w-full h-full bg-pureBlack overflow-hidden">
@@ -1662,23 +1846,12 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           >
             <Redo2 className="w-3.5 h-3.5" />
           </button>
-          <button aria-label="Atalhos do Estúdio"
-            type="button"
-            onClick={() => setShortcutsOpen((v) => !v)}
-            title="Atalhos do Estúdio"
-            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
-              shortcutsOpen
-                ? "bg-white text-black"
-                : "text-[#A1A1AA] hover:text-white hover:bg-white/15"
-            }`}
-          >
-            <Keyboard className="w-3.5 h-3.5" />
-          </button>
           {onOpenHelp && (
-            <button aria-label="Ajuda e documentação (F1)"
+            // Uma entrada só para ajuda e atalhos: a tabela de atalhos vive na Ajuda (seção "Atalhos").
+            <button aria-label="Ajuda, fórmulas e atalhos (F1)"
               type="button"
               onClick={onOpenHelp}
-              title="Ajuda e documentação (F1)"
+              title="Ajuda, fórmulas e atalhos (F1)"
               className="w-7 h-7 rounded-full flex items-center justify-center transition text-[#A1A1AA] hover:text-white hover:bg-white/15"
             >
               <BookOpen className="w-3.5 h-3.5" />
@@ -1739,6 +1912,16 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </div>
           )}
           <button
+            type="button"
+            onClick={togglePanel}
+            aria-label={panelOpen ? "Recolher o painel de propriedades e camadas (Ctrl+\\)" : "Mostrar o painel de propriedades e camadas (Ctrl+\\)"}
+            aria-pressed={panelOpen}
+            title={panelOpen ? "Recolher painel (Ctrl+\\) — canvas em tela cheia" : "Mostrar painel (Ctrl+\\)"}
+            className="frosted-chrome rounded-full w-9 h-9 flex items-center justify-center text-[#A1A1AA] hover:text-white transition"
+          >
+            {panelOpen ? <PanelRightClose className="w-4 h-4" /> : <PanelRightOpen className="w-4 h-4" />}
+          </button>
+          <button
             onClick={onExport}
             disabled={exporting}
             aria-busy={exporting}
@@ -1779,215 +1962,6 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
       </header>
 
-      {/* Shortcuts Cheat-Sheet Popover */}
-      <AnimatePresence initial={false}>{shortcutsOpen && (
-        <motion.div {...POP} className="fixed top-20 left-[304px] z-50 w-80 prism-glass-pop p-4 space-y-2.5 text-xs">
-          <div className="flex items-center justify-between border-b border-white/10 pb-2">
-            <span className="font-semibold text-white">Atalhos & Seleção do Estúdio</span>
-            <button
-              type="button"
-              onClick={() => setShortcutsOpen(false)}
-              className="text-[11px] text-[#A1A1AA] hover:text-white"
-            >
-              Esc
-            </button>
-          </div>
-          <div className="space-y-1.5 text-[11px] text-[#A1A1AA]">
-            {[
-              ["Ctrl+C / Ctrl+V", "Copiar / Colar camadas"],
-              ["Ctrl+X / Ctrl+D", "Recortar / Duplicar"],
-              ["Ctrl+G / Ctrl+Shift+G", "Agrupar / Desagrupar"],
-              ["Ctrl+] / Ctrl+[", "Trazer à frente / Enviar atrás"],
-              ["Ctrl+A / Esc", "Selecionar tudo / Desselecionar"],
-              ["Ctrl+Clique", "Selecionar / desmarcar vários itens"],
-              ["Alt+Clique", "Desmarcar item / entrar em grupo"],
-              ["Alt+Arrastar", "Mover livre (sem snap magnético)"],
-              ["Setas / Shift+Setas", "Mover 1px / 10px"],
-              ["Ctrl+Shift+H / Ctrl+L", "Ocultar / Travar selecionadas"],
-              ["Arrastar na lista", "Reordenar Z ou soltar dentro de Grupo"],
-              ["Sala 3D · Botão dir. + WASD/QE", "Voar pela sala (Shift acelera)"],
-              ["Sala 3D · Meio / Alt+Arrastar", "Pan · Scroll: aproximar"],
-              ["Sala 3D · G / R / S / F", "Mover / Girar / Escalar / Focar"],
-              ["Sala 3D · Ctrl+D / Delete", "Duplicar / Remover objeto"],
-              ["Ctrl+Shift+P", "HUD de desempenho"],
-              ["F1", "Ajuda e documentação"],
-            ].map(([k, desc]) => (
-              <div key={k} className="flex items-center justify-between gap-2">
-                <span className="font-mono-fx text-[10px] text-white/90 bg-white/10 px-1.5 py-0.5 rounded">
-                  {k}
-                </span>
-                <span className="text-right truncate">{desc}</span>
-              </div>
-            ))}
-          </div>
-        </motion.div>
-      )}</AnimatePresence>
-
-      {/* LEFT PANEL: Layer Tree (Stationary during drag) */}
-      <aside className="fixed top-20 left-4 bottom-4 z-30 w-[276px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
-        <div className="px-4 py-3 border-b border-white/10 flex items-center justify-between">
-          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#A1A1AA] flex items-center gap-1.5">
-            <Layers className="w-3.5 h-3.5 text-white" />
-            Camadas ({totalLayersCount})
-          </span>
-          <span className="text-[10px] font-mono-fx text-[#71717A]">Arraste p/ Z / Grupo</span>
-        </div>
-
-        {/* Add Layer Actions */}
-        <div className="p-3 border-b border-white/10 grid grid-cols-2 gap-1.5">
-          <button
-            onClick={() => addNewLayer("VIDEO")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Film className="w-3.5 h-3.5" /> Vídeo
-          </button>
-          <button
-            onClick={() => addNewLayer("IMAGE")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <ImageIcon className="w-3.5 h-3.5" /> Imagem PNG
-          </button>
-          <button
-            onClick={() => addNewLayer("SVG")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Shapes className="w-3.5 h-3.5" /> SVG / Ícone
-          </button>
-          <button
-            onClick={() => addNewLayer("TEXT")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Type className="w-3.5 h-3.5" /> Texto / ƒx
-          </button>
-          <button
-            onClick={() => addNewLayer("GLASS")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Sparkles className="w-3.5 h-3.5" /> Vidro
-          </button>
-          <button
-            onClick={() => addNewLayer("PROGRESS")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Layers className="w-3.5 h-3.5" /> Barra
-          </button>
-          <button
-            onClick={() => addNewLayer("SCENE_3D")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <Box className="w-3.5 h-3.5" /> Cena 3D
-          </button>
-          <button
-            onClick={() => addNewLayer("GROUP")}
-            className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center gap-1.5"
-          >
-            <FolderPlus className="w-3.5 h-3.5" /> Grupo
-          </button>
-          {project.packageType === "WALLPAPER" && (
-            <button
-              onClick={() => setWidgetPickerOpen((v) => !v)}
-              className="prism-pill-idle rounded-xl px-2.5 py-2 text-[11px] flex items-center justify-center gap-1.5 col-span-2"
-            >
-              <Box className="w-3.5 h-3.5" />
-              Importar Widget (.widget.prism)
-            </button>
-          )}
-        </div>
-
-        {/* Multi-Selection / Group Quick Action Bar */}
-        {(validSelectedIds.length > 1 || selectedLayer?.kind === "GROUP") && (
-          <div className="px-3 py-2 border-b border-white/10 bg-white/[0.04] flex items-center justify-between gap-1.5">
-            <span className="text-[10px] font-medium text-white/85 truncate">
-              {validSelectedIds.length > 1
-                ? `${validSelectedIds.length} selecionadas`
-                : "Grupo selecionado"}
-            </span>
-            <div className="flex items-center gap-1 shrink-0">
-              {validSelectedIds.length > 1 && (
-                <button
-                  type="button"
-                  onClick={handleGroupSelected}
-                  title="Agrupar selecionadas (Ctrl+G)"
-                  className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
-                >
-                  <FolderPlus className="w-3 h-3" /> Agrupar
-                </button>
-              )}
-              {selectedLayer?.kind === "GROUP" && (
-                <button
-                  type="button"
-                  onClick={handleUngroupSelected}
-                  title="Desagrupar (Ctrl+Shift+G)"
-                  className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white hover:text-black text-[10px] text-white transition flex items-center gap-1"
-                >
-                  <Ungroup className="w-3 h-3" /> Desagrupar
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Widget Importer Drawer inside Left Tree */}
-        <AnimatePresence initial={false}>{widgetPickerOpen && (
-          <motion.div {...COLLAPSE}><div className="p-3 border-b border-white/10 bg-black/50 space-y-2">
-            <span className="block text-[10px] uppercase tracking-wider text-[#A1A1AA]">
-              Inserir como Grupo Editável
-            </span>
-            {availableWidgets.map((w) => (
-              <button
-                key={w.id}
-                onClick={() => importWidgetAsGroup(w)}
-                className="w-full text-left px-3 py-2 rounded-xl bg-white/5 hover:bg-white hover:text-black text-[11px] transition truncate"
-              >
-                + {w.title} ({w.layers.length} camadas)
-              </button>
-            ))}
-            <button
-              onClick={importWidgetFromDisk}
-              className="w-full px-3 py-1.5 rounded-xl border border-white/15 text-[11px] text-[#A1A1AA] hover:text-white flex items-center justify-center gap-1.5"
-            >
-              <Upload className="w-3 h-3" /> Escolher .widget.prism do Disco
-            </button>
-          </div></motion.div>
-        )}</AnimatePresence>
-
-        {/* Ordered Stack (Front-most on top) */}
-        <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
-          {treeDrag?.active && treeDrag.hasNestedSource && (
-            <div
-              data-layer-root-drop="top"
-              className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
-                treeDrag.placement === "root-top"
-                  ? "border-white bg-white/20 text-white"
-                  : "border-white/25 text-[#A1A1AA]"
-              }`}
-            >
-              Soltar na Raiz (Topo / Frente)
-            </div>
-          )}
-
-          <AnimatePresence initial={false}>
-            {[...project.layers]
-              .reverse()
-              .map((layer, revIdx) =>
-                renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
-              )}
-          </AnimatePresence>
-
-          {treeDrag?.active && treeDrag.hasNestedSource && (
-            <div
-              data-layer-root-drop="bottom"
-              className={`rounded-xl px-2.5 py-1.5 text-center text-[10px] border border-dashed transition ${
-                treeDrag.placement === "root-bottom"
-                  ? "border-white bg-white/20 text-white"
-                  : "border-white/25 text-[#A1A1AA]"
-              }`}
-            >
-              Soltar na Raiz (Fundo / Atrás)
-            </div>
-          )}
-        </div>
-      </aside>
 
       {/* Floating Drag Ghost Pill for Layer Tree Reordering */}
       {treeDrag?.active && (
@@ -2004,7 +1978,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       )}
 
       {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
-      <div className="absolute inset-0 pt-20 pb-6 pl-[304px] pr-[380px]">
+      <div
+        className="absolute inset-0 pt-20 pb-6 pl-4"
+        style={{ paddingRight: stageRightInset(panelOpen) }}
+      >
         <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <div
             className="relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] shrink-0"
@@ -2244,7 +2221,12 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
       </div>
 
-      {/* RIGHT PANEL: Clean Tabbed Minimalist Inspector */}
+      {/* PAINEL ÚNICO (direita): propriedades em cima, camadas embaixo, divisória arrastável.
+          Recolhido (Ctrl+\) o canvas ocupa a largura toda; o painel nem fica montado. */}
+      {panelOpen && (
+      <StudioSidePanel
+        layers={layersPanel}
+        properties={
       <StudioInspector
         compatIssues={compatIssues}
         project={project}
@@ -2326,6 +2308,9 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         onRecordStep={() => history.pushSnapshot(projectRef.current)}
         onFlushSave={onFlushSave}
       />
+        }
+      />
+      )}
 
       <AnimatePresence>
         {fxTarget && (

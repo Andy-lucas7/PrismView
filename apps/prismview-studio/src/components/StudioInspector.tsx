@@ -3629,7 +3629,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   };
 
   return (
-    <aside className="fixed top-20 right-4 bottom-4 z-30 w-[352px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
+    // Conteúdo da metade de cima do painel único (`StudioSidePanel`): sem posição nem moldura próprias.
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <NativeCompatPanel issues={compatIssues} onSelectLayer={onSelectLayer} />
       {/* Top 3-Way Context Switcher */}
       <div className="p-2.5 border-b border-white/10 grid grid-cols-3 gap-1">
@@ -3663,7 +3664,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
             : renderLayerTab()}
         </motion.div>
       </AnimatePresence>
-    </aside>
+    </div>
   );
 };
 export { createGroupChildLayer } from "./InspectorControls";

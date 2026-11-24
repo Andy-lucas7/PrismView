@@ -117,6 +117,7 @@ export const SHORTCUT_GROUPS: readonly ShortcutGroup[] = [
     title: "Geral",
     rows: [
       { keys: "F1", desc: "Abrir esta Ajuda", hook: '"F1"', src: "app" },
+      { keys: "Ctrl+\\", desc: "Recolher / mostrar o painel de propriedades e camadas (canvas em tela cheia)", hook: 'e.code === "Backslash"', src: "editor" },
       { keys: "Ctrl+Shift+P", desc: "Mostrar / ocultar o HUD de desempenho", hook: 'toLowerCase() === "p"', src: "editor" },
     ],
   },
@@ -373,10 +374,12 @@ const EDITOR: HelpSection[] = [
       {
         t: "ul",
         items: [
-          "Camadas: lista com a ordem de empilhamento (a de cima fica na frente) e botões para criar cada tipo.",
-          "Canvas: a área onde a cena aparece, na proporção do seu monitor. Arraste para mover; as alças dos cantos mudam o tamanho mantendo a proporção.",
-          "Inspetor: Camada (propriedades da selecionada), Fundo (fundo do projeto, escurecimento, mídia) e Globais (variáveis do ƒx).",
-          "Barra superior: voltar ao Hub, nome do projeto, estado de salvamento, desfazer/refazer, atalhos, ajuda, Exportar e Aplicar.",
+          "Canvas: a área onde a cena aparece, na proporção do seu monitor, ocupando todo o espaço à esquerda do painel. Arraste para mover; as alças dos cantos mudam o tamanho mantendo a proporção.",
+          "Painel à direita: propriedades em cima e camadas embaixo. Arraste a divisória entre os dois (ou use as setas com ela focada; Enter restaura) para dar mais espaço a um deles; a proporção é lembrada.",
+          "Propriedades: Camada (a selecionada), Fundo (fundo do projeto, escurecimento, mídia) e Globais (variáveis do ƒx).",
+          "Camadas: lista com a ordem de empilhamento (a de cima fica na frente) e uma fileira de ícones para criar cada tipo. Ocultar e travar ficam sempre visíveis; ordem, duplicar e excluir aparecem ao passar o mouse ou selecionar.",
+          "Ctrl+\\ recolhe o painel inteiro (o canvas ocupa a largura toda) e mostra de novo; o botão ao lado de Exportar faz o mesmo.",
+          "Barra superior: voltar ao Hub, nome do projeto, estado de salvamento, desfazer/refazer, ajuda e atalhos, Exportar e Aplicar.",
         ],
       },
       {
