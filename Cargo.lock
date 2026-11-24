@@ -3479,6 +3479,7 @@ dependencies = [
 name = "prismview-studio"
 version = "0.1.0"
 dependencies = [
+ "fontdb",
  "serde",
  "serde_json",
  "tauri",

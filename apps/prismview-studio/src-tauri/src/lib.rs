@@ -1,6 +1,7 @@
 mod intro_gate;
 mod atomic_fs;
 mod bundled_fonts;
+mod font_bytes;
 mod desktop_host;
 mod log_file;
 mod native_engine;
@@ -15,6 +16,7 @@ mod tray;
 mod bg_monitor;
 
 use bg_monitor::*;
+use font_bytes::*;
 use tray::*;
 use widgets::*;
 use session::*;
@@ -947,6 +949,7 @@ pub fn run() {
             projects::delete_project,
             list_monitors,
             list_system_fonts,
+            read_font_bytes,
             apply_desktop_wallpaper,
             clear_desktop_wallpaper,
             widgets::pin_standalone_widget,

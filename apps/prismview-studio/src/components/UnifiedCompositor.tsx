@@ -1455,6 +1455,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                   shadowPx={glyphAlpha <= 0.002 ? 0 : layer.text.shadowBlur}
                   shadowAlpha={0.65 * glyphAlpha}
                   fontRev={fontRev}
+                  fontPath={layer.text.fontPath}
                 />
               </div>
             );

@@ -683,9 +683,190 @@ pub fn warp_glyph(contours: &[Contour], warp: &StemWarp, lines: &FontLines, para
             }
             pts.push([wpts[i][0] + d[0], wpts[i][1] + d[1]]);
         }
+        // Duas passadas: os lados mudam um pouco quando o primeiro corte é reposicionado.
+        restore_caps(&c.pts, &mut pts, ink_left, stroke);
+        restore_caps(&c.pts, &mut pts, ink_left, stroke);
         out.push(Contour { pts });
     }
     out
+}
+
+// ───────────────────────── Pontas (terminais de haste) ─────────────────────────
+
+/// Terminal de haste: aresta curta entre duas quinas convexas cujos lados correm no mesmo sentido
+/// (a "ponta" de uma haste, o corte de um arco em C/G/S/J, o pé de um A).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cap {
+    /// Aresta `i → j` (`j = i + 1`).
+    pub i: usize,
+    pub j: usize,
+    /// Corte alinhado a um eixo no contorno original: `Some(true)` horizontal, `Some(false)` vertical.
+    pub axis: Option<bool>,
+}
+
+/// Tolerância (|componente| do vetor unitário) para considerar o corte alinhado a um eixo.
+const CAP_AXIS_TOL: f32 = 0.035;
+
+fn unit(v: P) -> P {
+    let l = (v[0] * v[0] + v[1] * v[1]).sqrt();
+    if l < 1e-9 {
+        [0.0, 0.0]
+    } else {
+        [v[0] / l, v[1] / l]
+    }
+}
+
+fn dot2(a: P, b: P) -> f32 {
+    a[0] * b[0] + a[1] * b[1]
+}
+
+fn cross2(a: P, b: P) -> f32 {
+    a[0] * b[1] - a[1] * b[0]
+}
+
+fn rotate2(v: P, ang: f32) -> P {
+    let (s, c) = ang.sin_cos();
+    [v[0] * c - v[1] * s, v[0] * s + v[1] * c]
+}
+
+/// Direção (unitária) de `poly[i]` até o ponto que está a `dist` de comprimento ao longo do
+/// contorno, andando `fwd` (+1) ou para trás (-1). Ignora o ruído dos vértices de achatamento.
+fn walk_dir(poly: &[P], i: usize, fwd: bool, dist: f32) -> P {
+    let n = poly.len();
+    let mut acc = 0.0f32;
+    let mut k = i;
+    let origin = poly[i];
+    for _ in 0..n {
+        let next = if fwd { (k + 1) % n } else { (k + n - 1) % n };
+        let seg = ((poly[next][0] - poly[k][0]).powi(2) + (poly[next][1] - poly[k][1]).powi(2)).sqrt();
+        if acc + seg >= dist && seg > 1e-9 {
+            let t = (dist - acc) / seg;
+            let p = [poly[k][0] + (poly[next][0] - poly[k][0]) * t, poly[k][1] + (poly[next][1] - poly[k][1]) * t];
+            return unit([p[0] - origin[0], p[1] - origin[1]]);
+        }
+        acc += seg;
+        k = next;
+    }
+    unit([poly[k][0] - origin[0], poly[k][1] - origin[1]])
+}
+
+/// Vértice `i` é quina convexa da TINTA (curva para o lado da tinta).
+fn is_ink_convex(poly: &[P], i: usize, ink_left: bool) -> bool {
+    let n = poly.len();
+    let (p, q, r) = (poly[(i + n - 1) % n], poly[i], poly[(i + 1) % n]);
+    let c = cross2([q[0] - p[0], q[1] - p[1]], [r[0] - q[0], r[1] - q[1]]);
+    if ink_left {
+        c > 0.0
+    } else {
+        c < 0.0
+    }
+}
+
+/// Acha os terminais do contorno `poly` (original, antes do alongamento).
+pub fn find_caps(poly: &[P], ink_left: bool, stroke: f32) -> Vec<Cap> {
+    let n = poly.len();
+    let mut caps: Vec<Cap> = Vec::new();
+    if n < 6 || stroke <= 0.0 {
+        return caps;
+    }
+    let reach = 0.35 * stroke;
+    let mut used = vec![false; n];
+    for i in 0..n {
+        let j = (i + 1) % n;
+        if used[i] || used[j] {
+            continue;
+        }
+        let (a, b) = (poly[i], poly[j]);
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if len < 0.3 * stroke || len > 2.2 * stroke {
+            continue;
+        }
+        if !is_ink_convex(poly, i, ink_left) || !is_ink_convex(poly, j, ink_left) {
+            continue;
+        }
+        let c = unit([b[0] - a[0], b[1] - a[1]]);
+        let si = walk_dir(poly, i, false, reach);
+        let sj = walk_dir(poly, j, true, reach);
+        // Os lados saem da ponta no mesmo sentido (haste), e o corte atravessa a haste (35°–145°).
+        if dot2(si, sj) < 0.85 || dot2(si, c).abs() > 0.82 || dot2(sj, [-c[0], -c[1]]).abs() > 0.82 {
+            continue;
+        }
+        let axis = if c[1].abs() <= CAP_AXIS_TOL {
+            Some(true)
+        } else if c[0].abs() <= CAP_AXIS_TOL {
+            Some(false)
+        } else {
+            None
+        };
+        used[i] = true;
+        used[j] = true;
+        caps.push(Cap { i, j, axis });
+    }
+    caps
+}
+
+/// Reposiciona os dois vértices de cada terminal para que o corte mantenha o ângulo original com
+/// os lados (ou o eixo, se era horizontal/vertical): o mapa vertical e o recuo de espessura giram
+/// o corte e "apontam" ou "quebram" a ponta (C/G/S). Os lados continuam como estão.
+fn restore_caps(orig: &[P], pts: &mut [P], ink_left: bool, stroke: f32) {
+    let caps = find_caps(orig, ink_left, stroke);
+    if caps.is_empty() {
+        return;
+    }
+    let reach = 0.35 * stroke;
+    let mut fixes: Vec<(usize, P, usize, P)> = Vec::new();
+    for cap in caps {
+        let (i, j) = (cap.i, cap.j);
+        let (oa, ob) = (orig[i], orig[j]);
+        let c0 = unit([ob[0] - oa[0], ob[1] - oa[1]]);
+        let si0 = walk_dir(orig, i, false, reach);
+        let sj0 = walk_dir(orig, j, true, reach);
+        // Lados na geometria nova (a espessura recuada dá a direção real da haste).
+        let si1 = walk_dir(pts, i, false, reach);
+        let sj1 = walk_dir(pts, j, true, reach);
+        if dot2(si1, sj1) < 0.3 {
+            continue;
+        }
+        let c1 = match cap.axis {
+            Some(true) => [c0[0].signum(), 0.0],
+            Some(false) => [0.0, c0[1].signum()],
+            None => {
+                // Ângulo assinado original (lado → corte) aplicado ao lado novo, nos dois extremos.
+                let th_i = cross2(si0, c0).atan2(dot2(si0, c0));
+                let est_i = rotate2(si1, th_i);
+                let nc0 = [-c0[0], -c0[1]];
+                let th_j = cross2(sj0, nc0).atan2(dot2(sj0, nc0));
+                let r = rotate2(sj1, th_j);
+                let est_j = [-r[0], -r[1]];
+                unit([est_i[0] + est_j[0], est_i[1] + est_j[1]])
+            }
+        };
+        if c1 == [0.0, 0.0] {
+            continue;
+        }
+        let m = [(pts[i][0] + pts[j][0]) * 0.5, (pts[i][1] + pts[j][1]) * 0.5];
+        // Interseção da reta do corte (por `m`) com a reta de cada lado.
+        let hit = |p: P, s: P| -> Option<P> {
+            let den = cross2(c1, s);
+            if den.abs() < 0.25 {
+                return None;
+            }
+            let u = cross2([p[0] - m[0], p[1] - m[1]], s) / den;
+            Some([m[0] + c1[0] * u, m[1] + c1[1] * u])
+        };
+        let (Some(ni), Some(nj)) = (hit(pts[i], si1), hit(pts[j], sj1)) else { continue };
+        let moved = |a: P, b: P| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        let old_len = moved(pts[i], pts[j]).max(1e-3);
+        let new_len = moved(ni, nj);
+        if moved(ni, pts[i]) > 1.3 * stroke || moved(nj, pts[j]) > 1.3 * stroke || new_len < 0.3 * old_len || new_len > 2.5 * old_len {
+            continue;
+        }
+        fixes.push((i, ni, j, nj));
+    }
+    for (i, ni, j, nj) in fixes {
+        pts[i] = ni;
+        pts[j] = nj;
+    }
 }
 
 /// Suaviza o recuo por aresta ao longo de trechos *curvos* (sem quinas): a espessura medida por
@@ -1035,6 +1216,127 @@ mod tests {
             assert!(v > prev);
             prev = v;
             y += 3.0;
+        }
+    }
+
+    const OUTFIT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/prismview-studio/src-tauri/fonts/Outfit-400.ttf"));
+    const INTER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/prismview-studio/src-tauri/fonts/Inter-400.ttf"));
+    const MONO: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/prismview-studio/src-tauri/fonts/JetBrainsMono-400.ttf"));
+
+    fn outer_sign_of(cs: &[Contour]) -> f32 {
+        cs.iter()
+            .map(signed_area)
+            .fold((0.0f32, 1.0f32), |acc, a| if a.abs() > acc.0 { (a.abs(), a.signum()) } else { acc })
+            .1
+    }
+
+    /// Ângulo (graus) entre o corte e o lado, medido como no `restore_caps`.
+    fn cap_angles(poly: &[P], cap: &Cap, reach: f32) -> (f32, f32) {
+        let (a, b) = (poly[cap.i], poly[cap.j]);
+        let c = unit([b[0] - a[0], b[1] - a[1]]);
+        let si = walk_dir(poly, cap.i, false, reach);
+        let sj = walk_dir(poly, cap.j, true, reach);
+        let ai = dot2(si, c).clamp(-1.0, 1.0).acos().to_degrees();
+        let aj = dot2(sj, [-c[0], -c[1]]).clamp(-1.0, 1.0).acos().to_degrees();
+        (ai, aj)
+    }
+
+    /// Pior desvio aceito num canto de ponta. Sem a restauração, C/G/S/Q chegavam a 40°–90°.
+    const MAX_CAP_DEV: f32 = 25.0;
+
+    #[test]
+    fn terminal_caps_keep_their_corner_angles_and_axes() {
+        let mut checked = 0usize;
+        let mut oblique = 0usize;
+        let mut devs: Vec<f32> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+        for (name, data) in [("Outfit", OUTFIT), ("Inter", INTER), ("JetBrains Mono", MONO)] {
+            let face = Face::parse(data, 0).unwrap();
+            let lines = FontLines::measure(&face);
+            let reach = 0.35 * lines.stroke;
+            let params = StemParams::default();
+            for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".chars() {
+                let Some(gid) = face.glyph_index(ch) else { continue };
+                let Some(cs) = glyph_contours(&face, gid, lines.upem * 0.0015) else { continue };
+                let ink_left = outer_sign_of(&cs) > 0.0;
+                for s in [1.5f32, 2.0, 2.4] {
+                    let out = stretch_glyph(&cs, &lines, s, &params);
+                    for (a, b) in cs.iter().zip(out.iter()) {
+                        if a.pts.len() != b.pts.len() {
+                            continue; // pontos/pingos rígidos mantêm a contagem; qualquer outro caso é ignorado
+                        }
+                        for cap in find_caps(&a.pts, ink_left, lines.stroke) {
+                            checked += 1;
+                            let (a0, a1) = cap_angles(&a.pts, &cap, reach);
+                            let (b0, b1) = cap_angles(&b.pts, &cap, reach);
+                            let tag = format!("{name} '{ch}' x{s} cap {}-{}", cap.i, cap.j);
+                            match cap.axis {
+                                Some(horizontal) => {
+                                    let (p, q) = (b.pts[cap.i], b.pts[cap.j]);
+                                    let d = unit([q[0] - p[0], q[1] - p[1]]);
+                                    let off = if horizontal { d[1].abs() } else { d[0].abs() };
+                                    if off > 0.03 {
+                                        failures.push(format!("{tag}: corte deixou de ser alinhado ao eixo (desvio {off:.3})"));
+                                    }
+                                }
+                                None => {
+                                    oblique += 1;
+                                    for (before, after, end) in [(a0, b0, "início"), (a1, b1, "fim")] {
+                                        devs.push((after - before).abs());
+                                        if (after - before).abs() > MAX_CAP_DEV {
+                                            failures.push(format!("{tag}: canto do {end} {before:.0}° -> {after:.0}°"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 300, "poucos terminais verificados ({checked}): a detecção regrediu");
+        let mean = devs.iter().sum::<f32>() / devs.len().max(1) as f32;
+        assert!(mean <= 3.0, "desvio médio dos cantos {mean:.2}° (sem a restauração passava de 10°)");
+        assert!(oblique >= 40, "poucos cortes oblíquos ({oblique}): a detecção regrediu");
+        assert!(failures.is_empty(), "{} falhas:\n{}", failures.len(), failures.iter().take(25).cloned().collect::<Vec<_>>().join("\n"));
+    }
+
+    /// Diagnóstico de cantos: `STEM_FONT=arq.ttf STEM_S=2 cargo test -p prism-core corner_audit -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn corner_audit() {
+        let Ok(path) = std::env::var("STEM_FONT") else { return };
+        let sv: f32 = std::env::var("STEM_S").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+        let data = std::fs::read(path).unwrap();
+        let face = Face::parse(&data, 0).unwrap();
+        let lines = FontLines::measure(&face);
+        let params = StemParams::default();
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:".chars() {
+            let Some(gid) = face.glyph_index(ch) else { continue };
+            let Some(cs) = glyph_contours(&face, gid, lines.upem * 0.0015) else { continue };
+            let out = stretch_glyph(&cs, &lines, sv, &params);
+            for (ci, (a, b)) in cs.iter().zip(out.iter()).enumerate() {
+                if a.pts.len() != b.pts.len() {
+                    continue;
+                }
+                let n = a.pts.len();
+                for i in 0..n {
+                    let (pa, qa, ra) = (a.pts[(i + n - 1) % n], a.pts[i], a.pts[(i + 1) % n]);
+                    let (pb, qb, rb) = (b.pts[(i + n - 1) % n], b.pts[i], b.pts[(i + 1) % n]);
+                    let ang = |p: P, q: P, r: P| -> Option<f32> {
+                        let (ux, uy, vx, vy) = (p[0] - q[0], p[1] - q[1], r[0] - q[0], r[1] - q[1]);
+                        let (lu, lv) = ((ux * ux + uy * uy).sqrt(), (vx * vx + vy * vy).sqrt());
+                        if lu < lines.stroke * 0.12 || lv < lines.stroke * 0.12 {
+                            return None; // vértice de curva
+                        }
+                        Some(((ux * vx + uy * vy) / (lu * lv)).clamp(-1.0, 1.0).acos().to_degrees())
+                    };
+                    let (Some(a0), Some(a1)) = (ang(pa, qa, ra), ang(pb, qb, rb)) else { continue };
+                    if a0 < 125.0 && (a1 - a0).abs() > 6.0 {
+                        eprintln!("{ch} c{ci} v{i} ({:.0},{:.0}): {a0:.0}° -> {a1:.0}°", qa[0], qa[1]);
+                    }
+                }
+            }
         }
     }
 
