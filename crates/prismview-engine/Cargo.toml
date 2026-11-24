@@ -1,5 +1,6 @@
 [package]
 name = "prismview-engine"
+description = "PrismView Engine"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -71,4 +72,7 @@ windows = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(windows)'.build-dependencies]
+tauri-winres = "0.3"
 

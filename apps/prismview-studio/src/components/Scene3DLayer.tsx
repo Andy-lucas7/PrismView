@@ -123,6 +123,7 @@ export interface Scene3DLayerProps {
   /** When true inside Studio, enables live mouse orbit, Bone Look-At, hover & click raycast testing */
   testMode?: boolean;
   cursorNormRef?: React.RefObject<[number, number] | null>;
+  testOrbitOffsetRef?: React.RefObject<[number, number]>;
   subscribeCursorTick?: (cb: () => void) => () => void;
   subscribeCursorClick?: (cb: (x: number, y: number) => void) => () => void;
   reactiveSignalRef?: React.RefObject<ReactiveSignal>;
@@ -168,6 +169,7 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   interactive = false,
   testMode = false,
   cursorNormRef,
+  testOrbitOffsetRef,
   subscribeCursorTick,
   subscribeCursorClick,
   reactiveSignalRef,
@@ -262,6 +264,8 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
   interactiveRef.current = interactive;
   const testModeRef = useRef(testMode);
   testModeRef.current = testMode;
+  const testOrbitOffsetRefProp = useRef(testOrbitOffsetRef);
+  testOrbitOffsetRefProp.current = testOrbitOffsetRef;
   const mediaPlayingRef = useRef(mediaPlaying);
   mediaPlayingRef.current = mediaPlaying;
   const cpuPercentRef = useRef(cpuPercent);
@@ -989,8 +993,11 @@ const Scene3DLayerImpl: React.FC<Scene3DLayerProps> = ({
           cursorEnabled &&
           caps.allowCursorOrbit &&
           (Math.abs(cfg.camera.orbitParallaxX) > 1e-3 || Math.abs(cfg.camera.orbitParallaxY) > 1e-3);
-        const targetAz = useCursorOrbit ? cx * cfg.camera.orbitParallaxX : 0;
-        const targetEl = useCursorOrbit ? -cy * cfg.camera.orbitParallaxY : 0;
+        const testDragOrbit = testModeRef.current ? testOrbitOffsetRefProp.current?.current ?? null : null;
+        const targetAz =
+          (useCursorOrbit ? cx * cfg.camera.orbitParallaxX : 0) + (testDragOrbit ? testDragOrbit[0] : 0);
+        const targetEl =
+          (useCursorOrbit ? -cy * cfg.camera.orbitParallaxY : 0) + (testDragOrbit ? testDragOrbit[1] : 0);
         const damp = Math.max(0.02, Math.min(0.4, cfg.camera.damping || 0.08));
         const alpha = 1 - Math.exp(-damp * 60 * dt);
         eng.curOrbitAz += (targetAz - eng.curOrbitAz) * alpha;

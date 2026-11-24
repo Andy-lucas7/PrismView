@@ -25,7 +25,7 @@ import { warpGlyphMaps } from "../utils/stemGlyphMaps";
 // Type-only: keeps the 3D engine in its own lazy chunk
 import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
 
-import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, supportsCorsUrl } from "./UnifiedCompositorParts";
+import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, ensureSystemFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, supportsCorsUrl } from "./UnifiedCompositorParts";
 import { snapAxisInto, type SnapAxisBuffer } from "../utils/align";
 
 export type LayerResizePatch = {
@@ -142,10 +142,37 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   const fpsCapRef = useRef<number | null>(null);
   fpsCapRef.current = powerCapsFor(powerState).fpsCap;
 
-  // Studio 3D Test Mode cursor/click channels (zero React re-renders during live mouse test)
+  // Studio 3D Test Mode cursor/click/drag channels (zero React re-renders during live mouse test)
   const previewCursorRef = useRef<[number, number] | null>([0.5, 0.5]);
+  const previewTestOrbitRef = useRef<[number, number]>([0, 0]);
   const previewTickSubsRef = useRef<Set<() => void>>(new Set());
   const previewClickSubsRef = useRef<Set<(x: number, y: number) => void>>(new Set());
+  const testDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    lastX: number;
+    lastY: number;
+    moved: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!test3dMode) {
+      previewTestOrbitRef.current = [0, 0];
+      testDragRef.current = null;
+      previewTickSubsRef.current.forEach((cb) => cb());
+    }
+  }, [test3dMode]);
+
+  const normalizeScene3DCursor = (clientX: number, clientY: number): [number, number] | null => {
+    const targetEl = rootRef.current?.querySelector('[data-prism-scene3d="true"]') ?? rootRef.current;
+    const rect = targetEl?.getBoundingClientRect();
+    if (!rect || rect.width <= 1 || rect.height <= 1) return null;
+    return [
+      Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+      Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)),
+    ];
+  };
 
   const subscribePreviewTick = useCallback((cb: () => void) => {
     previewTickSubsRef.current.add(cb);
@@ -359,10 +386,16 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     let active = true;
     const walk = (layers: SceneLayer[]) => {
       for (const l of layers) {
-        if (l.kind === "TEXT" && l.text?.fontPath) {
-          void ensureCustomFontLoaded(l.text.fontFamily, l.text.fontPath).then((loaded) => {
-            if (active && loaded) setFontRev((r) => r + 1);
-          });
+        if (l.kind === "TEXT" && l.text) {
+          if (l.text.fontPath) {
+            void ensureCustomFontLoaded(l.text.fontFamily, l.text.fontPath).then((loaded) => {
+              if (active && loaded) setFontRev((r) => r + 1);
+            });
+          } else if (l.text.fontFamily) {
+            void ensureSystemFontLoaded(l.text.fontFamily, l.text.fontWeight).then((loaded) => {
+              if (active && loaded) setFontRev((r) => r + 1);
+            });
+          }
         }
         if (l.children?.length) walk(l.children);
       }
@@ -553,13 +586,28 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (paused && !interactive) return;
     if (interactive && test3dMode) {
-      const rect = rootRef.current?.getBoundingClientRect();
-      if (rect && rect.width > 1 && rect.height > 1) {
-        const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-        previewCursorRef.current = [nx, ny];
-        previewTickSubsRef.current.forEach((cb) => cb());
+      const norm = normalizeScene3DCursor(e.clientX, e.clientY);
+      if (norm) {
+        previewCursorRef.current = norm;
       }
+      const td = testDragRef.current;
+      if (td && td.pointerId === e.pointerId) {
+        const dx = e.clientX - td.lastX;
+        const dy = e.clientY - td.lastY;
+        td.lastX = e.clientX;
+        td.lastY = e.clientY;
+        if (!td.moved && Math.hypot(e.clientX - td.startX, e.clientY - td.startY) > 4) {
+          td.moved = true;
+        }
+        if (td.moved) {
+          const [curAz, curEl] = previewTestOrbitRef.current;
+          previewTestOrbitRef.current = [
+            curAz - dx * 0.35,
+            Math.max(-75, Math.min(75, curEl + dy * 0.25)),
+          ];
+        }
+      }
+      previewTickSubsRef.current.forEach((cb) => cb());
       return;
     }
     if (!interactive || !dragRef.current) return;
@@ -896,6 +944,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       <div
         key={layer.id}
         data-layer-id={layer.id}
+        data-prism-scene3d={layer.kind === "SCENE_3D" ? "true" : undefined}
         ref={(el) => {
           if (el) {
             layerElsRef.current.set(layer.id, el);
@@ -1020,9 +1069,11 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           // Sala 3D: 2D layers stop hit-testing; only the edited 3D canvas opts back in
           // Camada bloqueada no editor ainda recebe o clique (seleciona sem mover): o hit-test segue
           // sempre a ordem visual, nunca atravessa para o item de baixo.
-          pointerEvents: roomActive ? "none" : undefined,
+          pointerEvents: roomActive || (interactive && test3dMode) ? "none" : undefined,
           cursor: interactive
-            ? layer.locked
+            ? test3dMode
+              ? "crosshair"
+              : layer.locked
               ? "default"
               : isTopLevel || selectedLayerId === layer.id
               ? "grab"
@@ -1109,6 +1160,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 interactive={interactive && !layer.locked}
                 testMode={test3dMode}
                 cursorNormRef={test3dMode ? previewCursorRef : cursorNormRef}
+                testOrbitOffsetRef={test3dMode ? previewTestOrbitRef : undefined}
                 subscribeCursorTick={test3dMode ? subscribePreviewTick : subscribeCursorTick}
                 subscribeCursorClick={test3dMode ? subscribePreviewClick : subscribeCursorClick}
                 reactiveSignalRef={reactiveSignalRef}
@@ -1394,7 +1446,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             // quebra artificial em 50% do CSS shrink-to-fit. Com `maxWidth` (alças laterais) = quebra limpa.
             whiteSpace: textMaxWPx > 0 ? "pre-wrap" : "pre",
             width: textMaxWPx > 0 ? `${textMaxWPx}px` : "max-content",
-            overflowWrap: textMaxWPx > 0 ? "break-word" : undefined,
+            overflowWrap: "normal",
             fontVariantNumeric: "tabular-nums",
             textShadow:
               glyphAlpha <= 0.002
@@ -1407,8 +1459,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           };
 
           if (g.enabled && textMode === "PILL") {
-            const padX = Math.max(12, scaledFont * 0.34);
-            const padY = Math.max(6, scaledFont * 0.16);
+            const padX = Math.max(12 * containerScale, scaledFont * 0.34);
+            const padY = Math.max(6 * containerScale, scaledFont * 0.16);
             return (
               <div
                 style={{
@@ -1821,11 +1873,54 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   return (
     <div
       ref={rootRef}
+      onPointerDown={(e) => {
+        if (interactive && test3dMode && e.button === 0) {
+          const norm = normalizeScene3DCursor(e.clientX, e.clientY);
+          if (norm) previewCursorRef.current = norm;
+          testDragRef.current = {
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            lastX: e.clientX,
+            lastY: e.clientY,
+            moved: false,
+          };
+          try {
+            rootRef.current?.setPointerCapture(e.pointerId);
+          } catch {}
+          previewTickSubsRef.current.forEach((cb) => cb());
+        }
+      }}
       onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onPointerLeave={() => {
+      onPointerUp={(e) => {
         if (interactive && test3dMode) {
+          const td = testDragRef.current;
+          testDragRef.current = null;
+          try {
+            if (rootRef.current?.hasPointerCapture(e.pointerId)) {
+              rootRef.current.releasePointerCapture(e.pointerId);
+            }
+          } catch {}
+          if (td && td.pointerId === e.pointerId && !td.moved) {
+            const norm = normalizeScene3DCursor(e.clientX, e.clientY);
+            if (norm) {
+              previewCursorRef.current = norm;
+              previewClickSubsRef.current.forEach((cb) => cb(norm[0], norm[1]));
+            }
+          }
+          return;
+        }
+        endDrag();
+      }}
+      onPointerCancel={(e) => {
+        if (interactive && test3dMode) {
+          testDragRef.current = null;
+          return;
+        }
+        endDrag();
+      }}
+      onPointerLeave={() => {
+        if (interactive && test3dMode && !testDragRef.current) {
           previewCursorRef.current = [0.5, 0.5];
           previewTickSubsRef.current.forEach((cb) => cb());
         }
@@ -1839,17 +1934,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       }}
       onClick={(e) => {
         if (!interactive) return;
-        if (roomActive) return;
-        if (test3dMode) {
-          const rect = rootRef.current?.getBoundingClientRect();
-          if (rect && rect.width > 1 && rect.height > 1) {
-            const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-            previewCursorRef.current = [nx, ny];
-            previewClickSubsRef.current.forEach((cb) => cb(nx, ny));
-          }
-          return;
-        }
+        if (roomActive || test3dMode) return;
         onSelectLayer?.(null);
       }}
       style={{

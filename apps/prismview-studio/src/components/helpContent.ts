@@ -316,7 +316,7 @@ const GETTING_STARTED: HelpSection[] = [
       {
         t: "ul",
         items: [
-          "Wallpaper: ocupa o desktop inteiro, em todos os monitores. Pode ter vídeo, imagem, texto, vidro e cena 3D.",
+          "Wallpaper: ocupa o desktop inteiro, em todos os monitores. Pode ter vídeo, imagem, texto, vidro e modelo 3D.",
           "Widget: janela transparente do tamanho que você definir, fixada no desktop (relógio, música, telemetria). Pode ser movida e travada.",
           "Pacote .prism: arquivo zip com o projeto e suas mídias. Serve para exportar, compartilhar e importar (widgets usam .widget.prism).",
         ],
@@ -335,7 +335,7 @@ const GETTING_STARTED: HelpSection[] = [
         t: "ol",
         items: [
           "Crie: no Hub, “Novo Projeto” ou escolha um modelo em “Modelos Prontos”. Também dá para importar um modelo 3D (.glb/.gltf), um vídeo ou imagem, ou um pacote .prism (seção “Importar do PC”).",
-          "Edite: clique no card para abrir o Studio. Adicione camadas (Vídeo, Imagem, SVG, Texto, Vidro, Barra, Grupo, Cena 3D), arraste no canvas e ajuste no inspetor.",
+          "Edite: clique no card para abrir o Studio. Adicione camadas (Vídeo, Imagem, SVG, Texto, Vidro, Barra, Grupo, Modelo 3D), arraste no canvas e ajuste no inspetor.",
           "Dê vida: use fórmulas ƒx em textos, cores e opacidade; ligue globais a cliques; no 3D, ações reativas a mouse, áudio e teclado.",
           "Salve: o projeto salva sozinho; a etiqueta ao lado do nome mostra Salvando, Salvo ou Falha (com “Tentar de novo”). Ctrl+S força.",
           "Aplique: “Aplicar no Desktop” (wallpaper) ou “Fixar Widget na Tela”. Um selo laranja no botão avisa o que o desktop ainda não desenha.",
@@ -382,7 +382,7 @@ const EDITOR: HelpSection[] = [
         items: [
           "Canvas: a área onde a cena aparece, na proporção do seu monitor, ocupando todo o espaço à esquerda do painel. Arraste para mover; as alças dos cantos mudam o tamanho mantendo a proporção.",
           "Painel à direita: propriedades em cima e camadas embaixo. Arraste a divisória entre os dois (ou use as setas com ela focada; Enter restaura) para dar mais espaço a um deles; a proporção é lembrada.",
-          "Propriedades: Camada (a selecionada), Fundo (fundo do projeto, escurecimento, mídia) e Globais (variáveis do ƒx).",
+          "Propriedades: Camada (a selecionada) e Globais (variáveis do ƒx e tamanho de widgets).",
           "Camadas: lista com a ordem de empilhamento (a de cima fica na frente) e uma fileira de ícones para criar cada tipo. Ocultar e travar ficam sempre visíveis; ordem, duplicar e excluir aparecem ao passar o mouse ou selecionar.",
           "Ctrl+\\ recolhe o painel inteiro (o canvas ocupa a largura toda) e mostra de novo; o botão ao lado de Exportar faz o mesmo.",
           "Barra superior: voltar ao Hub, nome do projeto, estado de salvamento, desfazer/refazer, ajuda e atalhos, Exportar e Aplicar.",
@@ -390,7 +390,7 @@ const EDITOR: HelpSection[] = [
       },
       {
         t: "p",
-        text: "Se o projeto tem cena 3D, aparece também o seletor de modos: Layout 2D, Sala 3D e Testar Interações.",
+        text: "Se o projeto tem modelo 3D, aparece também o seletor de modos: Layout 2D, Sala 3D e Testar Interações.",
       },
     ],
   },
@@ -412,12 +412,12 @@ const EDITOR: HelpSection[] = [
           ["Vidro", "Placa de vidro óptico (desfoque, refração, dispersão, brilho) sobre o fundo."],
           ["Barra", "Barra de progresso ligada à música, CPU, RAM ou bateria."],
           ["Grupo", "Agrupa camadas para mover, escalar e aplicar vidro juntas. Widgets importados entram como grupo."],
-          ["Cena 3D", "Modelos .glb/.gltf ou esculturas prontas, com luz, ambiente e reações a mouse, áudio e teclado."],
+          ["Modelo 3D", "Modelos .glb/.gltf ou esculturas prontas, com luz, ambiente e reações a mouse, áudio e teclado."],
         ],
       },
       {
         t: "note",
-        text: "No desktop, só a primeira Cena 3D é desenhada; fontes woff/woff2 também não carregam no motor. O selo no botão Aplicar e o painel de compatibilidade do inspetor listam esses casos.",
+        text: "No desktop, só o primeiro Modelo 3D é desenhado; fontes woff/woff2 também não carregam no motor. O selo no botão Aplicar e o painel de compatibilidade do inspetor listam esses casos.",
       },
     ],
   },
@@ -485,7 +485,7 @@ const EDITOR: HelpSection[] = [
   {
     id: "cena3d",
     group: "Editor",
-    title: "Cena 3D e Sala 3D",
+    title: "Modelo 3D e Sala 3D",
     summary: "Modelos, câmera, luz e reações.",
     keywords: ["3d", "glb", "gltf", "sala", "camera", "gizmo", "reativo", "audio", "mouse"],
     blocks: [

@@ -31,7 +31,13 @@ fn build_native_engine() {
     for dir in ["crates/prismview-engine/src", "crates/prism-core/src"] {
         println!("cargo:rerun-if-changed={}", workspace.join(dir).display());
     }
-    for file in ["crates/prismview-engine/Cargo.toml", "crates/prism-core/Cargo.toml", "Cargo.lock"] {
+    for file in [
+        "crates/prismview-engine/Cargo.toml",
+        "crates/prismview-engine/build.rs",
+        "crates/prism-core/Cargo.toml",
+        "apps/prismview-studio/src-tauri/icons/icon.ico",
+        "Cargo.lock",
+    ] {
         println!("cargo:rerun-if-changed={}", workspace.join(file).display());
     }
 

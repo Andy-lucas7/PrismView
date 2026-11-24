@@ -13,9 +13,9 @@ const enterT = { duration: sec(DURATION.base), ease: [...EASE.decelerate] as [nu
 const exitT = { duration: sec(DURATION.fast), ease: [...EASE.accelerate] as [number, number, number, number] };
 
 export const POP = {
-  initial: { opacity: 0, y: 8, scale: SCALE.enter, filter: `blur(${BLUR.exit}px)` },
-  animate: { opacity: 1, y: 0, scale: 1, filter: "blur(0px)", transition: enterT },
-  exit: { opacity: 0, y: 4, scale: SCALE.exit, filter: `blur(${BLUR.exit / 2}px)`, transition: exitT },
+  initial: { opacity: 0, y: 6, scale: SCALE.enter },
+  animate: { opacity: 1, y: 0, scale: 1, transition: enterT },
+  exit: { opacity: 0, y: 3, scale: SCALE.exit, transition: exitT },
 } as const;
 
 export const COLLAPSE = {
@@ -26,9 +26,9 @@ export const COLLAPSE = {
 } as const;
 
 export const TAB = {
-  initial: { opacity: 0, y: 14, filter: `blur(${BLUR.enter}px)` },
-  animate: { opacity: 1, y: 0, filter: "blur(0px)", transition: enterT },
-  exit: { opacity: 0, y: -8, filter: `blur(${BLUR.exit}px)`, transition: exitT },
+  initial: { opacity: 0, y: 8 },
+  animate: { opacity: 1, y: 0, transition: enterT },
+  exit: { opacity: 0, y: -4, transition: exitT },
 } as const;
 
 /** Linha de lista que entra/sai (camadas): altura + fade + deslize; `overflow: clip` com margem p/ o brilho da seleção. */
@@ -41,23 +41,22 @@ export const ROW = {
 
 /** Troca de aba com muito conteúdo (inspetor): só fade + deslize curto, sem blur no painel inteiro. */
 export const TAB_LITE = {
-  initial: { opacity: 0, y: 10 },
+  initial: { opacity: 0, y: 6 },
   animate: { opacity: 1, y: 0, transition: enterT },
-  exit: { opacity: 0, y: -6, transition: exitT },
+  exit: { opacity: 0, y: -4, transition: exitT },
 } as const;
 
-/** Texto que troca com blur-reveal (títulos que mudam com a aba). */
+/** Texto que troca suavemente sem blur rasterizado (evita piscadas durante transições). */
 export const SwapText: React.FC<{ id: string; children: React.ReactNode; className?: string }> = ({ id, children, className }) => {
-  const reduced = Boolean(useReducedMotion());
   return (
     <span className={`relative block ${className ?? ""}`}>
       <AnimatePresence mode="popLayout" initial={false}>
         <motion.span
           key={id}
           className="block"
-          initial={{ opacity: 0, y: 6, filter: reduced ? "none" : `blur(${BLUR.exit}px)` }}
-          animate={{ opacity: 1, y: 0, filter: "blur(0px)", transition: enterT }}
-          exit={{ opacity: 0, y: -6, filter: reduced ? "none" : `blur(${BLUR.exit}px)`, transition: exitT }}
+          initial={{ opacity: 0, y: 4 }}
+          animate={{ opacity: 1, y: 0, transition: enterT }}
+          exit={{ opacity: 0, y: -4, transition: exitT }}
         >
           {children}
         </motion.span>
@@ -66,12 +65,12 @@ export const SwapText: React.FC<{ id: string; children: React.ReactNode; classNa
   );
 };
 
-/** Texto que se revela palavra por palavra (blur + sobe), estilo react-bits "BlurText". Só na montagem. */
+/** Texto que se revela palavra por palavra sem CSS blur caro na GPU/WebView. */
 export const BlurText: React.FC<{ text: string; className?: string; delay?: number; stagger?: number }> = ({
   text,
   className,
   delay = 0,
-  stagger = 0.045,
+  stagger = 0.03,
 }) => {
   const reduced = Boolean(useReducedMotion());
   if (reduced) return <span className={className}>{text}</span>;
@@ -83,9 +82,9 @@ export const BlurText: React.FC<{ text: string; className?: string; delay?: numb
           key={`${w}-${i}`}
           aria-hidden
           className="inline-block whitespace-pre"
-          initial={{ opacity: 0, y: 8, filter: `blur(${BLUR.exit}px)` }}
-          animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
-          transition={{ duration: sec(DURATION.slow), ease: [...EASE.decelerate], delay: delay + i * stagger }}
+          initial={{ opacity: 0, y: 5 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: sec(DURATION.base), ease: [...EASE.decelerate], delay: delay + i * stagger }}
         >
           {w}
           {i < words.length - 1 ? " " : ""}

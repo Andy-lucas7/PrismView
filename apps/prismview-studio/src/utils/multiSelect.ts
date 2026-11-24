@@ -20,7 +20,7 @@ export const LAYER_KIND_LABELS: Readonly<Record<LayerKind, string>> = {
   GLASS: "Vidro",
   GROUP: "Grupo",
   PROGRESS: "Barra",
-  SCENE_3D: "Cena 3D",
+  SCENE_3D: "Modelo 3D",
 };
 
 export function mergeField<T>(

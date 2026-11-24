@@ -156,22 +156,9 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
           current = "";
         } else {
           lines.push(current.trimEnd());
-          if (measureLine(token) <= maxWidthPx) {
-            current = token;
-          } else {
-            // Word wider than box: break by character
-            let chunk = "";
-            for (const ch of Array.from(token)) {
-              const nextChunk = chunk + ch;
-              if (chunk && measureLine(nextChunk) > maxWidthPx) {
-                lines.push(chunk);
-                chunk = ch;
-              } else {
-                chunk = nextChunk;
-              }
-            }
-            current = chunk;
-          }
+          // Paridade com `cosmic_text::Wrap::Word` no motor nativo:
+          // palavra única maior que `maxWidthPx` NÃO quebra caractere a caractere.
+          current = token;
         }
       }
       if (current) lines.push(current);

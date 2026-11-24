@@ -104,6 +104,7 @@ import {
   extractLayerStyle,
   formatMultiSelectionSummary,
   mergeProps,
+  LAYER_KIND_LABELS,
   resolveSelectedLayers,
   type TextCaseMode,
   transformTextCase,
@@ -146,7 +147,7 @@ const ADD_LAYER_BUTTONS: { kind: LayerKind; label: string; Icon: React.Component
   { kind: "TEXT", label: "texto / ƒx", Icon: Type },
   { kind: "GLASS", label: "vidro", Icon: Sparkles },
   { kind: "PROGRESS", label: "barra", Icon: Layers },
-  { kind: "SCENE_3D", label: "cena 3D", Icon: Box },
+  { kind: "SCENE_3D", label: "modelo 3D", Icon: Box },
   { kind: "GROUP", label: "grupo", Icon: FolderPlus },
 ];
 
@@ -473,8 +474,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   }, []);
 
   const stageFrameStyle = useMemo<React.CSSProperties>(() => {
-    const availW = Math.max(160, stageBounds.w - 24);
-    const availH = Math.max(120, stageBounds.h - 16);
+    const availW = Math.max(160, stageBounds.w);
+    const availH = Math.max(120, stageBounds.h);
     if (project.packageType === "WIDGET") {
       const ratio = canvasLogicalW / Math.max(1, canvasLogicalH);
       const maxW = Math.min(680, canvasLogicalW, availW);
@@ -494,7 +495,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       };
     }
     const aspect = Number.isFinite(monitorAspect) && monitorAspect > 0.2 ? monitorAspect : 16 / 9;
-    let w = Math.min(1024, availW);
+    let w = availW;
     let h = w / aspect;
     if (h > availH) {
       h = availH;
@@ -1876,7 +1877,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               <span className="block text-[10px] text-[#71717A]">
                 {dropInside
                   ? "Soltar dentro do grupo"
-                  : `Z${realIdx} · ${layer.kind}${isGroup ? ` (${children.length})` : ""}`}
+                  : `Z${realIdx} · ${LAYER_KIND_LABELS[layer.kind] ?? layer.kind}${isGroup ? ` (${children.length})` : ""}`}
               </span>
             </div>
           </div>
@@ -2278,13 +2279,6 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           "discrete"
         ),
       onAddNewLayer: (kind) => addNewLayer(kind),
-      onOpenSceneSettings: () => {
-        setPanelOpen((open) => {
-          if (!open) writePanelOpen(typeof window === "undefined" ? null : window.localStorage, true);
-          return true;
-        });
-        setInspectorMode("SCENE");
-      },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -2393,7 +2387,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               Energia · {POWER_PREFERENCE_LABELS[power.state]}
             </span>
           )}
-          {hasScene3D && (selectedLayer?.kind === "SCENE_3D" || scene3dEditMode !== "LAYOUT") && (
+          {hasScene3D && (
             <div className="frosted-chrome rounded-full p-1 flex items-center gap-0.5">
               {(
                 [
@@ -2499,12 +2493,12 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
       {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
       <div
-        className="absolute inset-0 pt-20 pb-6 pl-4"
+        className="absolute inset-0 pt-16 pb-3 pl-3"
         style={{ paddingRight: stageRightInset(panelOpen) }}
       >
         <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <div
-            className="relative overflow-hidden rounded-[22px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] shrink-0"
+            className="relative overflow-hidden rounded-[18px] border border-white/15 shadow-[0_28px_88px_rgba(0,0,0,0.92)] shrink-0"
             style={stageFrameStyle}
           >
           <UnifiedCompositor

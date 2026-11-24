@@ -450,6 +450,7 @@ impl TextSystem {
     /// Descarta todos os slots (hibernação de VRAM / troca de cena).
     pub fn clear(&mut self) {
         self.slots.clear();
+        self.stem_cache = StemCache::default();
         self.atlas.trim();
         self.swash = SwashCache::new();
     }

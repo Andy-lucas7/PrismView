@@ -82,6 +82,7 @@ export function nudgeSplit(current: number, steps: number, step = SPLIT_STEP): n
  */
 export const PANEL_WIDTH_PX = 352;
 export const PANEL_GAP_PX = 16;
+export const CANVAS_MARGIN_PX = 12;
 export function stageRightInset(open: boolean): number {
-  return open ? PANEL_WIDTH_PX + PANEL_GAP_PX * 2 : PANEL_GAP_PX;
+  return open ? PANEL_WIDTH_PX + PANEL_GAP_PX + CANVAS_MARGIN_PX : CANVAS_MARGIN_PX;
 }

@@ -504,18 +504,7 @@ const StudioHubApp: React.FC = () => {
   }, []);
   const [hubTab, setHubTab] = useState<HubTab>("WALLPAPERS");
   const [hubView, setHubView] = useState<HubView>(readHubView);
-  // Troca de aba do Hub sem AnimatePresence: sai (160 ms), troca o conteúdo e entra. (O modo "wait" travava com a grade.)
-  const [shownTab, setShownTab] = useState<HubTab>(hubTab);
-  const [tabLeaving, setTabLeaving] = useState(false);
-  useEffect(() => {
-    if (hubTab === shownTab) return;
-    setTabLeaving(true);
-    const id = window.setTimeout(() => {
-      setShownTab(hubTab);
-      setTabLeaving(false);
-    }, DURATION.fast + 10);
-    return () => window.clearTimeout(id);
-  }, [hubTab, shownTab]);
+  const shownTab = hubTab;
   // ── transição Hub ⇄ Studio (card cresce até a tela cheia; ver StudioHero)
   type StudioPhase = "idle" | "opening" | "closing";
   const reduceMotion = Boolean(useReducedMotion());
@@ -1415,7 +1404,7 @@ const StudioHubApp: React.FC = () => {
   };
 
   const createNew3DWallpaper = async () => {
-    const created = createPure3DProject(`Cena 3D ${wallpapers.length + 1}`, "");
+    const created = createPure3DProject(`Modelo 3D ${wallpapers.length + 1}`, "");
     await persistProjectImmediate(created);
     openStudio(created);
   };
@@ -1667,22 +1656,6 @@ const StudioHubApp: React.FC = () => {
     if (n <= 0) fn();
     else requestAnimationFrame(() => afterFrames(n - 1, fn));
   }
-  /** Espera fontes + ociosidade (até ~1,2 s) antes de continuar. */
-  function whenIdle(fn: () => void): void {
-    let done = false;
-    const go = () => {
-      if (done) return;
-      done = true;
-      fn();
-    };
-    window.setTimeout(go, 1200);
-    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
-    const fonts = document.fonts?.ready ?? Promise.resolve();
-    void fonts.then(() => {
-      if (idle) idle(go, { timeout: 900 });
-      else window.setTimeout(go, DURATION.fast);
-    });
-  }
   function cardRects(id: string): { rect: HeroRect | null; innerRect: HeroRect | null } {
     const sel = (k: string) => document.querySelector(`[data-hub-${k}="${CSS.escape(id)}"]`) as HTMLElement | null;
     const card = sel("card");
@@ -1746,7 +1719,7 @@ const StudioHubApp: React.FC = () => {
         // Fora do tick da animação: o mount é pesado e não pode rodar dentro do onUpdate.
         requestAnimationFrame(() => {
           setEditing(project);
-          afterFrames(2, () => whenIdle(dissolve));
+          afterFrames(1, dissolve);
         });
       };
       animate(heroP, 1, {
@@ -1792,9 +1765,8 @@ const StudioHubApp: React.FC = () => {
     afterFrames(2, () => {
       animate(heroOpacity, 1, { duration: sec(DURATION.instant) }).then(() => {
         setHubTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
-        setShownTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
         setEditing(null); // desmonta o Studio (coberto) e monta o Hub por baixo
-        afterFrames(3, () => {
+        afterFrames(1, () => {
           let { rect, innerRect } = cardRects(proj.id);
           if (!rect) {
             const w = window.innerWidth * 0.46;
@@ -2360,7 +2332,7 @@ const StudioHubApp: React.FC = () => {
                 onClick={() => void createNew3DWallpaper()}
                 className="prism-pill-idle rounded-full px-3.5 py-1.5 text-xs flex items-center gap-1.5"
               >
-                <Box className="w-3.5 h-3.5" /> Cena 3D em Branco
+                <Box className="w-3.5 h-3.5" /> Modelo 3D em Branco
               </button>
             )}
           </div>
@@ -2372,7 +2344,7 @@ const StudioHubApp: React.FC = () => {
           {!holdHub && (
           <>
           {shownTab === "WALLPAPERS" && (
-            <motion.div key="WALLPAPERS" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WALLPAPERS" initial={TAB.initial} animate={TAB.animate} className="max-w-7xl mx-auto space-y-5">
               {/* Filter Chips + Multi-Monitor Selector */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2543,7 +2515,7 @@ const StudioHubApp: React.FC = () => {
           )}
 
           {shownTab === "WIDGETS" && (
-            <motion.div key="WIDGETS" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WIDGETS" initial={TAB.initial} animate={TAB.animate} className="max-w-7xl mx-auto space-y-5">
               {runtime.pinned_widget_ids.length >= 3 && (
                 <div className="rounded-xl border border-amber-400/30 bg-amber-400/[0.06] px-3.5 py-2.5 text-[11px] text-amber-200/90">
                   Cada widget fixado roda em uma janela WebView própria (dezenas de MB de RAM cada).{" "}
@@ -2716,7 +2688,7 @@ const StudioHubApp: React.FC = () => {
           )}
 
           {shownTab === "TEMPLATES" && (
-            <motion.div key="TEMPLATES" initial={TAB.initial} animate={tabLeaving ? TAB.exit : TAB.animate} className="max-w-7xl mx-auto space-y-6 pb-6">
+            <motion.div key="TEMPLATES" initial={TAB.initial} animate={TAB.animate} className="max-w-7xl mx-auto space-y-6 pb-6">
               {/* Category Filter Bar + Restore Defaults */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2986,7 +2958,7 @@ const StudioHubApp: React.FC = () => {
                   >
                     <Box className="w-5 h-5 text-white" />
                     <div>
-                      <div className="text-xs font-semibold text-white">Cena 3D Interativa</div>
+                      <div className="text-xs font-semibold text-white">Modelo 3D Interativo</div>
                       <p className="text-[11px] text-[#A1A1AA] mt-0.5">
                         Sala 3D pronta para esculturas e modelos .glb.
                       </p>

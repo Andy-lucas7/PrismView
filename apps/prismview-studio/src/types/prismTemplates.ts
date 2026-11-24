@@ -6,7 +6,7 @@ import { createScene3DObject, defaultScene3D } from "./prismScene3D";
 import { createLayer } from "./prismFactory";
 
 export function createPure3DProject(title: string, modelPath = "", id?: string): PrismProject {
-  const stage = createLayer("SCENE_3D", title || "Cena 3D");
+  const stage = createLayer("SCENE_3D", title || "Modelo 3D");
   stage.scene3d = defaultScene3D(modelPath);
 
   const clock = createLayer("TEXT", "Relógio Cristal 3D");
@@ -39,7 +39,7 @@ export function createPure3DProject(title: string, modelPath = "", id?: string):
 
   return {
     id: id ?? `scene3d-${Date.now().toString(36)}`,
-    title: title || "Cena 3D",
+    title: title || "Modelo 3D",
     packageType: "WALLPAPER",
     dim: 0,
     backgroundColor: "#060608",

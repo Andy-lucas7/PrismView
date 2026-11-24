@@ -130,6 +130,8 @@ pub struct Scene3dRenderer {
     signals: SignalSnapshot,
     /// Cursor da última consulta de hover (re-pick só se mudou).
     hover_pointer: Option<[f32; 2]>,
+    hover_orbit: [f32; 2],
+    slow_idle_spin: bool,
 
     // Texturas dinâmicas (`MEDIA_COVER` e `CUSTOM_IMAGE`).
     media_cover_raw: String,
@@ -248,6 +250,8 @@ impl Scene3dRenderer {
             solver: BindingSolver3d::new(),
             signals: SignalSnapshot::default(),
             hover_pointer: None,
+            hover_orbit: [0.0, 0.0],
+            slow_idle_spin: false,
             media_cover_raw: String::new(),
             media_cover_key: None,
             dynamic_textures: HashMap::new(),
@@ -567,6 +571,7 @@ impl Scene3dRenderer {
         }
 
         let mut animating = false;
+        let mut fast_motion = false;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             // Oculto (ele ou um ancestral): o tempo anda, mas não pede quadro.
             let shown = self.visible.get(index).copied().unwrap_or(false);
@@ -574,6 +579,9 @@ impl Scene3dRenderer {
             if speed.is_finite() && speed.abs() > 1e-4 {
                 slot.spin = (slot.spin + speed * dt).rem_euclid(std::f32::consts::TAU);
                 animating |= shown;
+                if shown && speed.abs() >= 0.25 {
+                    fast_motion = true;
+                }
             } else if slot.spin != 0.0 {
                 slot.spin = 0.0;
                 self.dirty |= shown;
@@ -582,7 +590,10 @@ impl Scene3dRenderer {
                 if instance.advance(dt) {
                     self.dirty |= shown;
                 }
-                animating |= shown && instance.is_animating();
+                if shown && instance.is_animating() {
+                    animating = true;
+                    fast_motion = true;
+                }
             }
         }
 
@@ -600,7 +611,7 @@ impl Scene3dRenderer {
         let mut settled = true;
         for axis in 0..2 {
             let delta = target[axis] - self.orbit[axis];
-            if delta.abs() >= 0.01 {
+            if delta.abs() >= 0.025 {
                 settled = false;
                 self.orbit[axis] += delta * alpha;
                 self.dirty = true;
@@ -611,12 +622,16 @@ impl Scene3dRenderer {
         }
         if !settled {
             animating = true;
+            fast_motion = true;
         }
 
         // Bindings reativos: desfaz o delta anterior → (clipes já avançados acima) → reaplica.
         if !self.solver.is_empty() {
-            if self.solver.wants_hover() && (self.pointer != self.hover_pointer || !settled) {
+            let orbit_moved = (self.orbit[0] - self.hover_orbit[0]).abs() >= 0.15
+                || (self.orbit[1] - self.hover_orbit[1]).abs() >= 0.15;
+            if self.solver.wants_hover() && (self.pointer != self.hover_pointer || orbit_moved) {
                 self.hover_pointer = self.pointer;
+                self.hover_orbit = self.orbit;
                 let hit = self.pointer.and_then(|p| self.pick(p));
                 self.solver.set_hover(hit);
             }
@@ -627,14 +642,16 @@ impl Scene3dRenderer {
             if self.solver.solve(&mut access, &self.signals, look, dt) {
                 self.dirty = true;
             }
-            animating |= self.solver.is_animating();
-            // Override de clipe (PLAY_CLIP) iniciado agora também pede quadros.
-            animating |= self
+            let solver_anim = self.solver.is_animating();
+            let override_anim = self
                 .slots
                 .iter()
                 .any(|s| s.instance.as_ref().is_some_and(ModelInstance::is_animating));
+            animating |= solver_anim || override_anim;
+            fast_motion |= solver_anim || override_anim;
         }
 
+        self.slow_idle_spin = animating && !fast_motion;
         self.animating = animating;
         self.dirty || animating
     }
@@ -660,12 +677,20 @@ impl Scene3dRenderer {
     }
 
     /// Intervalo entre quadros pelo teto de FPS da cena (`None` = sincronia do monitor).
+    /// Se apenas auto-rotação lenta (< 0.25 rad/s) está rodando sem câmera/bindings rápidos,
+    /// limita a ~30 FPS para economizar CPU, blur de vidro e DWM.
     pub fn frame_interval(&self) -> Option<Duration> {
-        if self.config.fps_mode.eq_ignore_ascii_case("MONITOR") {
-            return None;
+        let base = if self.config.fps_mode.eq_ignore_ascii_case("MONITOR") {
+            None
+        } else {
+            let fps = self.config.max_fps.clamp(5, 200);
+            Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
+        };
+        if self.slow_idle_spin {
+            let floor = Duration::from_millis(33);
+            return Some(base.map_or(floor, |d| d.max(floor)));
         }
-        let fps = self.config.max_fps.clamp(5, 200);
-        Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
+        base
     }
 
     /// Quando acordar se nada estiver animando (ciclo dia/noite). `None` = só por evento.

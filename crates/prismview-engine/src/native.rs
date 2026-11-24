@@ -444,8 +444,11 @@ impl NativeApp {
             return;
         };
         loader.poll(&mut self.load_events);
+        let mut uploaded = false;
         for event in &self.load_events {
-            if let LoadEvent::Failed { path, error, .. } = event {
+            if let LoadEvent::Ready { .. } = event {
+                uploaded = true;
+            } else if let LoadEvent::Failed { path, error, .. } = event {
                 eprintln!("[prismview-engine] 3d {}: {error}", path.display());
             }
             if let Some(scene3d) = self.scene3d.as_mut() {
@@ -456,6 +459,10 @@ impl NativeApp {
             }
         }
         self.load_events.clear();
+        if uploaded {
+            self.vault.trim(0, 0);
+            trim_working_set();
+        }
     }
 
     /// Descarta o renderer 3D (cena sem 3D) e o bind da saída no compositor.
@@ -504,10 +511,6 @@ impl NativeApp {
         let (w, h) = placement.pixel_size();
         scene3d.set_viewport(w, h);
 
-        let cadence = scene3d
-            .frame_interval()
-            .unwrap_or(Duration::ZERO)
-            .max(self.governor.frame_interval());
         if let Some(at) = self.scene3d_next_at {
             if now < at {
                 return Some(at);
@@ -544,6 +547,10 @@ impl NativeApp {
             }
         }
 
+        let cadence = scene3d
+            .frame_interval()
+            .unwrap_or(Duration::ZERO)
+            .max(self.governor.frame_interval());
         if scene3d.needs_frame() {
             let at = now + cadence.max(Duration::from_millis(1));
             self.scene3d_next_at = Some(at);
@@ -2181,6 +2188,7 @@ impl LoopHandler for NativeApp {
         // Imagens decodificadas em segundo plano → rebuild 2D (upload) no próximo quadro.
         if self.renderer.as_mut().is_some_and(SceneRenderer::poll_images) {
             self.dirty = true;
+            trim_working_set();
         }
         for w in &mut self.widgets {
             w.poll_images();

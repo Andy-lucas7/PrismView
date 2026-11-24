@@ -53,8 +53,7 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
     return `inset(${(insetY * k).toFixed(2)}px ${(insetX * k).toFixed(2)}px ${(insetY * k).toFixed(2)}px ${(insetX * k).toFixed(2)}px round ${(rad0 * k).toFixed(2)}px)`;
   });
 
-  // Dissolução: blur curto acompanha a queda da opacidade (só no fim; 0 enquanto opaco = sem filtro).
-  const filter = useTransform(opacity, (o) => (o >= 0.999 ? "none" : `blur(${((1 - o) * 6).toFixed(2)}px)`));
+  // Sem blur em camada cheia: só transform, clip-path e opacity (compostos na GPU sem piscar).
 
   const isWidget = project.packageType === "WIDGET";
   const wAspect = isWidget ? project.widget.width / project.widget.height : 1;
@@ -65,7 +64,7 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
     <motion.div
       aria-hidden
       className="pointer-events-none fixed left-0 top-0 z-[400] overflow-hidden bg-pureBlack"
-      style={{ width: vw, height: vh, transformOrigin: "0 0", transform, clipPath: clip, opacity, filter, willChange: "transform, clip-path, opacity" }}
+      style={{ width: vw, height: vh, transformOrigin: "0 0", transform, clipPath: clip, opacity, willChange: "transform, clip-path, opacity" }}
     >
       {isWidget ? (
         <div
@@ -73,11 +72,11 @@ export const StudioHero = React.memo(function StudioHero({ project, rect, innerR
           style={{ backgroundImage: "radial-gradient(rgba(255,255,255,0.08) 1px, transparent 1px)", backgroundSize: `${16 / s}px ${16 / s}px` }}
         >
           <div style={{ width: widgetW, aspectRatio: String(wAspect) }}>
-            <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="full" interactive={false} />
+            <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" interactive={false} />
           </div>
         </div>
       ) : (
-        <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="full" interactive={false} />
+        <UnifiedCompositor project={project} telemetry={HUB_MOCK_TELEMETRY} paused isThumbnail thumbnailTier="still" interactive={false} />
       )}
     </motion.div>
   );

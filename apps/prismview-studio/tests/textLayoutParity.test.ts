@@ -110,6 +110,11 @@ test("entrelinha 1.06 e tolerância de quebra iguais nos dois lados", () => {
 test("o motor não escala a caixa do texto sozinho", () => {
   // `size_px * ui` (ui = min(w,h)/1080) é o único fator; o Estúdio usa `fontSize * containerScale`.
   const compositor = readFileSync(compositorPath, "utf8");
+  const glassLens = readFileSync(resolve(here, "../src/utils/glassLens.ts"), "utf8");
   assert.match(compositor, /scaledFont = layer\.text\.fontSize \* containerScale/);
   assert.match(compositor, /textMaxWPx = textMaxWLog > 0 \? textMaxWLog \* containerScale : 0/);
+  assert.doesNotMatch(compositor, /overflowWrap:\s*textMaxWPx > 0 \? "break-word"/);
+  assert.doesNotMatch(glassLens, /Word wider than box: break by character/);
+  assert.match(compositor, /Math\.max\(12 \* containerScale,/);
+  assert.match(compositor, /Math\.max\(6 \* containerScale,/);
 });

@@ -194,6 +194,48 @@ export function ensureCustomFontLoaded(fontFamily: string, fontPath: string): Pr
   return p;
 }
 
+const BUNDLED_OR_CORE_FONTS = new Set(["outfit", "inter", "jetbrains mono", "segoe ui"]);
+
+/**
+ * Carrega no `document.fonts` fontes instaladas no Windows cujo nome no Registro
+ * (ex.: `"SamsungSharpSans"`) difere do nome OpenType (`"Samsung Sharp Sans"`),
+ * garantindo que o WebView do Studio renderize exatamente o mesmo arquivo `.ttf`/`.otf`
+ * que o `prismview-engine` usa no desktop.
+ */
+export function ensureSystemFontLoaded(fontFamily: string, fontWeight = 400): Promise<boolean> {
+  const safeFamily = fontFamily.replace(/"/g, "").trim();
+  if (!safeFamily || BUNDLED_OR_CORE_FONTS.has(safeFamily.toLowerCase())) {
+    return Promise.resolve(false);
+  }
+  const key = `sys|${safeFamily.toLowerCase()}`;
+  if (loadedFontCache.has(key)) return Promise.resolve(false);
+  const inFlight = fontLoadsInFlight.get(key);
+  if (inFlight) return inFlight;
+  const p = (async () => {
+    try {
+      const raw = await invokeCmd<ArrayBuffer | number[]>("read_font_bytes", {
+        family: safeFamily,
+        weight: Math.max(100, Math.min(900, Math.round(fontWeight / 100) * 100 || 400)),
+      });
+      const buf = raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
+      if (buf.byteLength <= 16) return false;
+      const sfnt = buf.slice(4);
+      const face = new FontFace(safeFamily, sfnt);
+      const loaded = await face.load();
+      document.fonts.add(loaded);
+      loadedFontCache.add(key);
+      return true;
+    } catch {
+      loadedFontCache.add(key);
+      return false;
+    } finally {
+      fontLoadsInFlight.delete(key);
+    }
+  })();
+  fontLoadsInFlight.set(key, p);
+  return p;
+}
+
 export function hexToRgbTuple(hex: string): [number, number, number] {
   const raw = (hex || "#FFFFFF").trim();
   const rgbMatch = raw.match(/^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)/i);
@@ -494,6 +536,7 @@ interface Scene3DSlotProps {
   interactive: boolean;
   testMode: boolean;
   cursorNormRef?: React.RefObject<[number, number] | null>;
+  testOrbitOffsetRef?: React.RefObject<[number, number]>;
   subscribeCursorTick?: (cb: () => void) => () => void;
   subscribeCursorClick?: (cb: (x: number, y: number) => void) => () => void;
   reactiveSignalRef?: React.RefObject<ReactiveSignal>;
@@ -586,6 +629,7 @@ export const Scene3DSlot: React.FC<Scene3DSlotProps> = (p) => {
       interactive={p.interactive}
       testMode={p.testMode}
       cursorNormRef={p.cursorNormRef}
+      testOrbitOffsetRef={p.testOrbitOffsetRef}
       subscribeCursorTick={p.subscribeCursorTick}
       subscribeCursorClick={p.subscribeCursorClick}
       reactiveSignalRef={p.reactiveSignalRef}

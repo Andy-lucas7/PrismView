@@ -13,7 +13,7 @@ export function createLayer(kind: LayerKind, name?: string): SceneLayer {
       (kind === "VIDEO"
         ? "Camada de Vídeo"
         : kind === "SCENE_3D"
-        ? "Cena 3D (.glb)"
+        ? "Modelo 3D (.glb)"
         : kind === "IMAGE"
         ? "Imagem / Capa"
         : kind === "SVG"

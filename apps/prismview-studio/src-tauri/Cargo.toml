@@ -1,5 +1,6 @@
 [package]
 name = "prismview-studio"
+description = "PrismView"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

@@ -3471,6 +3471,7 @@ dependencies = [
  "ruzstd",
  "serde",
  "serde_json",
+ "tauri-winres",
  "wgpu",
  "windows 0.58.0",
 ]

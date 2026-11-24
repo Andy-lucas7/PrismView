@@ -1,7 +1,7 @@
 import { NativeCompatPanel } from "./NativeCompatPanel";
 import { Select, ColorInput } from "./ui/Controls";
 import { AnimatePresence, motion } from "framer-motion";
-import { COLLAPSE, TAB_LITE } from "./motion/Presence";
+import { COLLAPSE } from "./motion/Presence";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -24,7 +24,6 @@ import {
   FlipHorizontal2,
   FlipVertical2,
   Lock,
-  Palette,
   Plus,
   RotateCcw,
   RotateCw,
@@ -114,40 +113,7 @@ const BLEND_MODES: BlendModeCss[] = [
   "plus-lighter",
 ];
 
-const BG_PRESETS: Array<{ label: string; value: string; swatch: string }> = [
-  {
-    label: "Obsidian",
-    value: "radial-gradient(circle at 50% 18%, #1A1B21 0%, #09090C 62%, #050507 100%)",
-    swatch: "radial-gradient(circle at 50% 20%, #262830, #08080a)",
-  },
-  {
-    label: "Grafite",
-    value: "linear-gradient(145deg, #181920 0%, #0B0C10 55%, #060608 100%)",
-    swatch: "linear-gradient(145deg, #24262f, #09090c)",
-  },
-  {
-    label: "OLED Puro",
-    value: "#060608",
-    swatch: "#060608",
-  },
-  {
-    label: "Slate",
-    value: "radial-gradient(circle at 50% 0%, #1F242D 0%, #0D1015 60%, #07080B 100%)",
-    swatch: "radial-gradient(circle at 50% 0%, #2b323e, #0a0c10)",
-  },
-  {
-    label: "Carvão",
-    value: "linear-gradient(180deg, #1B1A18 0%, #0E0D0C 65%, #070706 100%)",
-    swatch: "linear-gradient(180deg, #282623, #0b0a09)",
-  },
-  {
-    label: "Névoa",
-    value: "radial-gradient(circle at 50% 35%, #26272E 0%, #111216 65%, #08090B 100%)",
-    swatch: "radial-gradient(circle at 50% 35%, #343640, #0c0d10)",
-  },
-];
-
-export type InspectorMode = "LAYER" | "SCENE" | "GLOBALS";
+export type InspectorMode = "LAYER" | "GLOBALS";
 type LayerTab = "CONTENT" | "STYLE" | "TRANSFORM";
 
 export interface FxTargetRequest {
@@ -517,7 +483,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     );
   };
 
-  const renderSceneTab = () => {
+  const renderGlobalsTab = () => {
     const isWidget = project.packageType === "WIDGET";
     const isTransparent = project.backgroundColor === "transparent";
     const solidHex = /^#[0-9a-f]{6}$/i.test(project.backgroundColor)
@@ -525,9 +491,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
       : "#09090B";
 
     return (
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {isWidget ? (
-          <>
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {isWidget && (
+          <div className="space-y-3 pb-3 border-b border-white/10">
             <div className="space-y-2">
               <span className="block text-[11px] font-medium uppercase tracking-wider text-[#A1A1AA]">
                 Dimensões do Widget
@@ -591,7 +557,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               />
             </div>
 
-            <div className="space-y-2.5 pt-3 border-t border-white/10">
+            <div className="space-y-2.5 pt-2 border-t border-white/10">
               <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs">
                 <span>Fundo Transparente</span>
                 <input
@@ -608,8 +574,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               {!isTransparent && (
                 <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                   <span className="text-xs text-[#A1A1AA]">Cor do Fundo</span>
-                  <ColorInput aria-label="Cor do fundo"
-                    
+                  <ColorInput
+                    aria-label="Cor do fundo"
                     value={solidHex}
                     onChange={(e) =>
                       onApplyCoalescedProject({
@@ -621,75 +587,8 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 </div>
               )}
             </div>
-          </>
-        ) : (
-          <>
-            <div className="space-y-2.5">
-              <span className="block text-[11px] font-medium uppercase tracking-wider text-[#A1A1AA]">
-                Superfície de Fundo
-              </span>
-              <div className="grid grid-cols-3 gap-2">
-                {BG_PRESETS.map((preset) => {
-                  const active = project.backgroundColor === preset.value;
-                  return (
-                    <button
-                      key={preset.label}
-                      type="button"
-                      onClick={() =>
-                        onApplyDiscreteProject({
-                          ...project,
-                          backgroundColor: preset.value,
-                        })
-                      }
-                      className={`rounded-xl p-1.5 border text-left transition ${
-                        active
-                          ? "border-white/75 bg-white/10"
-                          : "border-white/10 bg-white/[0.02] hover:border-white/25"
-                      }`}
-                    >
-                      <div
-                        className="h-7 rounded-lg border border-white/10 mb-1"
-                        style={{ background: preset.swatch }}
-                      />
-                      <span className="block text-[10px] text-white/90 truncate">{preset.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
-                <span className="text-xs text-[#A1A1AA]">Cor Sólida Personalizada</span>
-                <ColorInput aria-label="Cor sólida personalizada"
-                  
-                  value={solidHex}
-                  onChange={(e) =>
-                    onApplyCoalescedProject({
-                      ...project,
-                      backgroundColor: e.target.value,
-                    })
-                  }
-                />
-              </div>
-            </div>
-
-            <div className="space-y-2.5 pt-3 border-t border-white/10">
-              <InspectorSlider
-                label="Escurecimento (Dim)"
-                value={project.dim}
-                min={0}
-                max={0.85}
-                step={0.02}
-                {...sliderHandlers}
-                onChange={(dim) => onChangeProjectRaw({ ...project, dim })}
-              />
-            </div>
-          </>
+          </div>
         )}
-      </div>
-    );
-  };
-
-  const renderGlobalsTab = () => (
-    <div className="flex-1 overflow-y-auto p-4 space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-[11px] font-medium uppercase tracking-wider text-[#A1A1AA]">
           Variáveis ($gv)
@@ -803,21 +702,15 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
           );
         })
       )}
-    </div>
-  );
+      </div>
+    );
+  };
 
   const renderLayerTab = () => {
     if (!selectedLayer || effectiveLayers.length === 0) {
       return (
         <div className="flex-1 flex flex-col items-center justify-center p-6 text-center text-xs text-[#A1A1AA] space-y-2">
           <p>Selecione uma camada na lista abaixo ou clique no canvas.</p>
-          <button
-            type="button"
-            onClick={() => onModeChange("SCENE")}
-            className="prism-pill-idle px-3.5 py-1.5 rounded-full text-[11px]"
-          >
-            Configurar Fundo / Cena
-          </button>
         </div>
       );
     }
@@ -1083,7 +976,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
         <div className="px-4 pt-3 pb-2.5 border-b border-white/10 space-y-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-[10px] font-mono-fx uppercase tracking-widest text-[#A1A1AA]">
-              {isMulti ? formatMultiSelectionSummary(merged) : selectedLayer.kind}
+              {isMulti ? formatMultiSelectionSummary(merged) : LAYER_KIND_LABELS[selectedLayer.kind] ?? selectedLayer.kind}
             </span>
             {!isMulti && selectedParent && (
               <button
@@ -1131,8 +1024,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
         {/* Tab Body */}
         <div className="flex-1 overflow-y-auto p-4">
-          <AnimatePresence mode="wait" initial={false}>
-          <motion.div key={layerTab} className="space-y-3.5" {...TAB_LITE}>
+          <div key={layerTab} className="space-y-3.5">
           {layerTab === "CONTENT" && (
             <>
               {selectedLayer.kind === "TEXT" && selectedLayer.text && (
@@ -4197,8 +4089,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </div>
             </>
           )}
-          </motion.div>
-          </AnimatePresence>
+          </div>
         </div>
       </div>
     );
@@ -4209,11 +4100,10 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <NativeCompatPanel issues={compatIssues} onSelectLayer={onSelectLayer} />
       {/* Top 3-Way Context Switcher */}
-      <div className="p-2.5 border-b border-white/10 grid grid-cols-3 gap-1">
+      <div className="p-2.5 border-b border-white/10 grid grid-cols-2 gap-1">
         {(
           [
             { id: "LAYER" as InspectorMode, label: "Camada", Icon: SlidersHorizontal },
-            { id: "SCENE" as InspectorMode, label: "Fundo", Icon: Palette },
             { id: "GLOBALS" as InspectorMode, label: "Globais", Icon: Variable },
           ]
         ).map(({ id, label, Icon }) => (
@@ -4231,15 +4121,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
         ))}
       </div>
 
-      <AnimatePresence mode="wait" initial={false}>
-        <motion.div key={mode} className="flex min-h-0 flex-1 flex-col" {...TAB_LITE}>
-          {mode === "SCENE"
-            ? renderSceneTab()
-            : mode === "GLOBALS"
-            ? renderGlobalsTab()
-            : renderLayerTab()}
-        </motion.div>
-      </AnimatePresence>
+      <div className="flex min-h-0 flex-1 flex-col">
+        {mode === "GLOBALS" ? renderGlobalsTab() : renderLayerTab()}
+      </div>
     </div>
   );
 };

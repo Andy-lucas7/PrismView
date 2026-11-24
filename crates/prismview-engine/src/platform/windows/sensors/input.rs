@@ -47,7 +47,7 @@ const CLASS_NAME: PCWSTR = w!("PrismEngineRawInputSink");
 /// Demanda mudou: re-sincronizar registros.
 pub(super) const WM_INPUT_DEMAND: u32 = WM_APP + 0x51;
 
-const CURSOR_POLL: Duration = Duration::from_millis(12);
+const CURSOR_POLL: Duration = Duration::from_millis(16);
 /// Toque = soltar a até `TAP_SLOP_PX` de onde desceu, em até `TAP_MAX` (senão é arrasto/seleção).
 const TAP_SLOP_PX: i32 = 6;
 const TAP_MAX: Duration = Duration::from_millis(600);
@@ -289,6 +289,7 @@ fn handle_mouse(state: &InputState, raw: &[u8]) {
         bus.add_mouse_delta(dx, dy);
     }
 
+    let mut has_action = false;
     if button_flags != 0 {
         let pairs = [
             (RI_LEFT_DOWN, RI_LEFT_UP, buttons::LEFT),
@@ -311,12 +312,16 @@ fn handle_mouse(state: &InputState, raw: &[u8]) {
             // Clique: força cursor exato no instante do clique.
             poll_cursor(state, now, true);
             detect_desktop_tap(state, down, up, now);
+            has_action = true;
         }
         if button_flags & RI_WHEEL != 0 {
             bus.add_wheel(button_data as i32);
+            has_action = true;
         }
     }
-    bus.commit_input(SignalKind::MOUSE);
+    if has_action || cursor_delta.is_some() {
+        bus.commit_input(SignalKind::MOUSE);
+    }
 }
 
 /// Clique curto do botão esquerdo sobre o fundo do desktop → `publish_desktop_tap`.

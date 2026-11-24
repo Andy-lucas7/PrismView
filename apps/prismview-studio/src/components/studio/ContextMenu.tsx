@@ -89,7 +89,6 @@ export interface ContextMenuActions {
   onGlassReset: () => void;
   onProgressSource: (source: "MEDIA" | "CPU" | "RAM" | "BATTERY") => void;
   onAddNewLayer: (kind: LayerKind) => void;
-  onOpenSceneSettings: () => void;
 }
 
 export interface ContextMenuProps {
@@ -281,12 +280,6 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
               </button>
             ))}
           </div>
-          <Divider />
-          <MenuItem
-            icon={Sparkles}
-            label="Configurar fundo e superfície"
-            onClick={() => run(actions.onOpenSceneSettings)}
-          />
         </>
       ) : (
         <>
@@ -570,7 +563,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
           {sameKind === "SCENE_3D" && count === 1 && (
             <>
               <div className="px-2.5 py-0.5 text-[10px] uppercase tracking-wider text-[#71717A]">
-                Cena 3D
+                Modelo 3D
               </div>
               <MenuItem
                 icon={Box}

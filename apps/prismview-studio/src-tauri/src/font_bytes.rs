@@ -44,22 +44,57 @@ struct Found {
     index: u32,
 }
 
+fn normalize_family(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn find(family: &str, weight: u16) -> Result<Found, String> {
     let name = clean_family(family);
     if name.is_empty() || name.len() > 128 {
         return Err("família inválida".into());
     }
+    let req_weight = weight.clamp(100, 900);
     let db = database().lock().map_err(|_| "banco de fontes indisponível".to_string())?;
     let families = [Family::Name(&name)];
     let query = Query {
         families: &families,
-        weight: Weight(weight.clamp(100, 900)),
+        weight: Weight(req_weight),
         stretch: Stretch::Normal,
         style: Style::Normal,
     };
-    let id = db.query(&query).ok_or_else(|| format!("fonte não encontrada: {name}"))?;
+    let id = db.query(&query).or_else(|| {
+        // Fallback normalizado (ex.: "SamsungSharpSans" do Registro → "Samsung Sharp Sans" no OpenType).
+        let needle = normalize_family(&name);
+        if needle.is_empty() {
+            return None;
+        }
+        db.faces()
+            .filter(|f| {
+                f.families.iter().any(|(fam, _)| normalize_family(fam) == needle)
+                    || match &f.source {
+                        Source::File(p) => p
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| normalize_family(stem) == needle),
+                        Source::Binary(_) => false,
+                    }
+            })
+            .min_by_key(|f| {
+                let style_rank: u8 = match f.style {
+                    Style::Normal => 0,
+                    Style::Oblique => 1,
+                    Style::Italic => 2,
+                };
+                let stretch_rank: u8 = if f.stretch == Stretch::Normal { 0 } else { 1 };
+                let diff = f.weight.0.abs_diff(req_weight);
+                (style_rank, stretch_rank, diff)
+            })
+            .map(|f| f.id)
+    }).ok_or_else(|| format!("fonte não encontrada: {name}"))?;
     let face = db.face(id).ok_or_else(|| "face sem dados".to_string())?;
-    // `query` cai em outra família quando a pedida não existe? Não: só devolve faces da família.
     let (path, data) = match &face.source {
         Source::File(p) => (Some(p.clone()), None),
         Source::Binary(bytes) => (None, Some(bytes.as_ref().as_ref().to_vec())),

@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  CANVAS_MARGIN_PX,
   clampSplit,
   nudgeSplit,
   PANEL_GAP_PX,
@@ -92,8 +93,8 @@ test("nudgeSplit anda por passos e nunca passa dos limites", () => {
   assert.equal(nudgeSplit(NaN, 1), SPLIT_DEFAULT + 0.03);
 });
 
-test("margem direita do canvas: painel aberto reserva a largura, recolhido só a folga", () => {
-  assert.equal(stageRightInset(true), PANEL_WIDTH_PX + 2 * PANEL_GAP_PX);
-  assert.equal(stageRightInset(false), PANEL_GAP_PX);
+test("margem direita do canvas: painel aberto deixa folga leve do painel, recolhido deixa folga da borda", () => {
+  assert.equal(stageRightInset(true), PANEL_WIDTH_PX + PANEL_GAP_PX + CANVAS_MARGIN_PX);
+  assert.equal(stageRightInset(false), CANVAS_MARGIN_PX);
   assert.ok(stageRightInset(true) > stageRightInset(false));
 });
