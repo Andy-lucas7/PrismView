@@ -398,6 +398,8 @@ interface VideoElementProps {
   clipRadius: number;
   onMediaEl?: (el: HTMLVideoElement | null) => void;
   onMediaReady?: () => void;
+  /** Miniaturas: carrega o 1º quadro mesmo pausado. */
+  eager?: boolean;
 }
 
 export const RealVideoLayer: React.FC<VideoElementProps> = ({
@@ -410,6 +412,7 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
   clipRadius,
   onMediaEl,
   onMediaReady,
+  eager = false,
 }) => {
   const ref = useRef<HTMLVideoElement | null>(null);
   const pausedRef = useRef(paused);
@@ -458,7 +461,7 @@ export const RealVideoLayer: React.FC<VideoElementProps> = ({
       src={url}
       crossOrigin={supportsCorsUrl(url) ? "anonymous" : undefined}
       autoPlay={!paused}
-      preload={paused ? "metadata" : "auto"}
+      preload={paused && !eager ? "metadata" : "auto"}
       loop
       muted={muted}
       playsInline
@@ -508,6 +511,8 @@ interface Scene3DSlotProps {
   onInspectScene3D?: (layerId: string, info: Scene3DInspectInfo) => void;
   onHoverMesh3D?: (meshName: string | null) => void;
   onScene3DStats?: (layerId: string, stats: Scene3DStats) => void;
+  /** Miniaturas: quadro pronto no canvas 3D (capturar still). */
+  onThumbFrame?: (layerId: string, el: HTMLCanvasElement) => void;
   room3d: Room3DEditBinding | null;
 }
 
@@ -533,7 +538,9 @@ export const Scene3DSlot: React.FC<Scene3DSlotProps> = (p) => {
     const l = latest.current;
     l.videoFrameTokenRef.current += 1;
     l.frameTickSubsRef.current.forEach((cb) => cb());
-  }, []);
+    const cv = l.mediaElementsRef.current.get(layerId);
+    if (cv instanceof HTMLCanvasElement) l.onThumbFrame?.(layerId, cv);
+  }, [layerId]);
   const onInspectModel = useCallback(
     (info: Scene3DInspectInfo) => latest.current.onInspectScene3D?.(layerId, info),
     [layerId]

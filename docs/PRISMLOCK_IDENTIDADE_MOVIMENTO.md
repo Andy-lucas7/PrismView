@@ -16,26 +16,7 @@ Documento irmão de `PRISMVIEW_IDENTIDADE_MOVIMENTO.md`. Seções 0, 1 e as etap
 | **Aplicar** | Definir a View como wallpaper/lock ativo ou fixar o widget. |
 | Abas do Hub | `Wallpapers` · `Widgets` · `Cenas 3D` (PrismView) / `Telas` · `Widgets` (Prismlock) |
 
-**Tokens de movimento: fonte única** `docs/motion.tokens.json`, consumida por TS (PrismView) e Kotlin (Prismlock) via script de geração. Nenhum número de duração/easing fora dele.
-
-```json
-{
-  "duration": { "instant": 90, "fast": 160, "base": 280, "slow": 420, "hero": 650, "intro": 5200 },
-  "easing": {
-    "emphasized": [0.2, 0.0, 0.0, 1.0],
-    "decelerate": [0.05, 0.7, 0.1, 1.0],
-    "accelerate": [0.3, 0.0, 0.8, 0.15]
-  },
-  "spring": {
-    "tactile":  { "stiffness": 420, "damping": 34, "mass": 1 },
-    "carousel": { "stiffness": 260, "damping": 30, "mass": 1 },
-    "expand":   { "stiffness": 190, "damping": 26, "mass": 1 }
-  },
-  "blur":  { "enter": 12, "exit": 8 },
-  "scale": { "enter": 0.96, "carouselSide": 0.84 },
-  "gesture": { "commitDistance": 0.22, "commitVelocity": 900, "rubberBand": 0.35 }
-}
-```
+**Tokens de movimento e paleta: fonte única** `docs/motion.tokens.json` (durações, easings, springs, blur, escala, gesto e cores). Editar **só** ali. PrismView: `npm run gen:motion` gera `src/engine/motionTokens.gen.ts`, e `npm test` falha se o gerado ficar defasado ou se `prism.css`/`tailwind.config.js` divergirem da paleta. Prismlock: gerar `PrismMotion.kt` a partir do mesmo JSON e adicionar a mesma checagem (a fazer).
 
 **Regras de performance (inegociáveis)**
 1. Orçamento de quadro = `1000/Hz` do monitor (6,9 ms a 144 Hz, 8,3 ms a 120 Hz). Nunca fixar 60 fps: seguir o refresh real.
@@ -43,7 +24,7 @@ Documento irmão de `PRISMVIEW_IDENTIDADE_MOVIMENTO.md`. Seções 0, 1 e as etap
 3. Só animar `transform`, `opacity`, `clip-path` / `graphicsLayer`. Nada de layout/medição por quadro.
 4. Zero alocação por quadro (reusar objetos/arrays). Zero estado de UI por quadro (valor animado lido na camada de desenho, não via recomposição/re-render).
 5. Blur só em transições curtas e nunca em cartões vivos: usar **imagem pré-desfocada** com cross-fade (mesma técnica do `HubPreviewCache`).
-6. Só a View central é "viva" (render real). Vizinhas e grid usam **snapshot** em cache; descartar com `dispose()`/`recycle()` ao sair da janela de ±2.
+6. **Miniaturas em 3 níveis:** `full` (vidro, 3D e vídeo reais, parados) só para 3 por vez (a central + as 2 laterais); as demais visíveis ficam `still`: mostram o wallpaper e tudo, mas **parado** (vídeo/3D viram imagem em cache capturada antes; vidro sem WebGL); fora da tela vira poster (só a cor de fundo) e o render é descartado com `dispose()`/`recycle()`. Se vidro/blur pesarem no carrossel, ficam desligados naquela visualização (checagem de tempo de quadro, Etapa 2). Hora, data, clima, bateria e mídia nas miniaturas são **valores fixos** (18:45, quinta 12/03, 24 °C...), nunca ao vivo. PrismView: `engine/hubMock.ts`, `hubStillCache.ts`, `HubThumbnail`. Prismlock: `HUB_MOCK_ENV` (já existe) deve seguir os mesmos valores.
 7. Respeitar modo de energia e "reduzir movimento": blur → fade simples; spring → tween `fast`; intro pulada.
 8. Nada anima durante render pesado em tela cheia (Studio 3D ativo, jogo em foreground).
 

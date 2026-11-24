@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence } from "framer-motion";
+import { COLLAPSE, POP, ROW } from "./motion/Presence";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowDown,
   ArrowLeft,
@@ -1471,7 +1472,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     const dropInside = isDropTarget && treeDrag?.placement === "inside";
 
     return (
-      <div key={layer.id} className="space-y-1">
+      <motion.div key={layer.id} layout="position" {...ROW} className="space-y-1">
         <div
           data-layer-drop-id={layer.id}
           data-layer-is-group={isGroup ? "1" : "0"}
@@ -1591,21 +1592,23 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </button>
           </div>
         </div>
-        {isGroup && expanded && children.length > 0 && (
-          <div className="space-y-1 border-l border-white/15 ml-2.5 pl-1">
-            {[...children]
-              .reverse()
-              .map((child, childRevIdx) =>
-                renderLayerTreeRow(child, children.length - 1 - childRevIdx, depth + 1)
-              )}
-          </div>
-        )}
-      </div>
+        <AnimatePresence initial={false}>{isGroup && expanded && children.length > 0 && (
+          <motion.div {...COLLAPSE} className="space-y-1 border-l border-white/15 ml-2.5 pl-1">
+            <AnimatePresence initial={false}>
+              {[...children]
+                .reverse()
+                .map((child, childRevIdx) =>
+                  renderLayerTreeRow(child, children.length - 1 - childRevIdx, depth + 1)
+                )}
+            </AnimatePresence>
+          </motion.div>
+        )}</AnimatePresence>
+      </motion.div>
     );
   };
 
   return (
-    <div className="relative w-full h-full bg-[#060608] overflow-hidden">
+    <div className="relative w-full h-full bg-pureBlack overflow-hidden">
       {/* Top Floating Bar (Stationary during drag) */}
       <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
         <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
@@ -1670,11 +1673,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
-          {statusHint && (
-            <span className="frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-white/90">
+          <AnimatePresence initial={false}>{statusHint && (
+            <motion.span {...POP} className="frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-white/90">
               {statusHint}
-            </span>
-          )}
+            </motion.span>
+          )}</AnimatePresence>
           {power.state !== "NORMAL" && (
             <span
               title={`Energia: ${POWER_PREFERENCE_LABELS[power.state]} (preferência: ${POWER_PREFERENCE_LABELS[power.preference]})`}
@@ -1763,8 +1766,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       </header>
 
       {/* Shortcuts Cheat-Sheet Popover */}
-      {shortcutsOpen && (
-        <div className="fixed top-20 left-[304px] z-50 w-80 frosted-chrome frosted-chrome-panel p-4 space-y-2.5 text-xs shadow-2xl">
+      <AnimatePresence initial={false}>{shortcutsOpen && (
+        <motion.div {...POP} className="fixed top-20 left-[304px] z-50 w-80 frosted-chrome frosted-chrome-panel p-4 space-y-2.5 text-xs shadow-2xl">
           <div className="flex items-center justify-between border-b border-white/10 pb-2">
             <span className="font-semibold text-white">Atalhos & Seleção do Estúdio</span>
             <button
@@ -1802,8 +1805,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               </div>
             ))}
           </div>
-        </div>
-      )}
+        </motion.div>
+      )}</AnimatePresence>
 
       {/* LEFT PANEL: Layer Tree (Stationary during drag) */}
       <aside className="fixed top-20 left-4 bottom-4 z-30 w-[276px] frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden">
@@ -1910,8 +1913,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         )}
 
         {/* Widget Importer Drawer inside Left Tree */}
-        {widgetPickerOpen && (
-          <div className="p-3 border-b border-white/10 bg-black/50 space-y-2">
+        <AnimatePresence initial={false}>{widgetPickerOpen && (
+          <motion.div {...COLLAPSE}><div className="p-3 border-b border-white/10 bg-black/50 space-y-2">
             <span className="block text-[10px] uppercase tracking-wider text-[#A1A1AA]">
               Inserir como Grupo Editável
             </span>
@@ -1930,8 +1933,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             >
               <Upload className="w-3 h-3" /> Escolher .widget.prism do Disco
             </button>
-          </div>
-        )}
+          </div></motion.div>
+        )}</AnimatePresence>
 
         {/* Ordered Stack (Front-most on top) */}
         <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
@@ -1948,11 +1951,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             </div>
           )}
 
-          {[...project.layers]
-            .reverse()
-            .map((layer, revIdx) =>
-              renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
-            )}
+          <AnimatePresence initial={false}>
+            {[...project.layers]
+              .reverse()
+              .map((layer, revIdx) =>
+                renderLayerTreeRow(layer, project.layers.length - 1 - revIdx, 0)
+              )}
+          </AnimatePresence>
 
           {treeDrag?.active && treeDrag.hasNestedSource && (
             <div
@@ -2184,8 +2189,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               </button>
             </div>
           )}
-          {hudOpen && (
-            <div className="pointer-events-none absolute top-3 right-3 z-40 frosted-chrome rounded-xl px-3 py-2 text-[10px] font-mono-fx text-white/90 space-y-0.5 min-w-[180px]">
+          <AnimatePresence initial={false}>{hudOpen && (
+            <motion.div {...POP} className="pointer-events-none absolute top-3 right-3 z-40 frosted-chrome rounded-xl px-3 py-2 text-[10px] font-mono-fx text-white/90 space-y-0.5 min-w-[180px]">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold">
                 <Gauge className="w-3.5 h-3.5" /> HUD de desempenho
               </div>
@@ -2207,8 +2212,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                   </div>
                 ))
               )}
-            </div>
-          )}
+            </motion.div>
+          )}</AnimatePresence>
           {test3dMode && (
             <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 z-40 frosted-chrome rounded-full px-3.5 py-1.5 text-[11px] text-white flex items-center gap-2 border border-white/25">
               <span className="w-2 h-2 rounded-full bg-white animate-pulse" />

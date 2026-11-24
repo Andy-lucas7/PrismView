@@ -333,6 +333,9 @@ impl Frame<'_> {
                 TextAlign::End => TextAlignment::End,
             },
             max_width_px: (layer.text.max_width_px.max(0.0)) * self.ui,
+            // Quantizado (1/64): FX animado não refaz o raster a cada micro-variação.
+            stretch: (self.f(&layer.text.stem_stretch.stretch).clamp(1.0, 2.8) * 64.0).round() / 64.0,
+            stem_compensation: layer.text.stem_stretch.stroke_compensation.clamp(0.0, 1.5),
         };
         let layout = self.text.update(self.device, self.scratch.as_str(), &spec);
 
@@ -675,7 +678,8 @@ impl Frame<'_> {
         let (Some(tex), false) = (draw.tex, draw.layout.empty) else {
             return;
         };
-        let stretch_y = self.f(&layer.text.stem_stretch.stretch).clamp(1.0, 2.8);
+        // Com alongamento nativo (por haste) a textura já vem alongada: não escala a matriz de novo.
+        let stretch_y = if draw.layout.stretched { 1.0 } else { self.f(&layer.text.stem_stretch.stretch).clamp(1.0, 2.8) };
         let text_xf = if (stretch_y - 1.0).abs() > 1e-3 {
             Affine {
                 m: [xf.m[0], xf.m[1], xf.m[2] * stretch_y, xf.m[3] * stretch_y],

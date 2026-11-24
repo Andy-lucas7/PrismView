@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Select, ColorInput } from "./components/ui/Controls";
+import { COLLAPSE, POP, SwapText, TAB } from "./components/motion/Presence";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
-import { AnimatePresence, motion, MotionConfig } from "framer-motion";
+import { AnimatePresence, animate, motion, MotionConfig, useMotionValue, useReducedMotion, useTransform } from "framer-motion";
 import {
   Box,
   ChevronDown,
@@ -59,7 +61,11 @@ import { nativeCompatIssues } from "./utils/nativeCompat";
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
-import { UnifiedCompositor } from "./components/UnifiedCompositor";
+import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
+import { HubLayout, readHubView, writeHubView, type HubView } from "./components/hub/HubLayout";
+import { StudioHero, type HeroRect } from "./components/hub/StudioHero";
+import { PrismIntro } from "./components/intro/PrismIntro";
+import { setIntroHold, useIntroDecision, writeSeenMarker } from "./engine/introGate";
 import { StudioEditor } from "./components/StudioEditor";
 import {
   POWER_PREFERENCE_LABELS,
@@ -67,19 +73,7 @@ import {
   type PowerPreference,
   usePowerState,
 } from "./engine/powerGovernor";
-
-/** 4.7: Hub thumbnail. Fixed telemetry + memo => cards do not re-render on the 1.5 s telemetry tick. */
-const HubThumbnail = React.memo(function HubThumbnail({ project }: { project: PrismProject }) {
-  return (
-    <UnifiedCompositor
-      project={project}
-      telemetry={DEFAULT_TELEMETRY}
-      paused
-      isThumbnail
-      interactive={false}
-    />
-  );
-});
+import { DURATION, EASE, SPRING, applyMotionCssVars, sec } from "./engine/motion";
 
 function useLiveTelemetry(): LiveTelemetry {
   const [telemetry, setTelemetry] = useState<LiveTelemetry>(DEFAULT_TELEMETRY);
@@ -436,8 +430,8 @@ const ExposedGlobalsPanel: React.FC<{
                 className="prism-slider w-24"
               />
             ) : g.kind === "COLOR" ? (
-              <input aria-label={g.label || g.name}
-                type="color"
+              <ColorInput aria-label={g.label || g.name}
+                
                 value={/^#[0-9a-f]{6}$/i.test(g.value) ? g.value : "#FFFFFF"}
                 onChange={(e) => onDebouncedChange(patchGlobalValue(idx, e.target.value))}
                 onBlur={(e) => onCommitChange(patchGlobalValue(idx, e.currentTarget.value))}
@@ -472,6 +466,12 @@ function classifyWallpaperKind(project: PrismProject): "3D" | "VIDEO" | "2D" {
   return "2D";
 }
 
+/** Cor do brilho ambiente atrás do card no carrossel (fundo da View; neutro se for preto). */
+function hubAmbient(p: PrismProject): string {
+  const c = p.backgroundColor;
+  return c && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(c) && c.toLowerCase() !== "#000000" && c.toLowerCase() !== "#000" ? c : "#5b6178";
+}
+
 const StudioHubApp: React.FC = () => {
   const telemetry = useLiveTelemetry();
   const power = usePowerState(telemetry);
@@ -499,6 +499,38 @@ const StudioHubApp: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const [hubTab, setHubTab] = useState<HubTab>("WALLPAPERS");
+  const [hubView, setHubView] = useState<HubView>(readHubView);
+  // ── transição Hub ⇄ Studio (card cresce até a tela cheia; ver StudioHero)
+  type StudioPhase = "idle" | "opening" | "closing";
+  const reduceMotion = Boolean(useReducedMotion());
+  const [phase, setPhase] = useState<StudioPhase>("idle");
+  // ── intro (1× por sessão do Windows): hero → derrete como vidro → Hub
+  const introSkip = reduceMotion || power.state === "FROZEN";
+  const intro = useIntroDecision({ disabled: introSkip });
+  const [introPhase, setIntroPhase] = useState<"wait" | "play" | "melt" | "done">("wait");
+  useEffect(() => {
+    if (intro.decision === "play" && introPhase === "wait") setIntroPhase("play");
+    else if (intro.decision === "skip" && introPhase === "wait") setIntroPhase("done");
+  }, [intro.decision, introPhase]);
+  const holdHub = introPhase === "wait" || introPhase === "play";
+  useEffect(() => {
+    setIntroHold(holdHub);
+  }, [holdHub]);
+  const phaseRef = useRef<StudioPhase>("idle");
+  const pendingCloseRef = useRef(false);
+  const closeStudioRef = useRef<() => void>(() => {});
+  const [hero, setHero] = useState<{ project: PrismProject; rect: HeroRect | null; innerRect: HeroRect | null } | null>(null);
+  const [hubFocusId, setHubFocusId] = useState<string | null>(null);
+  const heroP = useMotionValue(0);
+  const heroOpacity = useMotionValue(0);
+  const hubOpacity = useTransform(heroP, (v) => {
+    const t = Math.min(1, v / 0.6);
+    return 1 - t * t * (3 - 2 * t);
+  });
+  const changeHubView = useCallback((v: HubView) => {
+    setHubView(v);
+    writeHubView(v);
+  }, []);
   const [wallpaperFilter, setWallpaperFilter] = useState<WallpaperKindFilter>("ALL");
   const [templateFilter, setTemplateFilter] = useState<TemplateCategoryFilter>("ALL");
   const [hubQuery, setHubQuery] = useState("");
@@ -808,6 +840,17 @@ const StudioHubApp: React.FC = () => {
       return true;
     });
   }, [templates3d, defaultTemplates, templateFilter, hubQuery]);
+
+  /** Projetos da aba atual, para o HubStillWarmer gerar os stills de vídeo/3D que faltam. */
+  const warmProjects = useMemo(
+    () =>
+      hubTab === "WALLPAPERS"
+        ? filteredWallpapers
+        : hubTab === "WIDGETS"
+        ? filteredWidgets
+        : unifiedTemplates.map((t) => t.project),
+    [hubTab, filteredWallpapers, filteredWidgets, unifiedTemplates]
+  );
 
   const runtimeRef = useRef(runtime);
   runtimeRef.current = runtime;
@@ -1303,7 +1346,7 @@ const StudioHubApp: React.FC = () => {
       }
     });
     if (!out.proj) return;
-    if (openInStudio) setEditing(out.proj);
+    if (openInStudio) openStudio(out.proj);
     else await applyWallpaper(out.proj);
   };
 
@@ -1343,14 +1386,14 @@ const StudioHubApp: React.FC = () => {
       }
     });
     if (!out.proj) return;
-    if (openInStudio) setEditing(out.proj);
+    if (openInStudio) openStudio(out.proj);
     else await applyWallpaper(out.proj);
   };
 
   const createNew3DWallpaper = async () => {
     const created = createPure3DProject(`Cena 3D ${wallpapers.length + 1}`, "");
     await persistProjectImmediate(created);
-    setEditing(created);
+    openStudio(created);
   };
 
   const createNew = async (kind: "WALLPAPER" | "WIDGET") => {
@@ -1363,7 +1406,7 @@ const StudioHubApp: React.FC = () => {
       packageType: kind,
     };
     await persistProjectImmediate(created);
-    setEditing(created);
+    openStudio(created);
   };
 
   const addMissingDefaultPresets = async (kind: "WALLPAPER" | "WIDGET") => {
@@ -1583,9 +1626,141 @@ const StudioHubApp: React.FC = () => {
     return 16 / 9;
   }, [monitors]);
 
-  if (editing) {
-    return (
-      <div className="w-screen h-screen bg-black text-white overflow-hidden">
+  /** Executa `fn` após `n` quadros (garante que o React já pintou o que acabou de montar). */
+  function afterFrames(n: number, fn: () => void): void {
+    if (n <= 0) fn();
+    else requestAnimationFrame(() => afterFrames(n - 1, fn));
+  }
+  /** Espera fontes + ociosidade (até ~1,2 s) antes de continuar. */
+  function whenIdle(fn: () => void): void {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      fn();
+    };
+    window.setTimeout(go, 1200);
+    const idle = (window as unknown as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => number }).requestIdleCallback;
+    const fonts = document.fonts?.ready ?? Promise.resolve();
+    void fonts.then(() => {
+      if (idle) idle(go, { timeout: 900 });
+      else window.setTimeout(go, DURATION.fast);
+    });
+  }
+  function cardRects(id: string): { rect: HeroRect | null; innerRect: HeroRect | null } {
+    const sel = (k: string) => document.querySelector(`[data-hub-${k}="${CSS.escape(id)}"]`) as HTMLElement | null;
+    const card = sel("card");
+    const inner = sel("inner");
+    const conv = (el: HTMLElement | null): HeroRect | null => {
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return r.width > 8 && r.height > 8 ? { left: r.left, top: r.top, width: r.width, height: r.height } : null;
+    };
+    return { rect: conv(card), innerRect: conv(inner) };
+  }
+  const heroEase = { ...SPRING.expand, restDelta: 0.0008, restSpeed: 0.02 };
+
+  /** Abre o Studio: o card cresce até preencher a tela; só então o Studio monta e o hero some em fade. */
+  function openStudio(project: PrismProject): void {
+    if (phaseRef.current !== "idle") return;
+    phaseRef.current = "opening";
+    setPhase("opening");
+    setHubFocusId(project.id);
+    const { rect, innerRect } = cardRects(project.id);
+    const finish = () => {
+      heroP.set(0);
+      setHero(null);
+      phaseRef.current = "idle";
+      setPhase("idle");
+      if (pendingCloseRef.current) {
+        pendingCloseRef.current = false;
+        afterFrames(1, () => closeStudioRef.current());
+      }
+    };
+    if (!rect || reduceMotion) {
+      // Sem card visível (criar/importar) ou movimento reduzido: Hub some em fade, Studio entra em fade.
+      animate(heroP, 1, { duration: sec(DURATION.base), ease: [...EASE.emphasized] }).then(() => {
+        setEditing(project);
+        afterFrames(1, finish);
+      });
+      return;
+    }
+    setHero({ project, rect, innerRect });
+    heroP.set(0);
+    heroOpacity.set(0);
+    afterFrames(2, () => {
+      animate(heroOpacity, 1, { duration: sec(DURATION.instant) });
+      animate(heroP, 1, heroEase).then(() => {
+        setEditing(project); // monta o Studio por baixo do hero já em tela cheia
+        // Só revela quando o Studio terminou de montar e a thread principal está ociosa (em PC lento o
+        // card fica parado em tela cheia, sem tela preta e sem engasgar o fade).
+        afterFrames(2, () =>
+          whenIdle(() => {
+            animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
+          })
+        );
+      });
+    });
+  }
+
+  /** Fecha o Studio: o hero cobre a tela e encolhe de volta até o card (que pode ter mudado de lugar). */
+  function closeStudio(): void {
+    if (phaseRef.current !== "idle") {
+      pendingCloseRef.current = true; // Voltar durante a abertura: executa assim que ela terminar
+      return;
+    }
+    if (!editing) return;
+    const proj = editing;
+    setEditingTxActive(false);
+    void flushPendingSave();
+    phaseRef.current = "closing";
+    setPhase("closing");
+    setHubFocusId(proj.id);
+    const finish = () => {
+      setHero(null);
+      phaseRef.current = "idle";
+      setPhase("idle");
+    };
+    if (reduceMotion) {
+      heroP.set(1);
+      setEditing(null);
+      afterFrames(1, () => animate(heroP, 0, { duration: sec(DURATION.base), ease: [...EASE.emphasized] }).then(finish));
+      return;
+    }
+    setHero({ project: proj, rect: null, innerRect: null });
+    heroP.set(1);
+    heroOpacity.set(0);
+    afterFrames(2, () => {
+      animate(heroOpacity, 1, { duration: sec(DURATION.instant) }).then(() => {
+        setHubTab(proj.packageType === "WIDGET" ? "WIDGETS" : "WALLPAPERS");
+        setEditing(null); // desmonta o Studio (coberto) e monta o Hub por baixo
+        afterFrames(3, () => {
+          let { rect, innerRect } = cardRects(proj.id);
+          if (!rect) {
+            const w = window.innerWidth * 0.46;
+            const h = window.innerHeight * 0.46;
+            rect = { left: (window.innerWidth - w) / 2, top: (window.innerHeight - h) / 2, width: w, height: h };
+          }
+          setHero({ project: proj, rect, innerRect });
+          afterFrames(1, () => {
+            animate(heroP, 0, heroEase).then(() => {
+              animate(heroOpacity, 0, { duration: sec(DURATION.base), ease: [...EASE.decelerate] }).then(finish);
+            });
+          });
+        });
+      });
+    });
+  }
+
+  closeStudioRef.current = closeStudio;
+
+  const studioTree = editing ? (
+      <motion.div
+        className="fixed inset-0 z-[10] h-screen w-screen overflow-hidden bg-black text-white"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: sec(DURATION.fast), ease: [...EASE.decelerate] }}
+      >
         <StudioEditor
           project={editing}
           availableWidgets={widgets}
@@ -1599,11 +1774,7 @@ const StudioHubApp: React.FC = () => {
           onSaveNow={() => {
             void flushPendingSave().then(flushFailedSaves);
           }}
-          onBack={() => {
-            setEditingTxActive(false);
-            void flushPendingSave();
-            setEditing(null);
-          }}
+          onBack={closeStudio}
           applying={busy !== null && (busy.startsWith("apply:") || busy.startsWith("pin:"))}
           exporting={busy !== null && busy.startsWith("export:")}
           onApply={() => {
@@ -1624,14 +1795,13 @@ const StudioHubApp: React.FC = () => {
           }}
         />
         <ToastOverlay message={toast} />
-      </div>
-    );
-  }
+      </motion.div>
+  ) : null;
 
   const totalTemplatesCount = templates3d.length + defaultTemplates.length;
 
-  return (
-    <div className="relative w-screen h-screen bg-[#060608] text-white flex overflow-hidden">
+  const hubTree = (
+    <div className="relative w-screen h-screen bg-pureBlack text-white flex overflow-hidden">
       {/* Subtle Monochrome Architectural Light */}
       <div
         className="pointer-events-none absolute inset-0"
@@ -1951,7 +2121,7 @@ const StudioHubApp: React.FC = () => {
                         {POWER_PREFERENCE_LABELS[power.state]}
                       </span>
                     </div>
-                    <select aria-label="Modo de energia"
+                    <Select aria-label="Modo de energia"
                       value={power.preference}
                       onChange={(e) => changePowerPreference(e.target.value as PowerPreference)}
                       className="w-full bg-black/70 border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
@@ -1963,7 +2133,7 @@ const StudioHubApp: React.FC = () => {
                             : POWER_PREFERENCE_LABELS[p]}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                     <p className="text-[10px] text-[#71717A] leading-snug">
                       {POWER_STATE_HINTS[power.state]}
                     </p>
@@ -1991,8 +2161,8 @@ const StudioHubApp: React.FC = () => {
 
       {/* Main Content Area */}
       <div className="relative z-10 flex-1 flex flex-col min-w-0 overflow-hidden">
-        {brokenProjects.length > 0 && (
-          <div
+        <AnimatePresence initial={false}>{brokenProjects.length > 0 && (
+          <motion.div {...COLLAPSE}><div
             role="alert"
             className="mx-7 mt-4 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-xs text-amber-100 shrink-0"
           >
@@ -2020,20 +2190,20 @@ const StudioHubApp: React.FC = () => {
                 <X size={14} />
               </button>
             </div>
-            {brokenDetailsOpen && (
-              <ul className="mt-2 space-y-1 text-[11px] text-amber-100/80">
+            <AnimatePresence initial={false}>{brokenDetailsOpen && (
+              <motion.ul {...COLLAPSE} className="mt-2 space-y-1 text-[11px] text-amber-100/80">
                 {brokenProjects.map((b) => (
                   <li key={b.file} className="break-all">
                     <span className="font-mono">{b.file}</span> —{" "}
                     {b.restored ? "restaurado do backup" : "movido para projects/_corrompidos"}: {b.error}
                   </li>
                 ))}
-              </ul>
-            )}
-          </div>
-        )}
-        {runtime.legacy_migration_notice && (
-          <div
+              </motion.ul>
+            )}</AnimatePresence>
+          </div></motion.div>
+        )}</AnimatePresence>
+        <AnimatePresence initial={false}>{runtime.legacy_migration_notice && (
+          <motion.div {...COLLAPSE}><div
             role="alert"
             className="mx-7 mt-4 flex items-start gap-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-xs text-amber-100 shrink-0"
           >
@@ -2046,26 +2216,26 @@ const StudioHubApp: React.FC = () => {
             >
               <X size={14} />
             </button>
-          </div>
-        )}
+          </div></motion.div>
+        )}</AnimatePresence>
 
         {/* Contextual Top Bar */}
         <header className="px-7 pt-5 pb-3 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3 shrink-0">
           <div>
-            <h1 className="font-display text-lg font-semibold text-white">
+            <h1 className="font-display text-lg font-semibold text-white"><SwapText id={hubTab}>
               {hubTab === "WALLPAPERS"
                 ? "Meus Wallpapers"
                 : hubTab === "WIDGETS"
                   ? "Meus Widgets"
                   : "Modelos Prontos"}
-            </h1>
-            <p className="text-xs text-[#A1A1AA]">
+            </SwapText></h1>
+            <p className="text-xs text-[#A1A1AA]"><SwapText id={hubTab}>
               {hubTab === "WALLPAPERS"
                 ? "Sua biblioteca de wallpapers 2D, vídeo e 3D com pausa automática em tela cheia."
                 : hubTab === "WIDGETS"
                   ? "Fixe sobre qualquer papel de parede ou importe dentro de um wallpaper no Estúdio."
                   : "Comece rápido com composições 2D, vidro óptico, widgets ou cenas 3D interativas."}
-            </p>
+            </SwapText></p>
           </div>
 
           <div className="flex items-center gap-2.5">
@@ -2126,8 +2296,11 @@ const StudioHubApp: React.FC = () => {
 
         {/* Scrollable Workspace Body */}
         <main className="flex-1 overflow-y-auto px-7 py-5">
+          {!holdHub && <HubStillWarmer projects={warmProjects} />}
+          {!holdHub && (
+          <AnimatePresence mode="wait" initial={false}>
           {hubTab === "WALLPAPERS" && (
-            <div className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WALLPAPERS" {...TAB} className="max-w-7xl mx-auto space-y-5">
               {/* Filter Chips + Multi-Monitor Selector */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2180,14 +2353,24 @@ const StudioHubApp: React.FC = () => {
                 />
               )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {filteredWallpapers.map((wp) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
+                items={filteredWallpapers}
+                getKey={(x) => x.id}
+                getAmbient={(x) => hubAmbient(x)}
+                onActivate={(x) => openStudio(x)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Wallpapers"
+                renderItem={(wp) => {
                   const isActive = runtime.active_wallpaper_id === wp.id;
                   const wpKind = classifyWallpaperKind(wp);
                   return (
                     <article key={wp.id} className="prism-hub-card flex flex-col">
                       <div
-                        onClick={() => setEditing(wp)}
+                        data-hub-card={wp.id}
+                        onClick={() => openStudio(wp)}
                         className="relative aspect-video bg-black cursor-pointer overflow-hidden"
                       >
                         <HubThumbnail project={wp} />
@@ -2272,7 +2455,7 @@ const StudioHubApp: React.FC = () => {
                           )}
                           <button
                             type="button"
-                            onClick={() => setEditing(wp)}
+                            onClick={() => openStudio(wp)}
                             className="prism-pill-idle rounded-full py-2 text-xs flex items-center justify-center gap-1.5"
                           >
                             <Sliders className="w-3.5 h-3.5" /> Estúdio
@@ -2281,13 +2464,13 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
-            </div>
+                }}
+              />
+            </motion.div>
           )}
 
           {hubTab === "WIDGETS" && (
-            <div className="max-w-7xl mx-auto space-y-5">
+            <motion.div key="WIDGETS" {...TAB} className="max-w-7xl mx-auto space-y-5">
               {runtime.pinned_widget_ids.length >= 3 && (
                 <div className="rounded-xl border border-amber-400/30 bg-amber-400/[0.06] px-3.5 py-2.5 text-[11px] text-amber-200/90">
                   Cada widget fixado roda em uma janela WebView própria (dezenas de MB de RAM cada).{" "}
@@ -2313,14 +2496,24 @@ const StudioHubApp: React.FC = () => {
                 />
               )}
 
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {filteredWidgets.map((w) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
+                items={filteredWidgets}
+                getKey={(x) => x.id}
+                getAmbient={(x) => hubAmbient(x)}
+                onActivate={(x) => openStudio(x)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Widgets"
+                renderItem={(w) => {
                   const pinned = runtime.pinned_widget_ids.includes(w.id);
                   const isLocked = runtime.locked_widget_ids.includes(w.id);
                   return (
                     <article key={w.id} className="prism-hub-card flex flex-col">
                       <div
-                        onClick={() => setEditing(w)}
+                        data-hub-card={w.id}
+                        onClick={() => openStudio(w)}
                         className="relative aspect-[16/10] flex items-center justify-center p-4 cursor-pointer overflow-hidden bg-[#0D0D0F]"
                         style={{
                           backgroundImage:
@@ -2329,6 +2522,7 @@ const StudioHubApp: React.FC = () => {
                         }}
                       >
                         <div
+                          data-hub-inner={w.id}
                           className="w-full max-w-[340px]"
                           style={{ aspectRatio: `${w.widget.width} / ${w.widget.height}` }}
                         >
@@ -2433,7 +2627,7 @@ const StudioHubApp: React.FC = () => {
                           )}
                           <button
                             type="button"
-                            onClick={() => setEditing(w)}
+                            onClick={() => openStudio(w)}
                             className="prism-pill-idle rounded-full py-2 text-xs flex items-center justify-center gap-1.5"
                           >
                             <Sliders className="w-3.5 h-3.5" /> Estúdio
@@ -2442,13 +2636,13 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
-            </div>
+                }}
+              />
+            </motion.div>
           )}
 
           {hubTab === "TEMPLATES" && (
-            <div className="max-w-7xl mx-auto space-y-6 pb-6">
+            <motion.div key="TEMPLATES" {...TAB} className="max-w-7xl mx-auto space-y-6 pb-6">
               {/* Category Filter Bar + Restore Defaults */}
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -2485,8 +2679,16 @@ const StudioHubApp: React.FC = () => {
               </div>
 
               {/* Unified Templates Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-                {unifiedTemplates.map(({ project: tpl, category, subtitle, badges }) => {
+              <HubLayout
+                view={hubView}
+                onViewChange={changeHubView}
+                initialKey={hubFocusId ?? undefined}
+                items={unifiedTemplates}
+                getKey={(x) => x.project.id}
+                getAmbient={(x) => hubAmbient(x.project)}
+                lowPower={power.state !== "NORMAL"}
+                ariaLabel="Modelos"
+                renderItem={({ project: tpl, category, subtitle, badges }) => {
                   const isWidgetTpl = tpl.packageType === "WIDGET";
                   const openOrCloneTemplate = async (applyDirectly: boolean) => {
                     const existing = projects.find((p) => p.id === tpl.id);
@@ -2500,7 +2702,7 @@ const StudioHubApp: React.FC = () => {
                       if (isWidgetTpl) await pinWidget(target);
                       else await applyWallpaper(target);
                     } else {
-                      setEditing(target);
+                      openStudio(target);
                     }
                   };
                   return (
@@ -2510,11 +2712,13 @@ const StudioHubApp: React.FC = () => {
                     >
                       <div>
                         <div
+                          data-hub-card={tpl.id}
                           onClick={() => void openOrCloneTemplate(false)}
                           className="relative aspect-video bg-[#08080A] overflow-hidden border-b border-white/10 cursor-pointer flex items-center justify-center"
                         >
                           {isWidgetTpl ? (
                             <div
+                              data-hub-inner={tpl.id}
                               className="w-full max-w-[290px] p-3"
                               style={{ aspectRatio: `${tpl.widget.width} / ${tpl.widget.height}` }}
                             >
@@ -2570,8 +2774,8 @@ const StudioHubApp: React.FC = () => {
                       </div>
                     </article>
                   );
-                })}
-              </div>
+                }}
+              />
 
               {/* Collapsible Blender Optimization Guide (Out of the way unless needed) */}
               <div className="frosted-chrome frosted-chrome-panel rounded-2xl overflow-hidden">
@@ -2594,8 +2798,8 @@ const StudioHubApp: React.FC = () => {
                     Meta: ≤ 1% CPU · GPU Ultra-Leve
                   </span>
                 </button>
-                {blenderGuideOpen && (
-                  <div className="px-5 pb-5 pt-1 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs border-t border-white/10">
+                <AnimatePresence initial={false}>{blenderGuideOpen && (
+                  <motion.div {...COLLAPSE}><div className="px-5 pb-5 pt-1 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs border-t border-white/10">
                     <div className="rounded-xl bg-white/[0.03] border border-white/10 p-3 space-y-1">
                       <span className="font-mono-fx text-[10px] text-white/60">01 · FORMATO</span>
                       <p className="font-medium text-white">Exporte como glTF Binary (.glb)</p>
@@ -2625,10 +2829,12 @@ const StudioHubApp: React.FC = () => {
                         <code className="font-mono-fx text-white">Screen</code> para capa de música ao vivo.
                       </p>
                     </div>
-                  </div>
-                )}
+                  </div></motion.div>
+                )}</AnimatePresence>
               </div>
-            </div>
+            </motion.div>
+          )}
+          </AnimatePresence>
           )}
         </main>
       </div>
@@ -2873,7 +3079,33 @@ const StudioHubApp: React.FC = () => {
       <ToastOverlay message={toast} />
     </div>
   );
+
+  const showHub = !editing || phase === "closing";
+  return (
+    <>
+      {showHub && (
+        <motion.div className="h-screen w-screen" style={{ opacity: hubOpacity, pointerEvents: phase === "idle" ? undefined : "none" }}>
+          {hubTree}
+        </motion.div>
+      )}
+      {studioTree}
+      {(introPhase === "play" || introPhase === "melt") && (
+        <PrismIntro
+          lowPower={power.state !== "NORMAL"}
+          onEnterStart={() => {
+            writeSeenMarker(intro.marker);
+            setIntroPhase("melt");
+            setIntroHold(false);
+          }}
+          onDone={() => setIntroPhase("done")}
+        />
+      )}
+      {hero && <StudioHero project={hero.project} rect={hero.rect} innerRect={hero.innerRect} p={heroP} opacity={heroOpacity} />}
+    </>
+  );
 };
+
+applyMotionCssVars();
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

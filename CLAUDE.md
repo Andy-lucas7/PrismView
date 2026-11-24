@@ -74,6 +74,8 @@
 - `import_prism_archive(archivePath, replace?)`: id existente sem `replace` → `{ conflict, existingId, existingTitle }` (diálogo "Substituir"/"Manter os dois"); `false` = cópia com id novo + " (importado)". OPEN_APP importado vira `clickTargetPending` + `clickTargetNeedsReview` (revisão em `utils/importReview.ts`, diálogo pós-import).
 - Front: `saveProjectOrReport` (toast + retry 2/5/15 s, `failedSavesRef`); fechar a janela usa `onCloseRequested` (precisa `core:window:allow-destroy`). Studio tem `tauri-plugin-single-instance`; `shutting_down` (logoff/sair) impede que janelas de widget destruídas os desafixem.
 
+- Intro (`components/intro/`): hero do Prismlock traduzido para GLSL + derretimento de vidro ao entrar (5,2 s + 1,9 s). Aparece no 1º uso depois de ligar o PC/entrar na sessão: `get_session_marker` (src-tauri `intro_gate.rs`, `WTSINFOW::LogonTime`, reserva = boot/10 min) comparado com `localStorage prismview.introSession.v1`; janela iniciada oculta (`--minimized`) espera ficar visível; movimento reduzido/FROZEN pulam. `?intro=1` força, `?intro=0` pula, `?introMelt=0.5` congela o derretimento (inspeção). Enquanto roda, o Hub não monta carrossel/miniaturas (`useIntroHold`).
+
 # Armadilhas
 - Widget é outro WebView e o wallpaper é o motor nativo: `blob:` URL não atravessa; salvar caminho real/asset (`PickedFileDto` via `pick_local_file`).
 - Backdrop 3D do vidro é canvas `live`: re-upload por frame.

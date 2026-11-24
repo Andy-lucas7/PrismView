@@ -1,3 +1,4 @@
+mod intro_gate;
 mod atomic_fs;
 mod bundled_fonts;
 mod desktop_host;
@@ -940,6 +941,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            intro_gate::get_session_marker,
             projects::list_projects,
             projects::save_project,
             projects::delete_project,

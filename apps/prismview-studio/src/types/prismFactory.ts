@@ -1,5 +1,5 @@
 // Fábricas de camadas, assets nativos (SVG embutido) e avaliação de fórmulas.
-import { evaluateFxTemplate } from "../engine/fx/fxEngine";
+import { evaluateFxTemplate, type FxWeather } from "../engine/fx/fxEngine";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { BUILTIN_SVG_ICONS, GlobalVar, LayerKind, LiveTelemetry, PrismProject, SceneLayer, defaultGlass } from "./prismBase";
 import { defaultScene3D } from "./prismScene3D";
@@ -158,10 +158,11 @@ export function evaluateFormula(
   template: string,
   telemetry: LiveTelemetry,
   globals: GlobalVar[],
-  now: Date
+  now: Date,
+  weather?: FxWeather
 ): string {
   if (!template.includes("$")) return template;
   const gMap: Record<string, string> = {};
   for (const g of globals) gMap[g.name.toLowerCase()] = g.value;
-  return evaluateFxTemplate(template, { now, telemetry, globals: gMap });
+  return evaluateFxTemplate(template, { now, telemetry, globals: gMap, weather });
 }

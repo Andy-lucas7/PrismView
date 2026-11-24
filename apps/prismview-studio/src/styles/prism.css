@@ -112,12 +112,12 @@
 
 
 :root {
-  --prism-pure-black: #060608;
-  --prism-carbon: #0d0d10;
+  --prism-pure-black: #000000;
+  --prism-carbon: #0d0d0f;
   --prism-surface: #141418;
   --prism-white: #f8f8fa;
-  --prism-muted-zinc: #9ca3af;
-  --prism-track-zinc: #27272c;
+  --prism-muted-zinc: #a1a1aa;
+  --prism-track-zinc: #27272a;
   --prism-border-rest: rgba(255, 255, 255, 0.1);
   --prism-border-hover: rgba(255, 255, 255, 0.22);
 }
@@ -195,7 +195,7 @@ html.prism-transparent #root {
   color: #09090b;
   border-radius: 9999px;
   font-weight: 600;
-  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), background-color 160ms ease, box-shadow 180ms ease;
+  transition: transform var(--motion-fast, 160ms) var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1)), background-color var(--motion-fast, 160ms) ease, box-shadow var(--motion-fast, 160ms) ease;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
 }
 
@@ -240,7 +240,7 @@ html.prism-transparent #root {
   background: rgba(255, 255, 255, 0.04);
   color: #a1a1aa;
   border: 1px solid rgba(255, 255, 255, 0.09);
-  transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
+  transition: color var(--motion-fast, 160ms) ease, background var(--motion-fast, 160ms) ease, border-color var(--motion-fast, 160ms) ease;
 }
 
 .prism-pill-idle:hover {
@@ -255,7 +255,7 @@ html.prism-transparent #root {
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 18px;
   overflow: hidden;
-  transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1), border-color 180ms ease, box-shadow 200ms ease;
+  transition: transform var(--motion-fast, 160ms) var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1)), border-color var(--motion-fast, 160ms) ease, box-shadow var(--motion-fast, 160ms) ease;
 }
 
 .prism-hub-card:hover {
@@ -269,7 +269,7 @@ html.prism-transparent #root {
   background: rgba(255, 255, 255, 0.04);
   color: var(--prism-muted-zinc);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  transition: all 160ms ease;
+  transition: color var(--motion-fast, 160ms) ease, background-color var(--motion-fast, 160ms) ease, border-color var(--motion-fast, 160ms) ease, opacity var(--motion-fast, 160ms) ease;
 }
 
 .fx-btn-idle:hover {
@@ -306,7 +306,7 @@ input[type="range"].prism-slider::-webkit-slider-thumb {
   border: 1px solid rgba(0, 0, 0, 0.35);
   cursor: pointer;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.65);
-  transition: transform 140ms ease;
+  transition: transform var(--motion-fast, 160ms) ease;
 }
 
 input[type="range"].prism-slider::-webkit-slider-thumb:hover {
@@ -332,4 +332,54 @@ input[type="range"].prism-slider::-webkit-slider-thumb:hover {
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Miniatura do Hub entrando (após montar o compositor). */
+.prism-thumb-in {
+  animation: prism-thumb-in var(--motion-slow, 420ms) var(--ease-decelerate, cubic-bezier(0.05, 0.7, 0.1, 1)) both;
+}
+@keyframes prism-thumb-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ── Interações base: nenhum botão/campo muda de estado "seco" ───────────────────────────── */
+button,
+[role="button"],
+[role="radio"],
+[role="tab"],
+select,
+input,
+textarea,
+summary {
+  transition-property: color, background-color, border-color, box-shadow, opacity, scale, filter;
+  transition-duration: var(--motion-fast, 160ms);
+  transition-timing-function: var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1));
+}
+button:not(:disabled):active,
+[role="button"]:not([aria-disabled="true"]):active,
+[role="radio"]:active,
+[role="tab"]:active {
+  scale: 0.97;
+  transition-duration: var(--motion-instant, 90ms);
+}
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* Amostra do seletor de cor (substitui <input type="color">). */
+.prism-color-swatch {
+  width: 2rem;
+  height: 1.5rem;
+  flex-shrink: 0;
+  border-radius: 0.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+.prism-color-swatch:hover {
+  border-color: rgba(255, 255, 255, 0.5);
+}
+.prism-color-swatch:disabled {
+  opacity: 0.5;
 }

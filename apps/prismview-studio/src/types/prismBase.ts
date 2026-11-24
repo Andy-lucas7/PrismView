@@ -1,5 +1,6 @@
 // Tipos, constantes, runtime Tauri (invokeCmd/resolveMediaUrl) e presets de vidro.
 import { evaluateFxTemplate } from "../engine/fx/fxEngine";
+import { SPRING } from "../engine/motion";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
 
@@ -486,12 +487,7 @@ export interface PickedFileDto {
   text_content: string;
 }
 
-export const SPRING_TACTILE = {
-  type: "spring" as const,
-  stiffness: 400,
-  damping: 32,
-  mass: 0.9,
-};
+export const SPRING_TACTILE = SPRING.tactile;
 
 export const BUILTIN_SVG_ICONS: Record<string, string> = {
   prism: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 20 2 20 12 2"/><line x1="12" y1="2" x2="12" y2="20"/></svg>`,
