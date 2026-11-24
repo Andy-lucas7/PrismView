@@ -31,11 +31,13 @@ interface BrandLayout {
   desc: number;
 }
 
+/** Peso da marca: Outfit Light (300), leve mas não ultrafino. */
+const BRAND_WEIGHT = 300;
 const FONT_FAMILY = '"Outfit", "Inter", "Segoe UI", sans-serif';
 
 function measureBrand(fontPx: number): BrandLayout {
   const cv = document.createElement("canvas").getContext("2d")!;
-  cv.font = `700 ${fontPx}px ${FONT_FAMILY}`;
+  cv.font = `${BRAND_WEIGHT} ${fontPx}px ${FONT_FAMILY}`;
   const ls = -0.011 * fontPx;
   (cv as unknown as { letterSpacing: string }).letterSpacing = `${ls}px`;
   const w = (s: string) => cv.measureText(s).width;
@@ -92,7 +94,7 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
       return;
     }
     void Promise.race([
-      Promise.all([fonts.load(`700 80px ${FONT_FAMILY}`, BRAND), fonts.ready]),
+      Promise.all([fonts.load(`${BRAND_WEIGHT} 80px ${FONT_FAMILY}`, BRAND), fonts.ready]),
       new Promise((r) => window.setTimeout(r, 900)),
     ]).then(fin, fin);
     return () => {
@@ -286,7 +288,7 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
       cv.height = Math.ceil(rh * dpr);
       const c = cv.getContext("2d")!;
       c.scale(dpr, dpr);
-      c.font = `700 ${brand.fontPx}px ${FONT_FAMILY}`;
+      c.font = `${BRAND_WEIGHT} ${brand.fontPx}px ${FONT_FAMILY}`;
       (c as unknown as { letterSpacing: string }).letterSpacing = `${-0.011 * brand.fontPx}px`;
       c.textBaseline = "alphabetic";
       c.fillStyle = "#fff";
@@ -355,7 +357,7 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
             style={{ scale: wordScale, transformOrigin: `50% ${(size.h * 0.35).toFixed(0)}px`, opacity: melting ? 0 : 1 }}
           >
             <motion.span
-              className="absolute whitespace-pre font-display font-bold text-white"
+              className="absolute whitespace-pre font-display text-white"
               style={{
                 x: pLeft,
                 y: brandTop,
@@ -365,12 +367,13 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
                 letterSpacing: "-0.011em",
                 textShadow: pShadow,
                 fontFamily: FONT_FAMILY,
+                fontWeight: BRAND_WEIGHT,
               }}
             >
               {BRAND_P}
             </motion.span>
             <motion.span
-              className="absolute whitespace-pre font-display font-bold"
+              className="absolute whitespace-pre font-display"
               style={{
                 x: restLeft,
                 y: brandTop,
@@ -380,6 +383,7 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
                 lineHeight: `${brand.lineH}px`,
                 letterSpacing: "-0.011em",
                 fontFamily: FONT_FAMILY,
+                fontWeight: BRAND_WEIGHT,
                 backgroundImage: restBg,
                 WebkitBackgroundClip: "text",
                 backgroundClip: "text",
