@@ -85,9 +85,12 @@ import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
 import { BindingTargetOption, BindingTargetPicker, InspectorSlider, Vec3Field } from "./InspectorControls";
 import {
+  collectGroupLeafLayers,
   formatMultiSelectionSummary,
   LAYER_KIND_LABELS,
   mergeProps,
+  patchGroupDescendants,
+  summarizeGroupKinds,
   transformTextCase,
 } from "../utils/multiSelect";
 import type { AlignMode, DistributeAxis, FlipAxis, MatchSizeMode } from "../utils/align";
@@ -184,7 +187,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   project,
   mode,
   onModeChange,
-  selectedLayer,
+  selectedLayer: rawSelectedLayer,
   selectedLayers,
   selectedParent,
   scene3dInfo = null,
@@ -289,15 +292,64 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     onFlushSave,
   };
 
-  const effectiveLayers = useMemo<SceneLayer[]>(
+  const [groupScope, setGroupScope] = useState<"GROUP" | "CHILDREN">("GROUP");
+  const [groupKindFilter, setGroupKindFilter] = useState<LayerKind | "ALL">("ALL");
+
+  const rawIsMulti = Boolean(selectedLayers && selectedLayers.length >= 2);
+  const groupLeaves = useMemo<SceneLayer[]>(
     () =>
-      selectedLayers && selectedLayers.length > 0
-        ? selectedLayers
-        : selectedLayer
-        ? [selectedLayer]
+      !rawIsMulti && rawSelectedLayer?.kind === "GROUP"
+        ? collectGroupLeafLayers(rawSelectedLayer)
         : [],
-    [selectedLayers, selectedLayer]
+    [rawIsMulti, rawSelectedLayer]
   );
+  const groupKindCounts = useMemo(() => summarizeGroupKinds(groupLeaves), [groupLeaves]);
+  const isSingleGroupWithLeaves =
+    !rawIsMulti && rawSelectedLayer?.kind === "GROUP" && groupLeaves.length > 0;
+  const groupHomogeneousKind: LayerKind | null =
+    groupKindCounts.length === 1 ? groupKindCounts[0].kind : null;
+
+  useEffect(() => {
+    if (
+      !rawIsMulti &&
+      rawSelectedLayer?.kind === "GROUP" &&
+      groupLeaves.length >= 2 &&
+      groupHomogeneousKind !== null
+    ) {
+      setGroupScope("CHILDREN");
+    } else {
+      setGroupScope("GROUP");
+    }
+    setGroupKindFilter("ALL");
+    // Só redefine o escopo ao trocar qual camada está selecionada
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rawSelectedLayer?.id, rawIsMulti]);
+
+  const activeKindFilter: LayerKind | "ALL" =
+    groupKindFilter !== "ALL" && groupKindCounts.some((g) => g.kind === groupKindFilter)
+      ? groupKindFilter
+      : "ALL";
+  const isGroupChildScope = isSingleGroupWithLeaves && groupScope === "CHILDREN";
+  const scopedGroupChildren = useMemo<SceneLayer[]>(
+    () =>
+      isGroupChildScope
+        ? activeKindFilter === "ALL"
+          ? groupLeaves
+          : groupLeaves.filter((l) => l.kind === activeKindFilter)
+        : [],
+    [isGroupChildScope, activeKindFilter, groupLeaves]
+  );
+
+  const effectiveLayers = useMemo<SceneLayer[]>(() => {
+    if (isGroupChildScope && scopedGroupChildren.length > 0) return scopedGroupChildren;
+    if (selectedLayers && selectedLayers.length > 0) return selectedLayers;
+    return rawSelectedLayer ? [rawSelectedLayer] : [];
+  }, [isGroupChildScope, scopedGroupChildren, selectedLayers, rawSelectedLayer]);
+
+  const selectedLayer =
+    isGroupChildScope && scopedGroupChildren.length > 0
+      ? scopedGroupChildren[0]
+      : rawSelectedLayer;
   const isMulti = effectiveLayers.length >= 2;
   const merged = useMemo(() => mergeProps(effectiveLayers), [effectiveLayers]);
 
@@ -305,13 +357,86 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     fn: (l: SceneLayer) => SceneLayer,
     commit: "raw" | "discrete" | "coalesced" = "raw"
   ) => {
+    if (isGroupChildScope && rawSelectedLayer && scopedGroupChildren.length > 0) {
+      const ids = new Set(scopedGroupChildren.map((c) => c.id));
+      onPatchLayer(
+        rawSelectedLayer.id,
+        (g) => patchGroupDescendants(g, ids, fn),
+        commit
+      );
+      return;
+    }
     if (isMulti && onPatchSelectedLayers) {
       onPatchSelectedLayers(fn, commit);
       return;
     }
-    if (selectedLayer) {
-      onPatchLayer(selectedLayer.id, fn, commit);
+    if (rawSelectedLayer) {
+      onPatchLayer(rawSelectedLayer.id, fn, commit);
     }
+  };
+
+  const renderGroupScopeBar = () => {
+    if (!isSingleGroupWithLeaves || !rawSelectedLayer) return null;
+    const childrenLabel = groupHomogeneousKind
+      ? `${groupLeaves.length}× ${LAYER_KIND_LABELS[groupHomogeneousKind]}`
+      : `Itens (${groupLeaves.length})`;
+    return (
+      <div className="space-y-1.5">
+        <div className="grid grid-cols-2 gap-1 bg-black/50 p-1 rounded-xl border border-white/10">
+          <button
+            type="button"
+            onClick={() => setGroupScope("GROUP")}
+            className={`py-1 rounded-lg text-[10px] font-medium transition truncate px-2 ${
+              groupScope === "GROUP"
+                ? "bg-white text-black"
+                : "text-[#A1A1AA] hover:text-white"
+            }`}
+          >
+            Grupo
+          </button>
+          <button
+            type="button"
+            onClick={() => setGroupScope("CHILDREN")}
+            className={`py-1 rounded-lg text-[10px] font-medium transition truncate px-2 ${
+              groupScope === "CHILDREN"
+                ? "bg-white text-black"
+                : "text-[#A1A1AA] hover:text-white"
+            }`}
+          >
+            {childrenLabel}
+          </button>
+        </div>
+        {groupScope === "CHILDREN" && groupKindCounts.length > 1 && (
+          <div className="flex flex-wrap gap-1">
+            <button
+              type="button"
+              onClick={() => setGroupKindFilter("ALL")}
+              className={`px-2 py-0.5 rounded-full text-[10px] border transition ${
+                activeKindFilter === "ALL"
+                  ? "bg-white text-black border-white font-medium"
+                  : "bg-white/[0.04] border-white/10 text-[#A1A1AA] hover:text-white"
+              }`}
+            >
+              Todos ({groupLeaves.length})
+            </button>
+            {groupKindCounts.map(({ kind, count }) => (
+              <button
+                key={kind}
+                type="button"
+                onClick={() => setGroupKindFilter(kind)}
+                className={`px-2 py-0.5 rounded-full text-[10px] border transition ${
+                  activeKindFilter === kind
+                    ? "bg-white text-black border-white font-medium"
+                    : "bg-white/[0.04] border-white/10 text-[#A1A1AA] hover:text-white"
+                }`}
+              >
+                {LAYER_KIND_LABELS[kind]} ({count})
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const renderAlignAndTransformQuickBar = (count: number) => {
@@ -721,6 +846,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
       return (
         <div className="flex-1 flex flex-col min-h-0">
           <div className="px-4 pt-3 pb-2.5 border-b border-white/10 space-y-2">
+            {renderGroupScopeBar()}
             <div className="flex items-center justify-between gap-2">
               <span className="text-[10px] font-mono-fx uppercase tracking-widest text-[#A1A1AA]">
                 {formatMultiSelectionSummary(merged)}
@@ -775,7 +901,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
           </div>
 
           <div className="flex-1 overflow-y-auto p-4 space-y-3.5">
-            {renderAlignAndTransformQuickBar(merged.count)}
+            {!isGroupChildScope && renderAlignAndTransformQuickBar(merged.count)}
 
             <div className="space-y-2.5 pt-2.5 border-t border-white/10">
               <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">
@@ -974,11 +1100,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
       <div className="flex-1 flex flex-col min-h-0">
         {/* Selected Layer Header */}
         <div className="px-4 pt-3 pb-2.5 border-b border-white/10 space-y-2">
+          {renderGroupScopeBar()}
           <div className="flex items-center justify-between gap-2">
             <span className="text-[10px] font-mono-fx uppercase tracking-widest text-[#A1A1AA]">
               {isMulti ? formatMultiSelectionSummary(merged) : LAYER_KIND_LABELS[selectedLayer.kind] ?? selectedLayer.kind}
             </span>
-            {!isMulti && selectedParent && (
+            {!isMulti && !isGroupChildScope && selectedParent && (
               <button
                 type="button"
                 onClick={() => onSelectLayer(selectedParent.id)}
@@ -988,14 +1115,16 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               </button>
             )}
           </div>
-          <input aria-label="Nome da camada"
-            value={isMulti && merged.common.name.mixed ? "" : merged.common.name.value}
-            placeholder={isMulti && merged.common.name.mixed ? "misto" : "Nome da camada"}
-            onChange={(e) =>
-              patchTarget((l) => ({ ...l, name: e.target.value }), "coalesced")
-            }
-            className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-1.5 text-xs font-medium text-white placeholder:italic placeholder:text-[#71717A] outline-none focus:border-white/25"
-          />
+          {!isGroupChildScope && (
+            <input aria-label="Nome da camada"
+              value={isMulti && merged.common.name.mixed ? "" : merged.common.name.value}
+              placeholder={isMulti && merged.common.name.mixed ? "misto" : "Nome da camada"}
+              onChange={(e) =>
+                patchTarget((l) => ({ ...l, name: e.target.value }), "coalesced")
+              }
+              className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-1.5 text-xs font-medium text-white placeholder:italic placeholder:text-[#71717A] outline-none focus:border-white/25"
+            />
+          )}
 
           {/* 3 Clean Layer Sub-Tabs */}
           <div className="grid grid-cols-3 gap-1 bg-black/50 p-1 rounded-xl border border-white/10">
@@ -3893,7 +4022,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
           {layerTab === "TRANSFORM" && (
             <>
-              {renderAlignAndTransformQuickBar(merged.count)}
+              {!isGroupChildScope && renderAlignAndTransformQuickBar(merged.count)}
 
               <InspectorSlider
                 label={isMulti ? "Posição X (Relativa)" : "Posição X"}

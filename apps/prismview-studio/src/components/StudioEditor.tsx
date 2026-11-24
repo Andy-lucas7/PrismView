@@ -2737,58 +2737,63 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div>
 
         {/* Pílula de vidro abaixo do canvas: modo de multiseleção (Etapa 5) */}
-        <AnimatePresence initial={false}>
-          {validSelectedIds.length >= 2 && !room3dMode && !test3dMode && (
-            <motion.div
-              {...POP}
-              role="status"
-              aria-live="polite"
-              className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-30 prism-glass-pop !rounded-full pl-3.5 pr-1.5 py-1 flex items-center gap-2 text-[11px] text-white"
-            >
-              <span className="h-2 w-2 rounded-full bg-white/90 shrink-0" />
-              <span className="text-white/90 whitespace-nowrap">
-                Modo de multiseleção ·{" "}
-                <strong className="font-medium text-white">
-                  {formatMultiSelectionSummary(mergedSelection)}
-                </strong>
-              </span>
-              <span className="h-3.5 w-px bg-white/15 mx-0.5" />
-              <button
-                type="button"
-                onClick={handleCenterSelected}
-                title="Centralizar seleção na tela"
-                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+        <div
+          className="pointer-events-none absolute bottom-3 left-3 z-30 flex justify-center"
+          style={{ right: stageRightInset(panelOpen) }}
+        >
+          <AnimatePresence initial={false}>
+            {validSelectedIds.length >= 2 && !room3dMode && !test3dMode && (
+              <motion.div
+                {...POP}
+                role="status"
+                aria-live="polite"
+                className="pointer-events-auto prism-glass-pop !rounded-full pl-3.5 pr-1.5 py-1 flex items-center gap-2 text-[11px] text-white"
               >
-                <Crosshair className="w-3 h-3" /> Centralizar
-              </button>
-              <button
-                type="button"
-                onClick={handleGroupSelected}
-                title="Agrupar selecionadas (Ctrl+G)"
-                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
-              >
-                <FolderPlus className="w-3 h-3" /> Agrupar
-              </button>
-              <button
-                type="button"
-                onClick={() => duplicateLayers(validSelectedIds)}
-                title="Duplicar selecionadas (Ctrl+D)"
-                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
-              >
-                <Copy className="w-3 h-3" /> Duplicar
-              </button>
-              <button
-                type="button"
-                aria-label="Limpar seleção (Esc)"
-                title="Limpar seleção (Esc)"
-                onClick={() => setSelectedIds([])}
-                className="rounded-full p-1 text-[#A1A1AA] hover:bg-white/15 hover:text-white"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </motion.div>
-          )}
-        </AnimatePresence>
+                <span className="h-2 w-2 rounded-full bg-white/90 shrink-0" />
+                <span className="text-white/90 whitespace-nowrap">
+                  Modo de multiseleção ·{" "}
+                  <strong className="font-medium text-white">
+                    {formatMultiSelectionSummary(mergedSelection)}
+                  </strong>
+                </span>
+                <span className="h-3.5 w-px bg-white/15 mx-0.5" />
+                <button
+                  type="button"
+                  onClick={handleCenterSelected}
+                  title="Centralizar seleção na tela"
+                  className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+                >
+                  <Crosshair className="w-3 h-3" /> Centralizar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleGroupSelected}
+                  title="Agrupar selecionadas (Ctrl+G)"
+                  className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+                >
+                  <FolderPlus className="w-3 h-3" /> Agrupar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => duplicateLayers(validSelectedIds)}
+                  title="Duplicar selecionadas (Ctrl+D)"
+                  className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+                >
+                  <Copy className="w-3 h-3" /> Duplicar
+                </button>
+                <button
+                  type="button"
+                  aria-label="Limpar seleção (Esc)"
+                  title="Limpar seleção (Esc)"
+                  onClick={() => setSelectedIds([])}
+                  className="rounded-full p-1 text-[#A1A1AA] hover:bg-white/15 hover:text-white"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
 
       {/* PAINEL ÚNICO (direita): propriedades em cima, camadas embaixo, divisória arrastável.

@@ -516,3 +516,60 @@ export function transformTextCase(content: string, mode: TextCaseMode): string {
     })
     .join("");
 }
+
+/** Coleta recursivamente todas as camadas-folha (não-GROUP) dentro de um grupo, na ordem visual. */
+export function collectGroupLeafLayers(group: SceneLayer): SceneLayer[] {
+  if (group.kind !== "GROUP" || !group.children || group.children.length === 0) return [];
+  const out: SceneLayer[] = [];
+  const walk = (list: readonly SceneLayer[]) => {
+    for (const child of list) {
+      if (child.kind === "GROUP") {
+        if (child.children && child.children.length > 0) walk(child.children);
+      } else {
+        out.push(child);
+      }
+    }
+  };
+  walk(group.children);
+  return out;
+}
+
+/** Conta quantas camadas de cada tipo existem em uma lista, preservando a ordem da primeira ocorrência. */
+export function summarizeGroupKinds(
+  leaves: readonly SceneLayer[]
+): Array<{ kind: LayerKind; count: number }> {
+  const counts = new Map<LayerKind, number>();
+  for (const l of leaves) {
+    counts.set(l.kind, (counts.get(l.kind) ?? 0) + 1);
+  }
+  return Array.from(counts.entries()).map(([kind, count]) => ({ kind, count }));
+}
+
+/**
+ * Aplica `fn` aos descendentes de `group` cujos IDs estão em `targetIds`,
+ * preservando referências intactas de subárvores não alteradas.
+ */
+export function patchGroupDescendants(
+  group: SceneLayer,
+  targetIds: ReadonlySet<string>,
+  fn: (layer: SceneLayer) => SceneLayer
+): SceneLayer {
+  if (!group.children || group.children.length === 0 || targetIds.size === 0) return group;
+  const mapList = (list: SceneLayer[]): SceneLayer[] => {
+    let changed = false;
+    const next = list.map((item) => {
+      let cur = targetIds.has(item.id) ? fn(item) : item;
+      if (cur.children && cur.children.length > 0) {
+        const nextChildren = mapList(cur.children);
+        if (nextChildren !== cur.children) {
+          cur = { ...cur, children: nextChildren };
+        }
+      }
+      if (cur !== item) changed = true;
+      return cur;
+    });
+    return changed ? next : list;
+  };
+  const nextChildren = mapList(group.children);
+  return nextChildren === group.children ? group : { ...group, children: nextChildren };
+}

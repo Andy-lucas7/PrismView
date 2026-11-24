@@ -5,10 +5,13 @@ import type { GlassEffect, LayerKind, SceneLayer } from "../src/types/prismBase.
 import {
   applyLayerStyle,
   applyPatchToMany,
+  collectGroupLeafLayers,
   extractLayerStyle,
   formatMultiSelectionSummary,
   mergeProps,
+  patchGroupDescendants,
   resolveSelectedLayers,
+  summarizeGroupKinds,
   transformTextCase,
 } from "../src/utils/multiSelect.ts";
 
@@ -196,4 +199,29 @@ test("transformTextCase: altera texto literal e envolve fórmulas $...$ com tc()
     transformTextCase("$tc(up, df(EEEE))$", "lower"),
     "$tc(low, df(EEEE))$"
   );
+});
+
+test("collectGroupLeafLayers, summarizeGroupKinds e patchGroupDescendants: edição em conjunto em grupos", () => {
+  const t1 = makeLayer("t1", "TEXT", { opacity: 0.8 });
+  const t2 = makeLayer("t2", "TEXT", { opacity: 0.4 });
+  const img = makeLayer("i1", "IMAGE", { opacity: 1 });
+  const subGroup = makeLayer("sub", "GROUP", { children: [t2, img] });
+  const rootGroup = makeLayer("g1", "GROUP", { children: [t1, subGroup] });
+
+  const leaves = collectGroupLeafLayers(rootGroup);
+  assert.deepEqual(leaves.map((l) => l.id), ["t1", "t2", "i1"]);
+  assert.deepEqual(summarizeGroupKinds(leaves), [
+    { kind: "TEXT", count: 2 },
+    { kind: "IMAGE", count: 1 },
+  ]);
+
+  // Patch apenas nos textos preserva a referência exata da imagem não tocada
+  const patched = patchGroupDescendants(rootGroup, new Set(["t1", "t2"]), (l) => ({
+    ...l,
+    opacity: 0.5,
+  }));
+  const patchedLeaves = collectGroupLeafLayers(patched);
+  assert.equal(patchedLeaves[0].opacity, 0.5);
+  assert.equal(patchedLeaves[1].opacity, 0.5);
+  assert.equal(patchedLeaves[2], img);
 });
