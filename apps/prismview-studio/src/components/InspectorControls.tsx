@@ -154,6 +154,8 @@ interface InspectorSliderProps {
   max: number;
   step: number;
   unit?: string;
+  /** Quando `true`, indica valores divergentes na multiseleção ("misto"). */
+  mixed?: boolean;
   fxActive?: boolean;
   onFx?: () => void;
   onChange: (v: number) => void;
@@ -170,6 +172,7 @@ export const InspectorSlider: React.FC<InspectorSliderProps> = ({
   max,
   step,
   unit = "",
+  mixed = false,
   fxActive = false,
   onFx,
   onChange,
@@ -198,7 +201,7 @@ export const InspectorSlider: React.FC<InspectorSliderProps> = ({
             type="button"
             onClick={() => {
               const next = clamp(value - step);
-              if (next === value) return;
+              if (next === value && !mixed) return;
               onRecordStep();
               onChange(next);
               onFlushSave?.();
@@ -207,15 +210,21 @@ export const InspectorSlider: React.FC<InspectorSliderProps> = ({
           >
             −
           </button>
-          <span className="min-w-[44px] text-center font-mono-fx text-[11px] text-white">
-            {Number.isInteger(step) ? Math.round(value) : value.toFixed(2)}
-            {unit}
+          <span
+            className={`min-w-[44px] text-center font-mono-fx text-[11px] ${
+              mixed ? "italic text-[#A1A1AA]" : "text-white"
+            }`}
+            title={mixed ? "Valores diferentes entre os itens selecionados" : undefined}
+          >
+            {mixed
+              ? "misto"
+              : `${Number.isInteger(step) ? Math.round(value) : value.toFixed(2)}${unit}`}
           </span>
           <button
             type="button"
             onClick={() => {
               const next = clamp(value + step);
-              if (next === value) return;
+              if (next === value && !mixed) return;
               onRecordStep();
               onChange(next);
               onFlushSave?.();

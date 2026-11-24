@@ -32,13 +32,18 @@ export interface KeyboardShortcutsConfig {
   onCopy?: () => void;
   onCut?: () => void;
   onPaste?: () => void;
+  onCopyStyle?: () => void;
+  onPasteStyle?: () => void;
   onDuplicate?: () => void;
+  onRename?: () => void;
   onSelectAll?: () => void;
   onDeselect?: () => void;
   onGroup?: () => void;
   onUngroup?: () => void;
   onBringForward?: () => void;
   onSendBackward?: () => void;
+  onBringToFront?: () => void;
+  onSendToBack?: () => void;
   onToggleHidden?: () => void;
   onToggleLock?: () => void;
 }
@@ -96,6 +101,22 @@ export function useKeyboardShortcuts(config: KeyboardShortcutsConfig): void {
         return;
       }
 
+      if (mod && e.altKey && !e.shiftKey && key === "c") {
+        if (cfg.onCopyStyle) {
+          e.preventDefault();
+          cfg.onCopyStyle();
+          return;
+        }
+      }
+
+      if (mod && e.altKey && !e.shiftKey && key === "v") {
+        if (cfg.onPasteStyle) {
+          e.preventDefault();
+          cfg.onPasteStyle();
+          return;
+        }
+      }
+
       if (mod && key === "c" && !e.shiftKey && !e.altKey) {
         if (cfg.onCopy) {
           e.preventDefault();
@@ -149,18 +170,36 @@ export function useKeyboardShortcuts(config: KeyboardShortcutsConfig): void {
         }
       }
 
-      if (mod && (e.key === "]" || e.code === "BracketRight")) {
-        if (cfg.onBringForward) {
+      if (!e.altKey && (e.key === "]" || (mod && e.code === "BracketRight" && e.key !== "\\"))) {
+        if (e.shiftKey && cfg.onBringToFront) {
+          e.preventDefault();
+          cfg.onBringToFront();
+          return;
+        }
+        if (!e.shiftKey && cfg.onBringForward) {
           e.preventDefault();
           cfg.onBringForward();
           return;
         }
       }
 
-      if (mod && (e.key === "[" || e.code === "BracketLeft")) {
-        if (cfg.onSendBackward) {
+      if (!e.altKey && (e.key === "[" || (mod && e.code === "BracketLeft" && e.key !== "\\"))) {
+        if (e.shiftKey && cfg.onSendToBack) {
+          e.preventDefault();
+          cfg.onSendToBack();
+          return;
+        }
+        if (!e.shiftKey && cfg.onSendBackward) {
           e.preventDefault();
           cfg.onSendBackward();
+          return;
+        }
+      }
+
+      if (!mod && !e.altKey && !e.shiftKey && e.key === "F2") {
+        if (cfg.onRename) {
+          e.preventDefault();
+          cfg.onRename();
           return;
         }
       }

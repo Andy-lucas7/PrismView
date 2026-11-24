@@ -277,6 +277,12 @@ impl Ctx {
         if self.is_full_bleed(layer, top_level) {
             node["fill_parent"] = json!(true);
         }
+        if boolean(layer, "flipX", false) {
+            node["flip_x"] = json!(true);
+        }
+        if boolean(layer, "flipY", false) {
+            node["flip_y"] = json!(true);
+        }
         if let Some(touch) = touch_action(layer) {
             node["touch"] = touch;
         }
@@ -358,6 +364,8 @@ impl Ctx {
         child["fill_parent"] = json!(false);
         if let Some(map) = child.as_object_mut() {
             map.remove("touch");
+            map.remove("flip_x");
+            map.remove("flip_y");
         }
         // O parallax (binding pelo id da camada) passa para a placa, que leva o texto junto.
         let child_id = text(&child, "id").to_string();

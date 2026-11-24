@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Crosshair,
   Download,
   Eye,
   EyeOff,
@@ -47,9 +48,11 @@ import {
   createBindingForPart,
   createLayer,
   createScene3DObject,
+  defaultGlass,
   DEFAULT_REACTIVE_SIGNAL,
   defaultScene3D,
   duplicateScene3DObject,
+  GLASS_STYLE_PRESETS,
   removeScene3DObject,
   setScene3DObjectTransform,
   invokeCmd,
@@ -77,6 +80,7 @@ import { nativeCompatIssues } from "../utils/nativeCompat";
 import {
   cloneLayerWithFreshIds,
   collectAllLayerIds,
+  collectLayerIdsByKind,
   countAllLayers,
   duplicateLayersByIds,
   findLayerById,
@@ -86,12 +90,38 @@ import {
   LayerDropPlacement,
   moveLayersByDrop,
   moveLayersZByIds,
+  moveLayersZExtremeByIds,
   pruneNestedSelection,
   removeLayersByIds,
   ungroupLayerById,
   updateLayerById,
   updateLayersByIds,
 } from "../utils/layerTree";
+import {
+  applyLayerStyle,
+  applyPatchToMany,
+  type CopiedLayerStyle,
+  extractLayerStyle,
+  formatMultiSelectionSummary,
+  mergeProps,
+  resolveSelectedLayers,
+  type TextCaseMode,
+  transformTextCase,
+} from "../utils/multiSelect";
+import {
+  alignLayers,
+  type AlignMode,
+  centerLayersOnScreen,
+  type DistributeAxis,
+  distributeLayers,
+  type FlipAxis,
+  flipLayers,
+  type LogicalSize,
+  matchLayersSize,
+  type MatchSizeMode,
+  rotateLayersBy90,
+} from "../utils/align";
+import { ContextMenu, type ContextMenuActions } from "./studio/ContextMenu";
 import { FxExpressionPopover } from "./FxExpressionPopover";
 import { Room3DEditBinding, UnifiedCompositor } from "./UnifiedCompositor";
 import type {
@@ -343,6 +373,12 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   }, [hasScene3D, scene3dEditMode]);
 
   const clipboardRef = useRef<SceneLayer[]>([]);
+  const [hasClipboard, setHasClipboard] = useState(false);
+  const copiedStyleRef = useRef<CopiedLayerStyle | null>(null);
+  const [hasCopiedStyle, setHasCopiedStyle] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [renamingLayerId, setRenamingLayerId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const hintTimerRef = useRef<number | null>(null);
   const treeDragRef = useRef<TreeDragState | null>(null);
   treeDragRef.current = treeDrag;
@@ -483,6 +519,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     [project.layers, primarySelectedId]
   );
   const selectedLayer = selectedLocation?.layer ?? null;
+  const selectedLayers = useMemo(
+    () => resolveSelectedLayers(project.layers, validSelectedIds),
+    [project.layers, validSelectedIds]
+  );
+  const mergedSelection = useMemo(() => mergeProps(selectedLayers), [selectedLayers]);
   // O que o desktop (motor nativo) não desenha: painel no Inspetor + badge no "Aplicar".
   const compatIssues = useMemo(() => nativeCompatIssues(project), [project]);
   const selectedParent = selectedLocation?.parent ?? null;
@@ -565,6 +606,54 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     },
     [history, onChangeProject, patchLayerRaw]
   );
+
+  const patchSelectedLayers = useCallback(
+    (
+      fn: (l: SceneLayer) => SceneLayer,
+      mode: "raw" | "discrete" | "coalesced" = "raw"
+    ) => {
+      const ids = new Set(selectedIdsRef.current);
+      if (ids.size === 0) return;
+      const cur = projectRef.current;
+      const nextLayers = applyPatchToMany(cur.layers, ids, fn);
+      if (nextLayers === cur.layers) return;
+      if (mode === "discrete") {
+        history.pushSnapshot(cur);
+        onChangeProject({ ...cur, layers: nextLayers });
+        return;
+      }
+      if (mode === "coalesced") {
+        history.recordCoalesced(cur, 350);
+      }
+      emitLiveProject({ ...cur, layers: nextLayers });
+    },
+    [emitLiveProject, history, onChangeProject]
+  );
+
+  /** Mede tamanhos lógicos reais no DOM sob demanda (só ao alinhar/distribuir — zero custo por quadro). */
+  const measureLogicalLayerSizes = useCallback((): ReadonlyMap<string, LogicalSize> => {
+    const map = new Map<string, LogicalSize>();
+    const root = stageRef.current;
+    if (!root) return map;
+    const cur = projectRef.current;
+    const logW = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+    const logH = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+    const frameEl = root.firstElementChild as HTMLElement | null;
+    const fw = frameEl?.clientWidth || logW;
+    const fh = frameEl?.clientHeight || logH;
+    const aspect = fw / Math.max(fh, 1);
+    const effLogW = cur.packageType === "WIDGET" ? logW : Math.max(960, Math.round(1080 * aspect));
+    const effLogH = cur.packageType === "WIDGET" ? logH : 1080;
+    const sc = Math.max(0.05, Math.min(fw / effLogW, fh / effLogH));
+    const nodes = root.querySelectorAll<HTMLElement>("[data-layer-id]");
+    nodes.forEach((el) => {
+      const id = el.dataset.layerId;
+      if (id && el.offsetWidth > 0 && el.offsetHeight > 0) {
+        map.set(id, { w: el.offsetWidth / sc, h: el.offsetHeight / sc });
+      }
+    });
+    return map;
+  }, []);
 
   const handleSelectLayer = useCallback(
     (
@@ -931,6 +1020,35 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     [applyDiscreteChange]
   );
 
+  const moveZExtreme = useCallback(
+    (ids: string[], toFront: boolean) => {
+      if (ids.length === 0) return;
+      const cur = projectRef.current;
+      const nextLayers = moveLayersZExtremeByIds(cur.layers, new Set(ids), toFront);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+        flashHint(toFront ? "Enviado para a frente total" : "Enviado para o fundo total");
+      }
+    },
+    [applyDiscreteChange, flashHint]
+  );
+
+  /** Alt+Arrastar no canvas: clona no lugar dentro da mesma transação de histórico do arraste. */
+  const duplicateForCanvasDrag = useCallback(
+    (ids: string[]): string[] => {
+      if (ids.length === 0) return [];
+      const cur = projectRef.current;
+      const { layers, newIds } = duplicateLayersByIds(cur.layers, ids, 0, 0);
+      if (newIds.length > 0) {
+        emitLiveProject({ ...cur, layers });
+        selectedIdsRef.current = newIds;
+        setSelectedIds(newIds);
+      }
+      return newIds;
+    },
+    [emitLiveProject]
+  );
+
   const duplicateLayers = useCallback(
     (ids: string[]) => {
       if (ids.length === 0) return;
@@ -988,8 +1106,166 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     }
     if (copied.length === 0) return;
     clipboardRef.current = copied;
+    setHasClipboard(true);
     flashHint(copied.length === 1 ? "1 camada copiada (Ctrl+C)" : `${copied.length} camadas copiadas`);
   }, [flashHint]);
+
+  const handleCopyStyle = useCallback(() => {
+    const cur = projectRef.current;
+    const primaryId = selectedLayerIdRef.current;
+    const layer = findLayerById(cur.layers, primaryId);
+    if (!layer) return;
+    copiedStyleRef.current = extractLayerStyle(layer);
+    setHasCopiedStyle(true);
+    flashHint("Estilo copiado (Ctrl+Alt+C)");
+  }, [flashHint]);
+
+  const handlePasteStyle = useCallback(() => {
+    const style = copiedStyleRef.current;
+    const ids = selectedIdsRef.current;
+    if (!style || ids.length === 0) return;
+    const cur = projectRef.current;
+    const nextLayers = applyPatchToMany(cur.layers, new Set(ids), (l) => applyLayerStyle(l, style));
+    if (nextLayers !== cur.layers) {
+      applyDiscreteChange({ ...cur, layers: nextLayers });
+      flashHint(ids.length === 1 ? "Estilo colado" : `Estilo colado em ${ids.length} camadas`);
+    }
+  }, [applyDiscreteChange, flashHint]);
+
+  const startRenameSelected = useCallback(() => {
+    const primaryId = selectedLayerIdRef.current;
+    const layer = findLayerById(projectRef.current.layers, primaryId);
+    if (!layer) return;
+    setPanelOpen((open) => {
+      if (!open) writePanelOpen(typeof window === "undefined" ? null : window.localStorage, true);
+      return true;
+    });
+    setRenamingLayerId(layer.id);
+    setRenameDraft(layer.name);
+  }, []);
+
+  const commitInlineRename = useCallback(
+    (id: string, draft: string) => {
+      setRenamingLayerId(null);
+      const trimmed = draft.trim();
+      if (!trimmed) return;
+      const cur = projectRef.current;
+      const existing = findLayerById(cur.layers, id);
+      if (!existing || existing.name === trimmed) return;
+      applyDiscreteChange({
+        ...cur,
+        layers: updateLayerById(cur.layers, id, (l) => ({ ...l, name: trimmed })),
+      });
+    },
+    [applyDiscreteChange]
+  );
+
+  const handleAlignSelected = useCallback(
+    (mode: AlignMode, reference: "screen" | "selection") => {
+      const cur = projectRef.current;
+      const ids = selectedIdsRef.current;
+      if (ids.length === 0) return;
+      const w = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+      const h = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+      const measured = measureLogicalLayerSizes();
+      const nextLayers = alignLayers(cur.layers, ids, mode, reference, w, h, measured);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+      }
+    },
+    [applyDiscreteChange, measureLogicalLayerSizes]
+  );
+
+  const handleCenterSelected = useCallback(() => {
+    const cur = projectRef.current;
+    const ids = selectedIdsRef.current;
+    if (ids.length === 0) return;
+    const w = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+    const h = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+    const measured = measureLogicalLayerSizes();
+    const nextLayers = centerLayersOnScreen(cur.layers, ids, w, h, measured);
+    if (nextLayers !== cur.layers) {
+      applyDiscreteChange({ ...cur, layers: nextLayers });
+      flashHint("Centralizado na tela");
+    }
+  }, [applyDiscreteChange, flashHint, measureLogicalLayerSizes]);
+
+  const handleDistributeSelected = useCallback(
+    (axis: DistributeAxis) => {
+      const cur = projectRef.current;
+      const ids = selectedIdsRef.current;
+      if (ids.length < 3) return;
+      const w = cur.packageType === "WIDGET" ? Math.max(160, cur.widget.width) : 1920;
+      const h = cur.packageType === "WIDGET" ? Math.max(100, cur.widget.height) : 1080;
+      const measured = measureLogicalLayerSizes();
+      const nextLayers = distributeLayers(cur.layers, ids, axis, w, h, measured);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+        flashHint(axis === "horizontal" ? "Distribuído horizontalmente" : "Distribuído verticalmente");
+      }
+    },
+    [applyDiscreteChange, flashHint, measureLogicalLayerSizes]
+  );
+
+  const handleMatchSizeSelected = useCallback(
+    (mode: MatchSizeMode) => {
+      const cur = projectRef.current;
+      const ids = selectedIdsRef.current;
+      if (ids.length < 2) return;
+      const nextLayers = matchLayersSize(cur.layers, ids, mode);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+        flashHint(mode === "width" ? "Larguras igualadas" : mode === "height" ? "Alturas igualadas" : "Tamanhos igualados");
+      }
+    },
+    [applyDiscreteChange, flashHint]
+  );
+
+  const handleFlipSelected = useCallback(
+    (axis: FlipAxis) => {
+      const cur = projectRef.current;
+      const ids = selectedIdsRef.current;
+      if (ids.length === 0) return;
+      const nextLayers = flipLayers(cur.layers, ids, axis);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+        flashHint(axis === "horizontal" ? "Espelhado na horizontal" : "Espelhado na vertical");
+      }
+    },
+    [applyDiscreteChange, flashHint]
+  );
+
+  const handleRotate90Selected = useCallback(
+    (dir: 1 | -1) => {
+      const cur = projectRef.current;
+      const ids = selectedIdsRef.current;
+      if (ids.length === 0) return;
+      const nextLayers = rotateLayersBy90(cur.layers, ids, dir);
+      if (nextLayers !== cur.layers) {
+        applyDiscreteChange({ ...cur, layers: nextLayers });
+      }
+    },
+    [applyDiscreteChange]
+  );
+
+  const openContextMenuAt = useCallback(
+    (layerId: string | null, clientX: number, clientY: number) => {
+      if (layerId) {
+        if (!selectedIdsRef.current.includes(layerId)) {
+          selectedIdsRef.current = [layerId];
+          selectedLayerIdRef.current = layerId;
+          setSelectedIds([layerId]);
+          setInspectorMode("LAYER");
+        }
+      } else {
+        selectedIdsRef.current = [];
+        selectedLayerIdRef.current = null;
+        setSelectedIds([]);
+      }
+      setContextMenu({ x: clientX, y: clientY });
+    },
+    []
+  );
 
   const handleCut = useCallback(() => {
     handleCopy();
@@ -1123,17 +1399,25 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     onCopy: handleCopy,
     onCut: handleCut,
     onPaste: handlePaste,
+    onCopyStyle: handleCopyStyle,
+    onPasteStyle: handlePasteStyle,
     onDuplicate: () => duplicateLayers(selectedIdsRef.current),
+    onRename: startRenameSelected,
     onSelectAll: () => {
       const all = collectAllLayerIds(projectRef.current.layers);
       setSelectedIds(all);
       flashHint(`${all.length} camadas selecionadas (Ctrl+A)`);
     },
-    onDeselect: () => setSelectedIds([]),
+    onDeselect: () => {
+      setContextMenu(null);
+      setSelectedIds([]);
+    },
     onGroup: handleGroupSelected,
     onUngroup: handleUngroupSelected,
     onBringForward: () => moveZ(selectedIdsRef.current, 1),
     onSendBackward: () => moveZ(selectedIdsRef.current, -1),
+    onBringToFront: () => moveZExtreme(selectedIdsRef.current, true),
+    onSendToBack: () => moveZExtreme(selectedIdsRef.current, false),
     onToggleHidden: handleToggleHiddenSelected,
     onToggleLock: handleToggleLockSelected,
   });
@@ -1560,8 +1844,35 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 )}
               </button>
             ) : null}
-            <div className="min-w-0">
-              <span className="block text-xs font-medium truncate">{layer.name}</span>
+            <div
+              className="min-w-0"
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                setRenamingLayerId(layer.id);
+                setRenameDraft(layer.name);
+              }}
+            >
+              {renamingLayerId === layer.id ? (
+                <input
+                  aria-label="Renomear camada"
+                  autoFocus
+                  value={renameDraft}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => setRenameDraft(e.target.value)}
+                  onBlur={() => commitInlineRename(layer.id, renameDraft)}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") commitInlineRename(layer.id, renameDraft);
+                    else if (e.key === "Escape") setRenamingLayerId(null);
+                  }}
+                  className="w-full rounded-md border border-white/30 bg-black/80 px-1.5 py-0.5 text-xs text-white outline-none"
+                />
+              ) : (
+                <span className="block text-xs font-medium truncate" title="Duplo clique ou F2 para renomear">
+                  {layer.name}
+                </span>
+              )}
               <span className="block text-[10px] text-[#71717A]">
                 {dropInside
                   ? "Soltar dentro do grupo"
@@ -1756,8 +2067,16 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         </div></motion.div>
       )}</AnimatePresence>
 
-      {/* Ordered Stack (Front-most on top) */}
-      <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
+      {/* Ordered Stack (Front-most on top) — único listener onContextMenu para toda a lista */}
+      <div
+        className="flex-1 overflow-y-auto p-2.5 space-y-1.5"
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const rowEl = (e.target as HTMLElement | null)?.closest<HTMLElement>("[data-layer-drop-id]");
+          openContextMenuAt(rowEl?.dataset.layerDropId ?? null, e.clientX, e.clientY);
+        }}
+      >
         {treeDrag?.active && treeDrag.hasNestedSource && (
           <div
             data-layer-root-drop="top"
@@ -1793,6 +2112,207 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         )}
       </div>
   </div>
+  );
+
+  const contextMenuActions = useMemo<ContextMenuActions>(
+    () => ({
+      onRename: startRenameSelected,
+      onDuplicate: () => duplicateLayers(selectedIdsRef.current),
+      onCopy: handleCopy,
+      onCut: handleCut,
+      onPaste: handlePaste,
+      onCopyStyle: handleCopyStyle,
+      onPasteStyle: handlePasteStyle,
+      onDelete: () => deleteLayers(selectedIdsRef.current),
+      onToggleLock: handleToggleLockSelected,
+      onToggleHidden: handleToggleHiddenSelected,
+      onSelectAll: () => {
+        const all = collectAllLayerIds(projectRef.current.layers);
+        setSelectedIds(all);
+        flashHint(`${all.length} camadas selecionadas`);
+      },
+      onSelectSameKind: (kind) => {
+        const matching = collectLayerIdsByKind(projectRef.current.layers, kind);
+        setSelectedIds(matching);
+        flashHint(`${matching.length} camada(s) do mesmo tipo selecionada(s)`);
+      },
+      onBringForward: () => moveZ(selectedIdsRef.current, 1),
+      onSendBackward: () => moveZ(selectedIdsRef.current, -1),
+      onBringToFront: () => moveZExtreme(selectedIdsRef.current, true),
+      onSendToBack: () => moveZExtreme(selectedIdsRef.current, false),
+      onGroup: handleGroupSelected,
+      onUngroup: handleUngroupSelected,
+      onAlign: handleAlignSelected,
+      onCenterOnScreen: handleCenterSelected,
+      onDistribute: handleDistributeSelected,
+      onMatchSize: handleMatchSizeSelected,
+      onFlip: handleFlipSelected,
+      onRotate90: handleRotate90Selected,
+      onTextAlign: (align) =>
+        patchSelectedLayers((l) => (l.text ? { ...l, text: { ...l.text, align } } : l), "discrete"),
+      onTextCase: (mode: TextCaseMode) =>
+        patchSelectedLayers(
+          (l) =>
+            l.text ? { ...l, text: { ...l.text, content: transformTextCase(l.text.content, mode) } } : l,
+          "discrete"
+        ),
+      onTextEditFx: () => {
+        const primary = findLayerById(projectRef.current.layers, selectedLayerIdRef.current);
+        if (!primary?.text) return;
+        setFxTarget({
+          label: "Conteúdo / Fórmula",
+          initialExpr: primary.text.content,
+          fallback: primary.text.content,
+          onApply: (expr) =>
+            patchLayer(primary.id, (l) => ({ ...l, text: { ...l.text!, content: expr } }), "discrete"),
+          onClear: () =>
+            patchLayer(primary.id, (l) => ({ ...l, text: { ...l.text!, content: "18:45" } }), "discrete"),
+        });
+      },
+      onTextResetStretch: () =>
+        patchSelectedLayers(
+          (l) => (l.text ? { ...l, text: { ...l.text, stemStretch: 1 } } : l),
+          "discrete"
+        ),
+      onTextAutoWidth: () =>
+        patchSelectedLayers(
+          (l) => {
+            if (!l.text) return l;
+            const nextText = { ...l.text };
+            delete nextText.maxWidth;
+            return { ...l, text: nextText };
+          },
+          "discrete"
+        ),
+      onMediaFit: (fit) =>
+        patchSelectedLayers(
+          (l) => {
+            if (l.image) return { ...l, image: { ...l.image, objectFit: fit } };
+            if (l.video) return { ...l, video: { ...l.video, objectFit: fit } };
+            return l;
+          },
+          "discrete"
+        ),
+      onMediaRadius: (radius) =>
+        patchSelectedLayers(
+          (l) => {
+            if (l.image) return { ...l, image: { ...l.image, borderRadius: radius } };
+            if (l.video) return { ...l, video: { ...l.video, clipRadius: radius } };
+            return l;
+          },
+          "discrete"
+        ),
+      onMediaPickFile: (kind) => void pickFileForLayer(kind),
+      onImageToggleMediaCover: () =>
+        patchSelectedLayers(
+          (l) => {
+            if (!l.image) return l;
+            const nextMode = l.image.sourceMode === "MEDIA_COVER" ? "FILE" : "MEDIA_COVER";
+            return {
+              ...l,
+              image: {
+                ...l.image,
+                sourceMode: nextMode,
+                objectFit: nextMode === "MEDIA_COVER" ? "cover" : l.image.objectFit,
+              },
+            };
+          },
+          "discrete"
+        ),
+      onScene3DOpenRoom: () => setViewMode("ROOM"),
+      onScene3DResetCamera: () => {
+        const primaryId = selectedLayerIdRef.current;
+        if (!primaryId) return;
+        const freshCam = defaultScene3D().camera;
+        patchLayer(
+          primaryId,
+          (l) => ({
+            ...l,
+            scene3d: { ...(l.scene3d ?? defaultScene3D()), camera: freshCam },
+          }),
+          "discrete"
+        );
+        flashHint("Câmera 3D centralizada");
+      },
+      onScene3DResetTransform: () => {
+        const primaryId = selectedLayerIdRef.current;
+        if (!primaryId) return;
+        patchLayer(
+          primaryId,
+          (l) => {
+            const s3d = l.scene3d ?? defaultScene3D();
+            const objs = normalizeScene3DObjects(s3d);
+            const activeId = selected3dObjectIdRef.current ?? objs[0]?.id;
+            return {
+              ...l,
+              scene3d: {
+                ...s3d,
+                objects: objs.map((o) =>
+                  o.id === activeId
+                    ? { ...o, position: [0, 0, 0], rotation: [0, 0, 0], scale: [1, 1, 1] }
+                    : o
+                ),
+              },
+            };
+          },
+          "discrete"
+        );
+        flashHint("Transformação do objeto 3D resetada");
+      },
+      onGlassPreset: (presetIndex) => {
+        const preset = GLASS_STYLE_PRESETS[presetIndex];
+        if (!preset) return;
+        patchSelectedLayers(
+          (l) => ({ ...l, glass: { ...l.glass, ...preset.patch, enabled: true } }),
+          "discrete"
+        );
+      },
+      onGlassReset: () =>
+        patchSelectedLayers(
+          (l) => ({ ...l, glass: defaultGlass(l.kind === "GLASS" || l.glass.enabled) }),
+          "discrete"
+        ),
+      onProgressSource: (source) =>
+        patchSelectedLayers(
+          (l) => (l.progress ? { ...l, progress: { ...l.progress, source } } : l),
+          "discrete"
+        ),
+      onAddNewLayer: (kind) => addNewLayer(kind),
+      onOpenSceneSettings: () => {
+        setPanelOpen((open) => {
+          if (!open) writePanelOpen(typeof window === "undefined" ? null : window.localStorage, true);
+          return true;
+        });
+        setInspectorMode("SCENE");
+      },
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      deleteLayers,
+      duplicateLayers,
+      flashHint,
+      handleAlignSelected,
+      handleCenterSelected,
+      handleCopy,
+      handleCopyStyle,
+      handleCut,
+      handleDistributeSelected,
+      handleFlipSelected,
+      handleGroupSelected,
+      handleMatchSizeSelected,
+      handlePaste,
+      handlePasteStyle,
+      handleRotate90Selected,
+      handleToggleHiddenSelected,
+      handleToggleLockSelected,
+      handleUngroupSelected,
+      moveZ,
+      moveZExtreme,
+      patchLayer,
+      patchSelectedLayers,
+      setViewMode,
+      startRenameSelected,
+    ]
   );
 
   return (
@@ -1999,6 +2519,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onSelectLayer={(id, modifiers) => handleSelectLayer(id, modifiers)}
             onMoveLayer={(id, x, y) => patchLayerRaw(id, (l) => ({ ...l, x, y }))}
             onMoveLayers={patchMultiplePositionsRaw}
+            onDuplicateForDrag={duplicateForCanvasDrag}
+            onContextMenuCanvas={openContextMenuAt}
             onResizeLayer={(id, patch) =>
               patchLayerRaw(id, (l) => {
                 if (l.kind === "TEXT" && l.text) {
@@ -2219,6 +2741,60 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           )}
           </div>
         </div>
+
+        {/* Pílula de vidro abaixo do canvas: modo de multiseleção (Etapa 5) */}
+        <AnimatePresence initial={false}>
+          {validSelectedIds.length >= 2 && !room3dMode && !test3dMode && (
+            <motion.div
+              {...POP}
+              role="status"
+              aria-live="polite"
+              className="pointer-events-auto absolute bottom-3 left-1/2 -translate-x-1/2 z-30 prism-glass-pop !rounded-full pl-3.5 pr-1.5 py-1 flex items-center gap-2 text-[11px] text-white"
+            >
+              <span className="h-2 w-2 rounded-full bg-white/90 shrink-0" />
+              <span className="text-white/90 whitespace-nowrap">
+                Modo de multiseleção ·{" "}
+                <strong className="font-medium text-white">
+                  {formatMultiSelectionSummary(mergedSelection)}
+                </strong>
+              </span>
+              <span className="h-3.5 w-px bg-white/15 mx-0.5" />
+              <button
+                type="button"
+                onClick={handleCenterSelected}
+                title="Centralizar seleção na tela"
+                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+              >
+                <Crosshair className="w-3 h-3" /> Centralizar
+              </button>
+              <button
+                type="button"
+                onClick={handleGroupSelected}
+                title="Agrupar selecionadas (Ctrl+G)"
+                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+              >
+                <FolderPlus className="w-3 h-3" /> Agrupar
+              </button>
+              <button
+                type="button"
+                onClick={() => duplicateLayers(validSelectedIds)}
+                title="Duplicar selecionadas (Ctrl+D)"
+                className="rounded-full px-2.5 py-1 text-[10px] text-white/85 hover:bg-white/15 hover:text-white flex items-center gap-1"
+              >
+                <Copy className="w-3 h-3" /> Duplicar
+              </button>
+              <button
+                type="button"
+                aria-label="Limpar seleção (Esc)"
+                title="Limpar seleção (Esc)"
+                onClick={() => setSelectedIds([])}
+                className="rounded-full p-1 text-[#A1A1AA] hover:bg-white/15 hover:text-white"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       {/* PAINEL ÚNICO (direita): propriedades em cima, camadas embaixo, divisória arrastável.
@@ -2233,6 +2809,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         mode={inspectorMode}
         onModeChange={setInspectorMode}
         selectedLayer={selectedLayer}
+        selectedLayers={selectedLayers}
         selectedParent={selectedParent}
         scene3dInfo={selectedLayer ? scene3dInspectMap[selectedLayer.id] ?? null : null}
         selected3dObjectId={selected3dObjectId}
@@ -2251,6 +2828,13 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         systemFonts={systemFonts}
         onSelectLayer={(id) => handleSelectLayer(id)}
         onPatchLayer={patchLayer}
+        onPatchSelectedLayers={patchSelectedLayers}
+        onAlignSelected={handleAlignSelected}
+        onCenterSelected={handleCenterSelected}
+        onDistributeSelected={handleDistributeSelected}
+        onMatchSizeSelected={handleMatchSizeSelected}
+        onFlipSelected={handleFlipSelected}
+        onRotate90Selected={handleRotate90Selected}
         onAddChildToGroup={addChildToGroup}
         onApplyDiscreteProject={applyDiscreteChange}
         onApplyCoalescedProject={applyCoalescedChange}
@@ -2310,6 +2894,19 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       />
         }
       />
+      )}
+
+      {/* Menu de botão direito: só monta quando aberto (Etapa 8) */}
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          selectedLayers={selectedLayers}
+          hasClipboard={hasClipboard}
+          hasCopiedStyle={hasCopiedStyle}
+          actions={contextMenuActions}
+          onClose={() => setContextMenu(null)}
+        />
       )}
 
       <AnimatePresence>

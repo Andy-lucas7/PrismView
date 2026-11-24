@@ -550,6 +550,10 @@ pub struct LayerNode {
     pub offset_y_px: StaticOrFx<f32>,
     #[serde(default)]
     pub rotation_deg: StaticOrFx<f32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip_x: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flip_y: bool,
     #[serde(default = "default_one_fx")]
     pub scale: StaticOrFx<f32>,
     #[serde(default = "default_one_fx")]
@@ -684,6 +688,8 @@ impl Default for LayerNode {
             offset_x_px: StaticOrFx::Static(0.0),
             offset_y_px: StaticOrFx::Static(0.0),
             rotation_deg: StaticOrFx::Static(0.0),
+            flip_x: false,
+            flip_y: false,
             scale: default_one_fx(),
             opacity: default_one_fx(),
             visible: default_true_fx(),

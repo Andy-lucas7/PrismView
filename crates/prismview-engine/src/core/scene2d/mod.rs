@@ -338,13 +338,14 @@ impl SceneRenderer {
                     t: b.parent_t,
                 };
                 let xf = |fx: &LayerFx| {
-                    parent.child(
+                    parent.child_flipped(
                         [
                             b.center_base[0] + fx.offset[0] * b.ui,
                             b.center_base[1] + fx.offset[1] * b.ui,
                         ],
                         b.rot_base + fx.rotation_deg.to_radians(),
                         b.scale_base * (1.0 + fx.scale),
+                        b.flip,
                     )
                 };
                 let Some(inv0) = xf(&b.fx0).inverse() else {

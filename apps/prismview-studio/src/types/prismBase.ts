@@ -312,6 +312,8 @@ export interface SceneLayer {
   width: number; // px in logical space (1920x1080 for wallpaper, widget w x h for widget)
   height: number;
   rotation: number;
+  flipX?: boolean;
+  flipY?: boolean;
   opacity: number;
   blendMode: BlendModeCss;
   hidden: boolean;

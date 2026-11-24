@@ -25,11 +25,24 @@ impl Affine {
         ]
     }
 
-    /// `self ∘ T(center) ∘ R(rot) ∘ S(scale)`: nó filho posicionado em `center` (espaço do pai).
+    /// `self ∘ T(center) ∘ R(rot) ∘ S(sx, sy)`: nó filho posicionado em `center` (espaço do pai).
     pub(super) fn child(&self, center: [f32; 2], rot: f32, scale: f32) -> Self {
+        self.child_flipped(center, rot, scale, [false, false])
+    }
+
+    /// Variante de `child` com espelhamento local horizontal/vertical (`flip = [flip_x, flip_y]`).
+    pub(super) fn child_flipped(
+        &self,
+        center: [f32; 2],
+        rot: f32,
+        scale: f32,
+        flip: [bool; 2],
+    ) -> Self {
+        let sx = if flip[0] { -scale } else { scale };
+        let sy = if flip[1] { -scale } else { scale };
         let (sn, cs) = rot.sin_cos();
-        let (c0, c1) = (cs * scale, sn * scale); // coluna X de R·S
-        let (c2, c3) = (-sn * scale, cs * scale); // coluna Y de R·S
+        let (c0, c1) = (cs * sx, sn * sx); // coluna X de R·S
+        let (c2, c3) = (-sn * sy, cs * sy); // coluna Y de R·S
         let m = &self.m;
         Self {
             m: [

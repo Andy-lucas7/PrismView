@@ -466,7 +466,8 @@ impl Frame<'_> {
             }
         };
         let rot = (self.f(&layer.rotation_deg) + fx.rotation_deg).to_radians();
-        let xf = parent_xf.child(center, rot, scale);
+        let flip = [layer.flip_x, layer.flip_y];
+        let xf = parent_xf.child_flipped(center, rot, scale, flip);
         // Parâmetros sem o delta do binding (o caminho rápido recompõe com o delta novo).
         let bound_base = bound.then(|| {
             (
@@ -531,6 +532,7 @@ impl Frame<'_> {
                 center_base,
                 rot_base,
                 scale_base: base_scale,
+                flip,
                 ui,
                 fx0: fx,
                 moving0: own_moving,

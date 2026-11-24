@@ -25,7 +25,8 @@ import { warpGlyphMaps } from "../utils/stemGlyphMaps";
 // Type-only: keeps the 3D engine in its own lazy chunk
 import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3DLayer";
 
-import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, snapCoordinate, supportsCorsUrl } from "./UnifiedCompositorParts";
+import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, supportsCorsUrl } from "./UnifiedCompositorParts";
+import { snapAxisInto, type SnapAxisBuffer } from "../utils/align";
 
 export type LayerResizePatch = {
   width?: number;
@@ -62,8 +63,12 @@ export interface UnifiedCompositorProps {
   ) => void;
   onMoveLayer?: (id: string, x: number, y: number) => void;
   onMoveLayers?: (moves: Array<{ id: string; x: number; y: number }>) => void;
+  /** Alt+arrastar no canvas: clona as camadas no lugar e retorna os novos IDs na mesma ordem. */
+  onDuplicateForDrag?: (ids: string[]) => string[];
   onResizeLayer?: (id: string, patch: LayerResizePatch) => void;
   onDragStateChange?: (dragging: boolean) => void;
+  /** Menu de botão direito no canvas (um único listener no container raiz). */
+  onContextMenuCanvas?: (layerId: string | null, clientX: number, clientY: number) => void;
   onInspectScene3D?: (layerId: string, info: Scene3DInspectInfo) => void;
   onHoverMesh3D?: (meshName: string | null) => void;
   /** Energy governor state forwarded to every 3D layer */
@@ -93,8 +98,10 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
   onSelectLayer,
   onMoveLayer,
   onMoveLayers,
+  onDuplicateForDrag,
   onResizeLayer,
   onDragStateChange,
+  onContextMenuCanvas,
   onInspectScene3D,
   onHoverMesh3D,
   powerState = "NORMAL",
@@ -195,8 +202,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     snapTargetsY: number[];
     moved: boolean;
     wasAlreadyInMulti: boolean;
+    altDuplicatePending?: boolean;
+    altDuplicated?: boolean;
     multiPeers?: Array<{ id: string; startX: number; startY: number }>;
   } | null>(null);
+  const snapBufXRef = useRef<SnapAxisBuffer>({ snapped: 0.5, guide: null });
+  const snapBufYRef = useRef<SnapAxisBuffer>({ snapped: 0.5, guide: null });
   const dragMoveRafRef = useRef<number | null>(null);
   const pendingDragMoveRef = useRef<{
     clientX: number;
@@ -402,18 +413,56 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       Math.hypot(pending.clientX - drag.startClientX, pending.clientY - drag.startClientY) >= 3
     ) {
       drag.moved = true;
+      // Alt+Arrastar: clona os itens arrastados 1× no início do movimento e passa a mover as cópias.
+      if (drag.mode === "MOVE" && drag.altDuplicatePending && !drag.altDuplicated && onDuplicateForDrag) {
+        drag.altDuplicated = true;
+        // Inclui a própria posição original como alvo de guia inteligente para alinhar a cópia à origem!
+        drag.snapTargetsX.push(drag.startX);
+        drag.snapTargetsY.push(drag.startY);
+        if (drag.halfW > 0.002) {
+          drag.snapTargetsX.push(
+            Math.max(0, drag.startX - drag.halfW),
+            Math.min(1, drag.startX + drag.halfW)
+          );
+        }
+        if (drag.halfH > 0.002) {
+          drag.snapTargetsY.push(
+            Math.max(0, drag.startY - drag.halfH),
+            Math.min(1, drag.startY + drag.halfH)
+          );
+        }
+        const sourceIds =
+          drag.multiPeers && drag.multiPeers.length > 1
+            ? drag.multiPeers.map((p) => p.id)
+            : [drag.id];
+        const clonedIds = onDuplicateForDrag(sourceIds);
+        if (clonedIds.length === sourceIds.length && clonedIds.length > 0) {
+          const primaryIdx = Math.max(0, sourceIds.indexOf(drag.id));
+          drag.id = clonedIds[primaryIdx] ?? clonedIds[0];
+          if (drag.multiPeers && drag.multiPeers.length > 1) {
+            drag.multiPeers = drag.multiPeers.map((p, idx) => ({
+              ...p,
+              id: clonedIds[idx] ?? p.id,
+            }));
+          }
+        }
+      }
     }
 
     if (drag.mode === "MOVE" && (onMoveLayers || onMoveLayer)) {
       const cw = Math.max(drag.containerW, 1);
       const ch = Math.max(drag.containerH, 1);
-      const dx = (pending.clientX - drag.startClientX) / cw;
-      const dy = (pending.clientY - drag.startClientY) / ch;
+      let dx = (pending.clientX - drag.startClientX) / cw;
+      let dy = (pending.clientY - drag.startClientY) / ch;
+      // Shift durante movimento trava no eixo predominante (horizontal ou vertical).
+      if (pending.shiftKey) {
+        if (Math.abs(dx) >= Math.abs(dy)) dy = 0;
+        else dx = 0;
+      }
       const rawX = Math.max(0, Math.min(1, drag.startX + dx));
       const rawY = Math.max(0, Math.min(1, drag.startY + dy));
-      const threshold = pending.altKey ? 0 : 0.012;
-      const snapX = snapCoordinate(rawX, drag.halfW, drag.snapTargetsX, threshold);
-      const snapY = snapCoordinate(rawY, drag.halfH, drag.snapTargetsY, threshold);
+      const snapX = snapAxisInto(snapBufXRef.current, rawX, drag.halfW, drag.snapTargetsX, 0.012);
+      const snapY = snapAxisInto(snapBufYRef.current, rawY, drag.halfH, drag.snapTargetsY, 0.012);
       const gx = drag.isTopLevel ? snapX.guide : null;
       const gy = drag.isTopLevel ? snapY.guide : null;
       // 4.6: pointermove fires constantly; only re-render the tree when a guide actually changes.
@@ -449,7 +498,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         const startBoxH = Math.max(24, drag.startBoxH ?? startFont * 1.1);
         const startMaxW = drag.startTextMaxW ?? 0;
 
-        if (handle === "e" || handle === "w") {
+        if ((handle === "e" || handle === "w") && !pending.shiftKey) {
           // Alças laterais (estilo Canva): mudam APENAS a largura da caixa (quebra de linha), sem alterar a fonte.
           const rawW = Math.max(60, Math.min(2400, Math.round(startBoxW + signX * dxLog * 2)));
           const natW = drag.naturalTextW ?? 0;
@@ -460,7 +509,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             onResizeLayer(drag.id, { textMaxWidth: rawW });
           }
         } else {
-          // Alças de canto (estilo Canva): escalam proporcionalmente fonte + largura da caixa mantendo as mesmas quebras!
+          // Alças de canto ou Shift: escalam proporcionalmente fonte + largura da caixa mantendo as mesmas quebras!
           const diag = Math.hypot(startBoxW, startBoxH);
           const proj = (signX * dxLog * 2 * startBoxW + signY * dyLog * 2 * startBoxH) / Math.max(diag, 1);
           const ratio = Math.max(0.15, (diag + proj) / Math.max(diag, 1));
@@ -473,21 +522,26 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             onResizeLayer(drag.id, { fontSize: nextFont });
           }
         }
-      } else if (handle === "e" || handle === "w") {
+      } else if ((handle === "e" || handle === "w") && !pending.shiftKey) {
         const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
         onResizeLayer(drag.id, { width: nw });
-      } else if (handle === "n" || handle === "s") {
+      } else if ((handle === "n" || handle === "s") && !pending.shiftKey) {
         const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
         onResizeLayer(drag.id, { height: nh });
-      } else if (pending.shiftKey) {
-        // Shift no canto = redimensionamento livre nos dois eixos.
+      } else if (pending.altKey && !pending.shiftKey) {
+        // Alt no canto = redimensionamento livre nos dois eixos; Shift sempre mantém a proporção!
         const nw = Math.max(24, Math.min(2400, Math.round(drag.startW + signX * dxLog * 2)));
         const nh = Math.max(20, Math.min(1400, Math.round(drag.startH + signY * dyLog * 2)));
         onResizeLayer(drag.id, { width: nw, height: nh });
       } else {
-        // Canto (estilo Canva): mantém a proporção exata da caixa.
+        // Canto ou Shift: mantém a proporção exata da caixa.
         const diag = Math.hypot(drag.startW, drag.startH);
-        const proj = (signX * dxLog * 2 * drag.startW + signY * dyLog * 2 * drag.startH) / Math.max(diag, 1);
+        const proj =
+          handle === "e" || handle === "w"
+            ? ((drag.startW + signX * dxLog * 2) / Math.max(drag.startW, 1) - 1) * diag
+            : handle === "n" || handle === "s"
+            ? ((drag.startH + signY * dyLog * 2) / Math.max(drag.startH, 1) - 1) * diag
+            : (signX * dxLog * 2 * drag.startW + signY * dyLog * 2 * drag.startH) / Math.max(diag, 1);
         const ratio = Math.max(0.1, (diag + proj) / Math.max(diag, 1));
         const nw = Math.max(24, Math.min(2400, Math.round(drag.startW * ratio)));
         const nh = Math.max(20, Math.min(1400, Math.round(drag.startH * ratio)));
@@ -537,8 +591,11 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       dragRef.current = null;
       setSnapGuide((prev) => (prev.x === null && prev.y === null ? prev : { x: null, y: null }));
       onDragStateChange?.(false);
-      // Clicking an item inside a multi-selection without dragging collapses selection to just that item
-      if (finished.mode === "MOVE" && !finished.moved && finished.wasAlreadyInMulti) {
+      // Alt+Clique sem arrastar preserva o comportamento de selecionar filho / desmarcar item
+      if (finished.mode === "MOVE" && !finished.moved && finished.altDuplicatePending) {
+        onSelectLayer?.(finished.id, { altKey: true });
+      } else if (finished.mode === "MOVE" && !finished.moved && finished.wasAlreadyInMulti) {
+        // Clique simples em item já dentro de multiseleção sem arrastar recolhe para apenas este item
         onSelectLayer?.(finished.id);
       }
     }
@@ -830,9 +887,15 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       lite || isTransparentWidget || resolvedBackdrop.hasIntermediateHtml || !resolvedBackdrop.backdrop;
     const glyphUseCssFallback = lite || isTransparentWidget || !resolvedBackdrop.backdrop;
 
+    const flipScale =
+      layer.flipX || layer.flipY
+        ? ` scale(${layer.flipX ? -1 : 1}, ${layer.flipY ? -1 : 1})`
+        : "";
+
     return (
       <div
         key={layer.id}
+        data-layer-id={layer.id}
         ref={(el) => {
           if (el) {
             layerElsRef.current.set(layer.id, el);
@@ -841,8 +904,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           }
         }}
         onPointerDown={(e) => {
-          if (!interactive || test3dMode || roomActive) return;
-          const isModSelect = e.ctrlKey || e.metaKey || e.altKey;
+          if (!interactive || test3dMode || roomActive || e.button !== 0) return;
+          const isCtrlSelect = e.ctrlKey || e.metaKey;
           // Allow direct child selection with Alt+Click or when already selected
           if (!isTopLevel && !selectedSet.has(layer.id) && !e.altKey) return;
           e.stopPropagation();
@@ -850,26 +913,28 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           // Camada bloqueada continua sólida para o clique (seleciona, nunca deixa o clique atravessar
           // para o item de baixo), mas não inicia arraste.
           if (layer.locked) {
-            if (isModSelect || !selectedSet.has(layer.id)) {
+            if (isCtrlSelect || e.altKey || !selectedSet.has(layer.id)) {
               onSelectLayer?.(layer.id, {
-                ctrlKey: e.ctrlKey || e.metaKey,
+                ctrlKey: isCtrlSelect,
                 altKey: e.altKey,
               });
             }
             return;
           }
 
-          if (isModSelect) {
+          if (isCtrlSelect) {
             onSelectLayer?.(layer.id, {
-              ctrlKey: e.ctrlKey || e.metaKey,
+              ctrlKey: true,
               altKey: e.altKey,
             });
             return;
           }
 
-          const wasAlreadyInMulti = selectedSet.has(layer.id) && selectedSet.size > 1;
-          // Preserve multi-selection when starting a drag on an already-selected layer
-          if (!selectedSet.has(layer.id)) {
+          const altDuplicatePending = Boolean(e.altKey);
+          const wasAlreadyInMulti = !altDuplicatePending && selectedSet.has(layer.id) && selectedSet.size > 1;
+          // Preserve multi-selection when starting a drag on an already-selected layer;
+          // with Alt held on an unselected item, wait to see if user drags (>=3px = duplicate) or clicks (Alt+Click).
+          if (!altDuplicatePending && !selectedSet.has(layer.id)) {
             onSelectLayer?.(layer.id);
           }
 
@@ -910,6 +975,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
             snapTargetsY: targets.y,
             moved: false,
             wasAlreadyInMulti,
+            altDuplicatePending,
+            altDuplicated: false,
             multiPeers: activePeers.length > 1 ? activePeers : undefined,
           };
           onDragStateChange?.(true);
@@ -944,8 +1011,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           left: `${(layer.x * 100).toFixed(3)}%`,
           top: `${(layer.y * 100).toFixed(3)}%`,
           transform: hasParallax
-            ? `translate(-50%, -50%) translate3d(calc(var(--px, 0) * ${maxPx}px), calc(var(--py, 0) * ${maxPy}px), 0) rotate(${rotation}deg)`
-            : `translate(-50%, -50%) rotate(${rotation}deg)`,
+            ? `translate(-50%, -50%) translate3d(calc(var(--px, 0) * ${maxPx}px), calc(var(--py, 0) * ${maxPy}px), 0) rotate(${rotation}deg)${flipScale}`
+            : `translate(-50%, -50%) rotate(${rotation}deg)${flipScale}`,
           // Never create a CSS Backdrop Root on an ancestor of a backdrop-filter glass surface
           opacity: g.enabled ? undefined : opacity,
           mixBlendMode: g.enabled ? undefined : layer.blendMode,
@@ -1530,7 +1597,10 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
 
         {/* Interactive Selection Box + Canva-style Handles (corners = proportional, sides = width/height) */}
         {isSelected && !test3dMode && !roomActive && (
-          <>
+          <div
+            className="pointer-events-none absolute inset-0 z-40"
+            style={flipScale ? { transform: flipScale } : undefined}
+          >
             <div
               className={`pointer-events-none absolute -inset-1.5 rounded-xl border ${
                 isPrimarySelected
@@ -1619,13 +1689,13 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                       key={c.id}
                       type="button"
                       aria-label="Redimensionar proporcionalmente"
-                      title={
+                       title={
                         layer.kind === "TEXT"
                           ? "Arraste o canto para aumentar ou diminuir o texto mantendo a proporção"
-                          : "Arraste o canto para escalar proporcionalmente (Shift = livre)"
+                          : "Arraste o canto para escalar proporcionalmente (Shift mantém proporção · Alt = livre)"
                       }
                       onPointerDown={(e) => startResize(c.id, e)}
-                      className={`absolute ${c.cls} w-3 h-3 rounded-full bg-white border-2 border-black shadow-md ${c.cursor} z-40 hover:scale-125 transition-transform`}
+                      className={`pointer-events-auto absolute ${c.cls} w-3 h-3 rounded-full bg-white border-2 border-black shadow-md ${c.cursor} z-40 hover:scale-125 transition-transform`}
                     />
                   ))}
                   {showSideHorizontal && (
@@ -1636,7 +1706,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                         title={
                           layer.kind === "TEXT"
                             ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
-                            : "Arraste para ajustar a largura"
+                            : "Arraste para ajustar a largura (Shift mantém proporção)"
                         }
                         onPointerDown={(e) => startResize("w", e)}
                         onDoubleClick={(e) => {
@@ -1644,7 +1714,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                           e.stopPropagation();
                           onResizeLayer(layer.id, { textMaxWidth: null });
                         }}
-                        className="absolute -left-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                        className="pointer-events-auto absolute -left-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
                       />
                       <button
                         type="button"
@@ -1652,7 +1722,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                         title={
                           layer.kind === "TEXT"
                             ? "Arraste para ajustar a largura da caixa (duplo clique = linha única)"
-                            : "Arraste para ajustar a largura"
+                            : "Arraste para ajustar a largura (Shift mantém proporção)"
                         }
                         onPointerDown={(e) => startResize("e", e)}
                         onDoubleClick={(e) => {
@@ -1660,7 +1730,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                           e.stopPropagation();
                           onResizeLayer(layer.id, { textMaxWidth: null });
                         }}
-                        className="absolute -right-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
+                        className="pointer-events-auto absolute -right-2.5 top-1/2 -translate-y-1/2 w-1.5 h-6 rounded-full bg-white border border-black/80 shadow-md cursor-ew-resize z-40 hover:scale-y-110 transition-transform"
                       />
                     </>
                   )}
@@ -1669,23 +1739,23 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                       <button
                         type="button"
                         aria-label="Ajustar altura"
-                        title="Arraste para ajustar a altura"
+                        title="Arraste para ajustar a altura (Shift mantém proporção)"
                         onPointerDown={(e) => startResize("n", e)}
-                        className="absolute -top-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                        className="pointer-events-auto absolute -top-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
                       />
                       <button
                         type="button"
                         aria-label="Ajustar altura"
-                        title="Arraste para ajustar a altura"
+                        title="Arraste para ajustar a altura (Shift mantém proporção)"
                         onPointerDown={(e) => startResize("s", e)}
-                        className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
+                        className="pointer-events-auto absolute -bottom-2.5 left-1/2 -translate-x-1/2 h-1.5 w-6 rounded-full bg-white border border-black/80 shadow-md cursor-ns-resize z-40 hover:scale-x-110 transition-transform"
                       />
                     </>
                   )}
                 </>
               );
             })()}
-          </>
+          </div>
         )}
       </div>
     );
@@ -1736,6 +1806,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           selectionKey,
           selectedLayerId,
           onSelectLayer,
+          onDuplicateForDrag,
           onResizeLayer,
           onDragStateChange,
           onInspectScene3D,
@@ -1758,6 +1829,13 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
           previewCursorRef.current = [0.5, 0.5];
           previewTickSubsRef.current.forEach((cb) => cb());
         }
+      }}
+      onContextMenu={(e) => {
+        if (!interactive || roomActive || test3dMode || !onContextMenuCanvas) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const targetEl = (e.target as HTMLElement | null)?.closest<HTMLElement>("[data-layer-id]");
+        onContextMenuCanvas(targetEl?.dataset.layerId ?? null, e.clientX, e.clientY);
       }}
       onClick={(e) => {
         if (!interactive) return;

@@ -3,21 +3,36 @@ import { Select, ColorInput } from "./ui/Controls";
 import { AnimatePresence, motion } from "framer-motion";
 import { COLLAPSE, TAB_LITE } from "./motion/Presence";
 import type { NativeCompatIssue } from "../utils/nativeCompat";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   AlignCenter,
+  AlignCenterHorizontal,
+  AlignCenterVertical,
+  AlignEndHorizontal,
+  AlignEndVertical,
+  AlignHorizontalSpaceAround,
   AlignLeft,
   AlignRight,
+  AlignStartHorizontal,
+  AlignStartVertical,
+  AlignVerticalSpaceAround,
   Copy,
+  Crosshair,
   Eye,
   EyeOff,
+  FlipHorizontal2,
+  FlipVertical2,
+  Lock,
   Palette,
   Plus,
+  RotateCcw,
+  RotateCw,
   Search,
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  Unlock,
   Upload,
   Variable,
 } from "lucide-react";
@@ -70,6 +85,13 @@ import type { Scene3DEditorApi } from "./Scene3DLayer";
 import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
 import { BindingTargetOption, BindingTargetPicker, InspectorSlider, Vec3Field } from "./InspectorControls";
+import {
+  formatMultiSelectionSummary,
+  LAYER_KIND_LABELS,
+  mergeProps,
+  transformTextCase,
+} from "../utils/multiSelect";
+import type { AlignMode, DistributeAxis, FlipAxis, MatchSizeMode } from "../utils/align";
 
 function toHexColorInput(raw?: string, fallback = "#FFFFFF"): string {
   const s = (raw || "").trim();
@@ -143,6 +165,7 @@ export interface StudioInspectorProps {
   mode: InspectorMode;
   onModeChange: (mode: InspectorMode) => void;
   selectedLayer: SceneLayer | null;
+  selectedLayers?: SceneLayer[];
   selectedParent: SceneLayer | null;
   scene3dInfo?: Scene3DInspectInfo | null;
   selected3dObjectId?: string | null;
@@ -167,6 +190,16 @@ export interface StudioInspectorProps {
     fn: (l: SceneLayer) => SceneLayer,
     commit?: "raw" | "discrete" | "coalesced"
   ) => void;
+  onPatchSelectedLayers?: (
+    fn: (l: SceneLayer) => SceneLayer,
+    commit?: "raw" | "discrete" | "coalesced"
+  ) => void;
+  onAlignSelected?: (mode: AlignMode, reference: "screen" | "selection") => void;
+  onCenterSelected?: () => void;
+  onDistributeSelected?: (axis: DistributeAxis) => void;
+  onMatchSizeSelected?: (mode: MatchSizeMode) => void;
+  onFlipSelected?: (axis: FlipAxis) => void;
+  onRotate90Selected?: (dir: 1 | -1) => void;
   onAddChildToGroup: (groupId: string, kind: LayerKind) => void;
   onApplyDiscreteProject: (next: PrismProject) => void;
   onApplyCoalescedProject: (next: PrismProject) => void;
@@ -186,6 +219,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   mode,
   onModeChange,
   selectedLayer,
+  selectedLayers,
   selectedParent,
   scene3dInfo = null,
   selected3dObjectId = null,
@@ -204,6 +238,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   systemFonts,
   onSelectLayer,
   onPatchLayer,
+  onPatchSelectedLayers,
+  onAlignSelected,
+  onCenterSelected,
+  onDistributeSelected,
+  onMatchSizeSelected,
+  onFlipSelected,
+  onRotate90Selected,
   onAddChildToGroup,
   onApplyDiscreteProject,
   onApplyCoalescedProject,
@@ -280,6 +321,200 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
     onCommitTx,
     onRecordStep,
     onFlushSave,
+  };
+
+  const effectiveLayers = useMemo<SceneLayer[]>(
+    () =>
+      selectedLayers && selectedLayers.length > 0
+        ? selectedLayers
+        : selectedLayer
+        ? [selectedLayer]
+        : [],
+    [selectedLayers, selectedLayer]
+  );
+  const isMulti = effectiveLayers.length >= 2;
+  const merged = useMemo(() => mergeProps(effectiveLayers), [effectiveLayers]);
+
+  const patchTarget = (
+    fn: (l: SceneLayer) => SceneLayer,
+    commit: "raw" | "discrete" | "coalesced" = "raw"
+  ) => {
+    if (isMulti && onPatchSelectedLayers) {
+      onPatchSelectedLayers(fn, commit);
+      return;
+    }
+    if (selectedLayer) {
+      onPatchLayer(selectedLayer.id, fn, commit);
+    }
+  };
+
+  const renderAlignAndTransformQuickBar = (count: number) => {
+    const ref: "screen" | "selection" = count >= 2 ? "selection" : "screen";
+    return (
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] text-[#A1A1AA]">
+            {count >= 2 ? "Alinhar entre Selecionados" : "Alinhar à Tela"}
+          </span>
+          {count >= 2 && onCenterSelected && (
+            <button
+              type="button"
+              onClick={onCenterSelected}
+              className="text-[10px] text-[#A1A1AA] hover:text-white underline-offset-2 hover:underline"
+            >
+              Centralizar na tela
+            </button>
+          )}
+        </div>
+        <div className="grid grid-cols-7 gap-1">
+          {(
+            [
+              { m: "left" as const, t: "Alinhar à esquerda", Icon: AlignStartVertical },
+              { m: "centerX" as const, t: "Centralizar na horizontal", Icon: AlignCenterVertical },
+              { m: "right" as const, t: "Alinhar à direita", Icon: AlignEndVertical },
+              { m: "top" as const, t: "Alinhar ao topo", Icon: AlignStartHorizontal },
+              { m: "centerY" as const, t: "Centralizar na vertical", Icon: AlignCenterHorizontal },
+              { m: "bottom" as const, t: "Alinhar à base", Icon: AlignEndHorizontal },
+            ] as const
+          ).map(({ m, t, Icon }) => (
+            <button
+              key={m}
+              type="button"
+              title={t}
+              aria-label={t}
+              onClick={() =>
+                onAlignSelected
+                  ? onAlignSelected(m, ref)
+                  : patchTarget(
+                      (l) => ({
+                        ...l,
+                        x: m === "left" ? 0.12 : m === "centerX" ? 0.5 : m === "right" ? 0.88 : l.x,
+                        y: m === "top" ? 0.14 : m === "centerY" ? 0.5 : m === "bottom" ? 0.86 : l.y,
+                      }),
+                      "discrete"
+                    )
+              }
+              className="prism-pill-idle grid h-7 place-items-center rounded-lg"
+            >
+              <Icon className="w-3.5 h-3.5" />
+            </button>
+          ))}
+          <button
+            type="button"
+            title="Centralizar na tela"
+            aria-label="Centralizar na tela"
+            onClick={() =>
+              onCenterSelected
+                ? onCenterSelected()
+                : patchTarget((l) => ({ ...l, x: 0.5, y: 0.5 }), "discrete")
+            }
+            className="prism-pill-idle grid h-7 place-items-center rounded-lg"
+          >
+            <Crosshair className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        <div className="grid grid-cols-4 gap-1">
+          <button
+            type="button"
+            title="Espelhar horizontalmente"
+            onClick={() =>
+              onFlipSelected
+                ? onFlipSelected("horizontal")
+                : patchTarget((l) => ({ ...l, flipX: !l.flipX }), "discrete")
+            }
+            className={`py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1 ${
+              !merged.common.flipX.mixed && merged.common.flipX.value
+                ? "prism-pill-active"
+                : "prism-pill-idle"
+            }`}
+          >
+            <FlipHorizontal2 className="w-3 h-3" /> Esp. H
+          </button>
+          <button
+            type="button"
+            title="Espelhar verticalmente"
+            onClick={() =>
+              onFlipSelected
+                ? onFlipSelected("vertical")
+                : patchTarget((l) => ({ ...l, flipY: !l.flipY }), "discrete")
+            }
+            className={`py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1 ${
+              !merged.common.flipY.mixed && merged.common.flipY.value
+                ? "prism-pill-active"
+                : "prism-pill-idle"
+            }`}
+          >
+            <FlipVertical2 className="w-3 h-3" /> Esp. V
+          </button>
+          <button
+            type="button"
+            title="Girar -90°"
+            onClick={() =>
+              onRotate90Selected
+                ? onRotate90Selected(-1)
+                : patchTarget((l) => ({ ...l, rotation: l.rotation - 90 }), "discrete")
+            }
+            className="prism-pill-idle py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1"
+          >
+            <RotateCcw className="w-3 h-3" /> -90°
+          </button>
+          <button
+            type="button"
+            title="Girar +90°"
+            onClick={() =>
+              onRotate90Selected
+                ? onRotate90Selected(1)
+                : patchTarget((l) => ({ ...l, rotation: l.rotation + 90 }), "discrete")
+            }
+            className="prism-pill-idle py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1"
+          >
+            <RotateCw className="w-3 h-3" /> +90°
+          </button>
+        </div>
+
+        {count >= 2 && (
+          <div className="grid grid-cols-2 gap-1">
+            {onMatchSizeSelected && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onMatchSizeSelected("width")}
+                  className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
+                >
+                  Igualar Largura
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onMatchSizeSelected("height")}
+                  className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
+                >
+                  Igualar Altura
+                </button>
+              </>
+            )}
+            {count >= 3 && onDistributeSelected && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onDistributeSelected("horizontal")}
+                  className="prism-pill-idle py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1"
+                >
+                  <AlignHorizontalSpaceAround className="w-3 h-3" /> Distribuir H
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDistributeSelected("vertical")}
+                  className="prism-pill-idle py-1.5 rounded-lg text-[10px] flex items-center justify-center gap-1"
+                >
+                  <AlignVerticalSpaceAround className="w-3 h-3" /> Distribuir V
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const renderSceneTab = () => {
@@ -572,10 +807,10 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   );
 
   const renderLayerTab = () => {
-    if (!selectedLayer) {
+    if (!selectedLayer || effectiveLayers.length === 0) {
       return (
         <div className="flex-1 flex flex-col items-center justify-center p-6 text-center text-xs text-[#A1A1AA] space-y-2">
-          <p>Selecione uma camada à esquerda ou clique no canvas.</p>
+          <p>Selecione uma camada na lista abaixo ou clique no canvas.</p>
           <button
             type="button"
             onClick={() => onModeChange("SCENE")}
@@ -587,15 +822,270 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
       );
     }
 
+    // Multiseleção de tipos mistos: exibe apenas as propriedades comuns a todos os itens selecionados.
+    if (isMulti && merged.sameKind === null) {
+      const anyNonText = effectiveLayers.some((l) => l.kind !== "TEXT");
+      return (
+        <div className="flex-1 flex flex-col min-h-0">
+          <div className="px-4 pt-3 pb-2.5 border-b border-white/10 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-mono-fx uppercase tracking-widest text-[#A1A1AA]">
+                {formatMultiSelectionSummary(merged)}
+              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  title="Mostrar / Ocultar selecionadas (Ctrl+Shift+H)"
+                  onClick={() =>
+                    patchTarget(
+                      (l) => ({ ...l, hidden: !effectiveLayers.every((it) => it.hidden) }),
+                      "discrete"
+                    )
+                  }
+                  className="p-1 rounded-lg bg-white/5 text-[#A1A1AA] hover:text-white"
+                >
+                  {effectiveLayers.every((it) => it.hidden) ? (
+                    <EyeOff className="w-3.5 h-3.5 text-white" />
+                  ) : (
+                    <Eye className="w-3.5 h-3.5" />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  title="Travar / Destravar selecionadas (Ctrl+L)"
+                  onClick={() =>
+                    patchTarget(
+                      (l) => ({ ...l, locked: !effectiveLayers.every((it) => it.locked) }),
+                      "discrete"
+                    )
+                  }
+                  className="p-1 rounded-lg bg-white/5 text-[#A1A1AA] hover:text-white"
+                >
+                  {effectiveLayers.every((it) => it.locked) ? (
+                    <Lock className="w-3.5 h-3.5 text-white" />
+                  ) : (
+                    <Unlock className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {merged.kinds.map((k) => (
+                <span
+                  key={k}
+                  className="px-2 py-0.5 rounded-full bg-white/[0.06] border border-white/10 text-[10px] text-[#A1A1AA]"
+                >
+                  {LAYER_KIND_LABELS[k]}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-3.5">
+            {renderAlignAndTransformQuickBar(merged.count)}
+
+            <div className="space-y-2.5 pt-2.5 border-t border-white/10">
+              <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">
+                Propriedades Comuns
+              </span>
+              <InspectorSlider
+                label="Opacidade"
+                value={merged.common.opacity.value}
+                mixed={merged.common.opacity.mixed}
+                min={0}
+                max={1}
+                step={0.02}
+                {...sliderHandlers}
+                onChange={(v) => patchTarget((l) => ({ ...l, opacity: v }))}
+              />
+
+              <label className="block text-xs text-[#A1A1AA]">
+                Blend Mode
+                <Select
+                  value={merged.common.blendMode.value}
+                  mixed={merged.common.blendMode.mixed}
+                  onChange={(e) =>
+                    patchTarget(
+                      (l) => ({ ...l, blendMode: e.target.value as BlendModeCss }),
+                      "discrete"
+                    )
+                  }
+                  className="mt-1 w-full bg-black border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
+                >
+                  {BLEND_MODES.map((bm) => (
+                    <option key={bm} value={bm}>
+                      {bm}
+                    </option>
+                  ))}
+                </Select>
+              </label>
+
+              <InspectorSlider
+                label="Posição X (Relativa)"
+                value={Number((merged.common.x.value * 100).toFixed(1))}
+                mixed={merged.common.x.mixed}
+                min={0}
+                max={100}
+                step={0.5}
+                unit="%"
+                {...sliderHandlers}
+                onChange={(v) => {
+                  const delta = v / 100 - merged.common.x.value;
+                  patchTarget((l) => ({
+                    ...l,
+                    x: Math.max(0, Math.min(1, Number((l.x + delta).toFixed(4)))),
+                  }));
+                }}
+              />
+              <InspectorSlider
+                label="Posição Y (Relativa)"
+                value={Number((merged.common.y.value * 100).toFixed(1))}
+                mixed={merged.common.y.mixed}
+                min={0}
+                max={100}
+                step={0.5}
+                unit="%"
+                {...sliderHandlers}
+                onChange={(v) => {
+                  const delta = v / 100 - merged.common.y.value;
+                  patchTarget((l) => ({
+                    ...l,
+                    y: Math.max(0, Math.min(1, Number((l.y + delta).toFixed(4)))),
+                  }));
+                }}
+              />
+
+              {anyNonText && (
+                <>
+                  <InspectorSlider
+                    label="Largura"
+                    value={merged.common.width.value}
+                    mixed={merged.common.width.mixed}
+                    min={8}
+                    max={2200}
+                    step={4}
+                    unit="px"
+                    {...sliderHandlers}
+                    onChange={(v) =>
+                      patchTarget((l) => (l.kind === "TEXT" ? l : { ...l, width: v }))
+                    }
+                  />
+                  <InspectorSlider
+                    label="Altura"
+                    value={merged.common.height.value}
+                    mixed={merged.common.height.mixed}
+                    min={8}
+                    max={1400}
+                    step={4}
+                    unit="px"
+                    {...sliderHandlers}
+                    onChange={(v) =>
+                      patchTarget((l) => (l.kind === "TEXT" ? l : { ...l, height: v }))
+                    }
+                  />
+                </>
+              )}
+
+              <InspectorSlider
+                label="Rotação"
+                value={merged.common.rotation.value}
+                mixed={merged.common.rotation.mixed}
+                min={-180}
+                max={180}
+                step={1}
+                unit="°"
+                {...sliderHandlers}
+                onChange={(v) => patchTarget((l) => ({ ...l, rotation: v }))}
+              />
+
+              <InspectorSlider
+                label="Parallax X"
+                value={merged.common.parallaxX.value}
+                mixed={merged.common.parallaxX.mixed}
+                min={-1.2}
+                max={1.2}
+                step={0.05}
+                {...sliderHandlers}
+                onChange={(v) => patchTarget((l) => ({ ...l, parallaxX: v }))}
+              />
+              <InspectorSlider
+                label="Parallax Y"
+                value={merged.common.parallaxY.value}
+                mixed={merged.common.parallaxY.mixed}
+                min={-1.2}
+                max={1.2}
+                step={0.05}
+                {...sliderHandlers}
+                onChange={(v) => patchTarget((l) => ({ ...l, parallaxY: v }))}
+              />
+            </div>
+
+            {merged.allSupportFullGlass && (
+              <div className="space-y-2.5 pt-2.5 border-t border-white/10">
+                <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs font-medium text-white">
+                  <span>
+                    Vidro Óptico{" "}
+                    {merged.common.glass.enabled.mixed && (
+                      <span className="italic text-[#A1A1AA] font-normal">(misto)</span>
+                    )}
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={!merged.common.glass.enabled.mixed && merged.common.glass.enabled.value}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      patchTarget(
+                        (l) => ({ ...l, glass: { ...l.glass, enabled: checked } }),
+                        "discrete"
+                      );
+                    }}
+                  />
+                </label>
+                {effectiveLayers.some((l) => l.glass.enabled) && (
+                  <>
+                    <InspectorSlider
+                      label="Desfoque do Vidro"
+                      value={merged.common.glass.blurPx.value}
+                      mixed={merged.common.glass.blurPx.mixed}
+                      min={0}
+                      max={80}
+                      step={1}
+                      unit="px"
+                      {...sliderHandlers}
+                      onChange={(v) =>
+                        patchTarget((l) => ({ ...l, glass: { ...l.glass, blurPx: v } }))
+                      }
+                    />
+                    <InspectorSlider
+                      label="Refração Óptica"
+                      value={merged.common.glass.refractionScale.value}
+                      mixed={merged.common.glass.refractionScale.mixed}
+                      min={0}
+                      max={60}
+                      step={1}
+                      {...sliderHandlers}
+                      onChange={(v) =>
+                        patchTarget((l) => ({ ...l, glass: { ...l.glass, refractionScale: v } }))
+                      }
+                    />
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="flex-1 flex flex-col min-h-0">
         {/* Selected Layer Header */}
         <div className="px-4 pt-3 pb-2.5 border-b border-white/10 space-y-2">
           <div className="flex items-center justify-between gap-2">
             <span className="text-[10px] font-mono-fx uppercase tracking-widest text-[#A1A1AA]">
-              {selectedLayer.kind}
+              {isMulti ? formatMultiSelectionSummary(merged) : selectedLayer.kind}
             </span>
-            {selectedParent && (
+            {!isMulti && selectedParent && (
               <button
                 type="button"
                 onClick={() => onSelectLayer(selectedParent.id)}
@@ -606,11 +1096,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
             )}
           </div>
           <input aria-label="Nome da camada"
-            value={selectedLayer.name}
+            value={isMulti && merged.common.name.mixed ? "" : merged.common.name.value}
+            placeholder={isMulti && merged.common.name.mixed ? "misto" : "Nome da camada"}
             onChange={(e) =>
-              onPatchLayer(selectedLayer.id, (l) => ({ ...l, name: e.target.value }), "coalesced")
+              patchTarget((l) => ({ ...l, name: e.target.value }), "coalesced")
             }
-            className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-1.5 text-xs font-medium text-white outline-none focus:border-white/25"
+            className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-1.5 text-xs font-medium text-white placeholder:italic placeholder:text-[#71717A] outline-none focus:border-white/25"
           />
 
           {/* 3 Clean Layer Sub-Tabs */}
@@ -648,54 +1139,96 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 <>
                   <div className="space-y-1.5">
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-[#A1A1AA]">Texto / Fórmula</span>
-                      <FxButton
-                        active={selectedLayer.text.content.includes("$")}
-                        onClick={() =>
-                          onOpenFx({
-                            label: "Conteúdo / Fórmula",
-                            initialExpr: selectedLayer.text!.content,
-                            fallback: selectedLayer.text!.content,
-                            onApply: (expr) =>
-                              onPatchLayer(
-                                selectedLayer.id,
-                                (l) => ({ ...l, text: { ...l.text!, content: expr } }),
+                      <span className="text-xs text-[#A1A1AA]">
+                        Texto / Fórmula{" "}
+                        {isMulti && merged.text?.content.mixed && (
+                          <span className="italic text-[#71717A]">(misto)</span>
+                        )}
+                      </span>
+                      <div className="flex items-center gap-1">
+                        {(
+                          [
+                            { m: "upper" as const, l: "AA", t: "MAIÚSCULAS" },
+                            { m: "lower" as const, l: "aa", t: "minúsculas" },
+                            { m: "capitalize" as const, l: "Aa", t: "Capitalizar" },
+                          ] as const
+                        ).map((c) => (
+                          <button
+                            key={c.m}
+                            type="button"
+                            title={c.t}
+                            onClick={() =>
+                              patchTarget(
+                                (l) =>
+                                  l.text
+                                    ? {
+                                        ...l,
+                                        text: {
+                                          ...l.text,
+                                          content: transformTextCase(l.text.content, c.m),
+                                        },
+                                      }
+                                    : l,
                                 "discrete"
-                              ),
-                            onClear: () =>
-                              onPatchLayer(
-                                selectedLayer.id,
-                                (l) => ({ ...l, text: { ...l.text!, content: "18:45" } }),
-                                "discrete"
-                              ),
-                          })
-                        }
-                      />
+                              )
+                            }
+                            className="px-1.5 py-0.5 rounded-md bg-white/5 hover:bg-white/15 font-mono-fx text-[10px] text-[#A1A1AA] hover:text-white"
+                          >
+                            {c.l}
+                          </button>
+                        ))}
+                        {!isMulti && (
+                          <FxButton
+                            active={selectedLayer.text.content.includes("$")}
+                            onClick={() =>
+                              onOpenFx({
+                                label: "Conteúdo / Fórmula",
+                                initialExpr: selectedLayer.text!.content,
+                                fallback: selectedLayer.text!.content,
+                                onApply: (expr) =>
+                                  patchTarget(
+                                    (l) => ({ ...l, text: { ...l.text!, content: expr } }),
+                                    "discrete"
+                                  ),
+                                onClear: () =>
+                                  patchTarget(
+                                    (l) => ({ ...l, text: { ...l.text!, content: "18:45" } }),
+                                    "discrete"
+                                  ),
+                              })
+                            }
+                          />
+                        )}
+                      </div>
                     </div>
                     <textarea aria-label="Texto da camada"
                       rows={2}
-                      value={selectedLayer.text.content}
+                      value={isMulti && merged.text?.content.mixed ? "" : selectedLayer.text.content}
+                      placeholder={isMulti && merged.text?.content.mixed ? "misto" : undefined}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
-                          (l) => ({ ...l, text: { ...l.text!, content: e.target.value } }),
+                        patchTarget(
+                          (l) =>
+                            l.text ? { ...l, text: { ...l.text, content: e.target.value } } : l,
                           "coalesced"
                         )
                       }
-                      className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-2 font-mono-fx text-xs text-white outline-none resize-none focus:border-white/25"
+                      className="w-full bg-black/60 border border-white/10 rounded-xl px-3 py-2 font-mono-fx text-xs text-white placeholder:italic placeholder:text-[#71717A] outline-none resize-none focus:border-white/25"
                     />
                   </div>
 
                   <div className="flex items-center gap-2">
                     <Select aria-label="Família da fonte"
                       value={selectedLayer.text.fontFamily}
+                      mixed={Boolean(isMulti && merged.text?.fontFamily.mixed)}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
-                          (l) => ({
-                            ...l,
-                            text: { ...l.text!, fontFamily: e.target.value, fontPath: "" },
-                          }),
+                        patchTarget(
+                          (l) =>
+                            l.text
+                              ? {
+                                  ...l,
+                                  text: { ...l.text, fontFamily: e.target.value, fontPath: "" },
+                                }
+                              : l,
                           "discrete"
                         )
                       }
@@ -722,36 +1255,41 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Tamanho"
                     value={selectedLayer.text.fontSize}
+                    mixed={Boolean(isMulti && merged.text?.fontSize.mixed)}
                     min={10}
                     max={340}
                     step={1}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, fontSize: v },
-                      }))
+                      patchTarget((l) =>
+                        l.text ? { ...l, text: { ...l.text, fontSize: v } } : l
+                      )
                     }
                   />
 
                   <InspectorSlider
                     label="Peso da Fonte"
                     value={selectedLayer.text.fontWeight}
+                    mixed={Boolean(isMulti && merged.text?.fontWeight.mixed)}
                     min={200}
                     max={800}
                     step={100}
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, fontWeight: v },
-                      }))
+                      patchTarget((l) =>
+                        l.text ? { ...l, text: { ...l.text, fontWeight: v } } : l
+                      )
                     }
                   />
 
                   <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs text-[#A1A1AA]">Alinhamento</span>
+                    <span className="text-xs text-[#A1A1AA]">
+                      Alinhamento{" "}
+                      {isMulti && merged.text?.align.mixed && (
+                        <span className="italic text-[#71717A]">(misto)</span>
+                      )}
+                    </span>
                     <div className="flex items-center gap-1">
                       {(
                         [
@@ -759,77 +1297,81 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           { id: "center" as const, Icon: AlignCenter },
                           { id: "right" as const, Icon: AlignRight },
                         ]
-                      ).map(({ id, Icon }) => (
-                        <button
-                          key={id}
-                          type="button"
-                          aria-label={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
-                          title={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
-                          aria-pressed={selectedLayer.text?.align === id}
-                          onClick={() =>
-                            onPatchLayer(
-                              selectedLayer.id,
-                              (l) => ({ ...l, text: { ...l.text!, align: id } }),
-                              "discrete"
-                            )
-                          }
-                          className={`p-1.5 rounded-lg transition ${
-                            selectedLayer.text?.align === id
-                              ? "bg-white text-black"
-                              : "bg-white/5 text-[#A1A1AA] hover:text-white"
-                          }`}
-                        >
-                          <Icon className="w-3.5 h-3.5" />
-                        </button>
-                      ))}
+                      ).map(({ id, Icon }) => {
+                        const active =
+                          !(isMulti && merged.text?.align.mixed) &&
+                          selectedLayer.text?.align === id;
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            aria-label={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                            title={id === "left" ? "Alinhar à esquerda" : id === "center" ? "Centralizar" : "Alinhar à direita"}
+                            aria-pressed={active}
+                            onClick={() =>
+                              patchTarget(
+                                (l) => (l.text ? { ...l, text: { ...l.text, align: id } } : l),
+                                "discrete"
+                              )
+                            }
+                            className={`p-1.5 rounded-lg transition ${
+                              active
+                                ? "bg-white text-black"
+                                : "bg-white/5 text-[#A1A1AA] hover:text-white"
+                            }`}
+                          >
+                            <Icon className="w-3.5 h-3.5" />
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
 
                   <InspectorSlider
                     label="Espaçamento"
                     value={selectedLayer.text.letterSpacing}
+                    mixed={Boolean(isMulti && merged.text?.letterSpacing.mixed)}
                     min={-0.08}
                     max={0.4}
                     step={0.01}
                     unit="em"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, letterSpacing: v },
-                      }))
+                      patchTarget((l) =>
+                        l.text ? { ...l, text: { ...l.text, letterSpacing: v } } : l
+                      )
                     }
                   />
 
                   <InspectorSlider
                     label="Escala Vertical"
                     value={selectedLayer.text.stemStretch}
+                    mixed={Boolean(isMulti && merged.text?.stemStretch.mixed)}
                     min={1}
                     max={2.4}
                     step={0.05}
                     unit="×"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, stemStretch: v },
-                      }))
+                      patchTarget((l) =>
+                        l.text ? { ...l, text: { ...l.text, stemStretch: v } } : l
+                      )
                     }
                   />
 
                   <InspectorSlider
                     label="Sombra do Texto"
                     value={selectedLayer.text.shadowBlur}
+                    mixed={Boolean(isMulti && merged.text?.shadowBlur.mixed)}
                     min={0}
                     max={48}
                     step={1}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, shadowBlur: v },
-                      }))
+                      patchTarget((l) =>
+                        l.text ? { ...l, text: { ...l.text, shadowBlur: v } } : l
+                      )
                     }
                   />
 
@@ -837,12 +1379,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <span className="text-xs text-[#A1A1AA]">Cor do Texto</span>
                     <div className="flex items-center gap-2">
                       <ColorInput aria-label="Cor do texto"
-                        
+                        mixed={Boolean(isMulti && merged.text?.color.mixed)}
                         value={toHexColorInput(selectedLayer.text.color)}
                         onChange={(e) =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({ ...l, text: { ...l.text!, color: e.target.value } }),
+                          patchTarget(
+                            (l) =>
+                              l.text ? { ...l, text: { ...l.text, color: e.target.value } } : l,
                             "coalesced"
                           )
                         }
@@ -855,14 +1397,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                             initialExpr: selectedLayer.fx?.color ?? "",
                             fallback: selectedLayer.text!.color,
                             onApply: (expr) =>
-                              onPatchLayer(
-                                selectedLayer.id,
+                              patchTarget(
                                 (l) => ({ ...l, fx: { ...l.fx, color: expr } }),
                                 "discrete"
                               ),
                             onClear: () =>
-                              onPatchLayer(
-                                selectedLayer.id,
+                              patchTarget(
                                 (l) => {
                                   const fx = { ...l.fx };
                                   delete fx.color;
@@ -879,16 +1419,21 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Alpha da Cor (Transparência)"
                     value={Math.round((selectedLayer.text.colorAlpha ?? 1) * 100)}
+                    mixed={Boolean(isMulti && merged.text?.colorAlpha.mixed)}
                     min={0}
                     max={100}
                     step={1}
                     unit="%"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        text: { ...l.text!, colorAlpha: Number((v / 100).toFixed(2)) },
-                      }))
+                      patchTarget((l) =>
+                        l.text
+                          ? {
+                              ...l,
+                              text: { ...l.text, colorAlpha: Number((v / 100).toFixed(2)) },
+                            }
+                          : l
+                      )
                     }
                   />
                 </>
@@ -896,92 +1441,101 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
               {selectedLayer.kind === "VIDEO" && selectedLayer.video && (
                 <>
-                  <button
-                    type="button"
-                    onClick={() => onPickFile("video")}
-                    className="w-full prism-pill-active rounded-xl py-2.5 text-xs flex items-center justify-center gap-2"
-                  >
-                    <Upload className="w-3.5 h-3.5" /> Escolher Vídeo (.mp4 / .webm)
-                  </button>
+                  {!isMulti && (
+                    <button
+                      type="button"
+                      onClick={() => onPickFile("video")}
+                      className="w-full prism-pill-active rounded-xl py-2.5 text-xs flex items-center justify-center gap-2"
+                    >
+                      <Upload className="w-3.5 h-3.5" /> Escolher Vídeo (.mp4 / .webm)
+                    </button>
+                  )}
                   <div className="grid grid-cols-2 gap-1.5">
-                    {(["cover", "contain"] as const).map((fit) => (
-                      <button
-                        key={fit}
-                        type="button"
-                        onClick={() =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({ ...l, video: { ...l.video!, objectFit: fit } }),
-                            "discrete"
-                          )
-                        }
-                        className={`py-1.5 rounded-xl text-[11px] ${
-                          selectedLayer.video?.objectFit === fit
-                            ? "prism-pill-active"
-                            : "prism-pill-idle"
-                        }`}
-                      >
-                        {fit === "cover" ? "Preencher (Cover)" : "Ajustar (Contain)"}
-                      </button>
-                    ))}
+                    {(["cover", "contain"] as const).map((fit) => {
+                      const active =
+                        !(isMulti && merged.video?.objectFit.mixed) &&
+                        selectedLayer.video?.objectFit === fit;
+                      return (
+                        <button
+                          key={fit}
+                          type="button"
+                          onClick={() =>
+                            patchTarget(
+                              (l) => (l.video ? { ...l, video: { ...l.video, objectFit: fit } } : l),
+                              "discrete"
+                            )
+                          }
+                          className={`py-1.5 rounded-xl text-[11px] ${
+                            active ? "prism-pill-active" : "prism-pill-idle"
+                          }`}
+                        >
+                          {fit === "cover" ? "Preencher (Cover)" : "Ajustar (Contain)"}
+                        </button>
+                      );
+                    })}
                   </div>
                   <InspectorSlider
                     label="Velocidade"
                     value={selectedLayer.video.speed}
+                    mixed={Boolean(isMulti && merged.video?.speed.mixed)}
                     min={0.25}
                     max={2.5}
                     step={0.05}
                     unit="×"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        video: { ...l.video!, speed: v },
-                      }))
+                      patchTarget((l) =>
+                        l.video ? { ...l, video: { ...l.video, speed: v } } : l
+                      )
                     }
                   />
                   <InspectorSlider
                     label="Raio do Recorte"
                     value={selectedLayer.video.clipRadius}
+                    mixed={Boolean(isMulti && merged.video?.clipRadius.mixed)}
                     min={0}
                     max={120}
                     step={2}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        video: { ...l.video!, clipRadius: v },
-                      }))
+                      patchTarget((l) =>
+                        l.video ? { ...l, video: { ...l.video, clipRadius: v } } : l
+                      )
                     }
                   />
                   <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs">
-                    <span>Sem áudio</span>
+                    <span>
+                      Sem áudio{" "}
+                      {isMulti && merged.video?.muted.mixed && (
+                        <span className="italic text-[#71717A]">(misto)</span>
+                      )}
+                    </span>
                     <input
                       type="checkbox"
-                      checked={selectedLayer.video.muted}
+                      checked={!(isMulti && merged.video?.muted.mixed) && selectedLayer.video.muted}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
-                          (l) => ({ ...l, video: { ...l.video!, muted: e.target.checked } }),
+                        patchTarget(
+                          (l) =>
+                            l.video ? { ...l, video: { ...l.video, muted: e.target.checked } } : l,
                           "discrete"
                         )
                       }
                     />
                   </label>
-                  {!selectedLayer.video.muted && (
+                  {effectiveLayers.some((l) => l.video && !l.video.muted) && (
                     <InspectorSlider
                       label="Volume"
                       value={selectedLayer.video.volume}
+                      mixed={Boolean(isMulti && merged.video?.volume.mixed)}
                       min={0}
                       max={1}
                       step={0.05}
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
-                          ...l,
-                          video: { ...l.video!, volume: v },
-                        }))
+                        patchTarget((l) =>
+                          l.video ? { ...l, video: { ...l.video, volume: v } } : l
+                        )
                       }
                     />
                   )}
@@ -996,35 +1550,41 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         { id: "FILE" as const, label: "Arquivo Local" },
                         { id: "MEDIA_COVER" as const, label: "Capa da Música" },
                       ]
-                    ).map((srcMode) => (
-                      <button
-                        key={srcMode.id}
-                        type="button"
-                        onClick={() =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({
-                              ...l,
-                              image: {
-                                ...l.image!,
-                                sourceMode: srcMode.id,
-                                objectFit: srcMode.id === "MEDIA_COVER" ? "cover" : l.image!.objectFit,
-                              },
-                            }),
-                            "discrete"
-                          )
-                        }
-                        className={`py-1.5 rounded-xl text-[11px] ${
-                          (selectedLayer.image?.sourceMode ?? "FILE") === srcMode.id
-                            ? "prism-pill-active"
-                            : "prism-pill-idle"
-                        }`}
-                      >
-                        {srcMode.label}
-                      </button>
-                    ))}
+                    ).map((srcMode) => {
+                      const active =
+                        !(isMulti && merged.image?.sourceMode.mixed) &&
+                        (selectedLayer.image?.sourceMode ?? "FILE") === srcMode.id;
+                      return (
+                        <button
+                          key={srcMode.id}
+                          type="button"
+                          onClick={() =>
+                            patchTarget(
+                              (l) =>
+                                l.image
+                                  ? {
+                                      ...l,
+                                      image: {
+                                        ...l.image,
+                                        sourceMode: srcMode.id,
+                                        objectFit:
+                                          srcMode.id === "MEDIA_COVER" ? "cover" : l.image.objectFit,
+                                      },
+                                    }
+                                  : l,
+                              "discrete"
+                            )
+                          }
+                          className={`py-1.5 rounded-xl text-[11px] ${
+                            active ? "prism-pill-active" : "prism-pill-idle"
+                          }`}
+                        >
+                          {srcMode.label}
+                        </button>
+                      );
+                    })}
                   </div>
-                  {(selectedLayer.image.sourceMode ?? "FILE") === "FILE" && (
+                  {!isMulti && (selectedLayer.image.sourceMode ?? "FILE") === "FILE" && (
                     <button
                       type="button"
                       onClick={() => onPickFile("image")}
@@ -1034,40 +1594,42 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     </button>
                   )}
                   <div className="grid grid-cols-2 gap-1.5">
-                    {(["contain", "cover"] as const).map((fit) => (
-                      <button
-                        key={fit}
-                        type="button"
-                        onClick={() =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({ ...l, image: { ...l.image!, objectFit: fit } }),
-                            "discrete"
-                          )
-                        }
-                        className={`py-1.5 rounded-xl text-[11px] ${
-                          selectedLayer.image?.objectFit === fit
-                            ? "prism-pill-active"
-                            : "prism-pill-idle"
-                        }`}
-                      >
-                        {fit === "contain" ? "Recorte Alpha" : "Preencher (Cover)"}
-                      </button>
-                    ))}
+                    {(["contain", "cover"] as const).map((fit) => {
+                      const active =
+                        !(isMulti && merged.image?.objectFit.mixed) &&
+                        selectedLayer.image?.objectFit === fit;
+                      return (
+                        <button
+                          key={fit}
+                          type="button"
+                          onClick={() =>
+                            patchTarget(
+                              (l) => (l.image ? { ...l, image: { ...l.image, objectFit: fit } } : l),
+                              "discrete"
+                            )
+                          }
+                          className={`py-1.5 rounded-xl text-[11px] ${
+                            active ? "prism-pill-active" : "prism-pill-idle"
+                          }`}
+                        >
+                          {fit === "contain" ? "Recorte Alpha" : "Preencher (Cover)"}
+                        </button>
+                      );
+                    })}
                   </div>
                   <InspectorSlider
                     label="Raio da Borda"
                     value={selectedLayer.image.borderRadius}
+                    mixed={Boolean(isMulti && merged.image?.borderRadius.mixed)}
                     min={0}
                     max={160}
                     step={2}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        image: { ...l.image!, borderRadius: v },
-                      }))
+                      patchTarget((l) =>
+                        l.image ? { ...l, image: { ...l.image, borderRadius: v } } : l
+                      )
                     }
                   />
                 </>
@@ -1076,7 +1638,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               {selectedLayer.kind === "PROGRESS" && selectedLayer.progress && (
                 <>
                   <div className="space-y-1.5">
-                    <span className="block text-xs text-[#A1A1AA]">Fonte da Barra</span>
+                    <span className="block text-xs text-[#A1A1AA]">
+                      Fonte da Barra{" "}
+                      {isMulti && merged.progress?.source.mixed && (
+                        <span className="italic text-[#71717A]">(misto)</span>
+                      )}
+                    </span>
                     <div className="grid grid-cols-2 gap-1.5">
                       {(
                         [
@@ -1085,37 +1652,44 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           { id: "RAM" as const, label: "Uso de RAM" },
                           { id: "BATTERY" as const, label: "Bateria" },
                         ]
-                      ).map((src) => (
-                        <button
-                          key={src.id}
-                          type="button"
-                          onClick={() =>
-                            onPatchLayer(
-                              selectedLayer.id,
-                              (l) => ({ ...l, progress: { ...l.progress!, source: src.id } }),
-                              "discrete"
-                            )
-                          }
-                          className={`py-1.5 rounded-xl text-[11px] ${
-                            selectedLayer.progress?.source === src.id
-                              ? "prism-pill-active"
-                              : "prism-pill-idle"
-                          }`}
-                        >
-                          {src.label}
-                        </button>
-                      ))}
+                      ).map((src) => {
+                        const active =
+                          !(isMulti && merged.progress?.source.mixed) &&
+                          selectedLayer.progress?.source === src.id;
+                        return (
+                          <button
+                            key={src.id}
+                            type="button"
+                            onClick={() =>
+                              patchTarget(
+                                (l) =>
+                                  l.progress
+                                    ? { ...l, progress: { ...l.progress, source: src.id } }
+                                    : l,
+                                "discrete"
+                              )
+                            }
+                            className={`py-1.5 rounded-xl text-[11px] ${
+                              active ? "prism-pill-active" : "prism-pill-idle"
+                            }`}
+                          >
+                            {src.label}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor do Preenchimento</span>
                     <ColorInput aria-label="Cor do preenchimento"
-                      
+                      mixed={Boolean(isMulti && merged.progress?.fillColor.mixed)}
                       value={toHexColorInput(selectedLayer.progress.fillColor)}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
-                          (l) => ({ ...l, progress: { ...l.progress!, fillColor: e.target.value } }),
+                        patchTarget(
+                          (l) =>
+                            l.progress
+                              ? { ...l, progress: { ...l.progress, fillColor: e.target.value } }
+                              : l,
                           "coalesced"
                         )
                       }
@@ -1124,27 +1698,34 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Alpha do Preenchimento"
                     value={Math.round(selectedLayer.progress.fillAlpha * 100)}
+                    mixed={Boolean(isMulti && merged.progress?.fillAlpha.mixed)}
                     min={0}
                     max={100}
                     step={2}
                     unit="%"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        progress: { ...l.progress!, fillAlpha: Number((v / 100).toFixed(2)) },
-                      }))
+                      patchTarget((l) =>
+                        l.progress
+                          ? {
+                              ...l,
+                              progress: { ...l.progress, fillAlpha: Number((v / 100).toFixed(2)) },
+                            }
+                          : l
+                      )
                     }
                   />
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor da Trilha</span>
                     <ColorInput aria-label="Cor da trilha"
-                      
+                      mixed={Boolean(isMulti && merged.progress?.trackColor.mixed)}
                       value={toHexColorInput(selectedLayer.progress.trackColor)}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
-                          (l) => ({ ...l, progress: { ...l.progress!, trackColor: e.target.value } }),
+                        patchTarget(
+                          (l) =>
+                            l.progress
+                              ? { ...l, progress: { ...l.progress, trackColor: e.target.value } }
+                              : l,
                           "coalesced"
                         )
                       }
@@ -1153,31 +1734,36 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Alpha da Trilha"
                     value={Math.round(selectedLayer.progress.trackAlpha * 100)}
+                    mixed={Boolean(isMulti && merged.progress?.trackAlpha.mixed)}
                     min={0}
                     max={100}
                     step={2}
                     unit="%"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        progress: { ...l.progress!, trackAlpha: Number((v / 100).toFixed(2)) },
-                      }))
+                      patchTarget((l) =>
+                        l.progress
+                          ? {
+                              ...l,
+                              progress: { ...l.progress, trackAlpha: Number((v / 100).toFixed(2)) },
+                            }
+                          : l
+                      )
                     }
                   />
                   <InspectorSlider
                     label="Arredondamento"
                     value={selectedLayer.progress.borderRadius}
+                    mixed={Boolean(isMulti && merged.progress?.borderRadius.mixed)}
                     min={0}
                     max={999}
                     step={1}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        progress: { ...l.progress!, borderRadius: v },
-                      }))
+                      patchTarget((l) =>
+                        l.progress ? { ...l, progress: { ...l.progress, borderRadius: v } } : l
+                      )
                     }
                   />
                 </>
@@ -1185,60 +1771,63 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
               {selectedLayer.kind === "SVG" && selectedLayer.svg && (
                 <>
-                  <button
-                    type="button"
-                    onClick={() => onPickFile("svg")}
-                    className="w-full prism-pill-active rounded-xl py-2 text-xs flex items-center justify-center gap-2"
-                  >
-                    <Upload className="w-3.5 h-3.5" /> Importar Arquivo .svg
-                  </button>
+                  {!isMulti && (
+                    <button
+                      type="button"
+                      onClick={() => onPickFile("svg")}
+                      className="w-full prism-pill-active rounded-xl py-2 text-xs flex items-center justify-center gap-2"
+                    >
+                      <Upload className="w-3.5 h-3.5" /> Importar Arquivo .svg
+                    </button>
+                  )}
                   <div className="grid grid-cols-4 gap-1.5">
-                    {Object.keys(BUILTIN_SVG_ICONS).map((ic) => (
-                      <button
-                        key={ic}
-                        type="button"
-                        onClick={() =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({ ...l, svg: { ...l.svg!, iconName: ic, customSvg: "" } }),
-                            "discrete"
-                          )
-                        }
-                        className={`py-1.5 rounded-xl text-[10px] uppercase ${
-                          selectedLayer.svg?.iconName === ic && !selectedLayer.svg?.customSvg
-                            ? "prism-pill-active"
-                            : "prism-pill-idle"
-                        }`}
-                      >
-                        {ic}
-                      </button>
-                    ))}
+                    {Object.keys(BUILTIN_SVG_ICONS).map((ic) => {
+                      const active =
+                        !(isMulti && merged.svg?.iconName.mixed) &&
+                        selectedLayer.svg?.iconName === ic &&
+                        !selectedLayer.svg?.customSvg;
+                      return (
+                        <button
+                          key={ic}
+                          type="button"
+                          onClick={() =>
+                            patchTarget(
+                              (l) =>
+                                l.svg ? { ...l, svg: { ...l.svg, iconName: ic, customSvg: "" } } : l,
+                              "discrete"
+                            )
+                          }
+                          className={`py-1.5 rounded-xl text-[10px] uppercase ${
+                            active ? "prism-pill-active" : "prism-pill-idle"
+                          }`}
+                        >
+                          {ic}
+                        </button>
+                      );
+                    })}
                   </div>
                   <InspectorSlider
                     label="Espessura do Traço"
                     value={selectedLayer.svg.strokeWidth}
+                    mixed={Boolean(isMulti && merged.svg?.strokeWidth.mixed)}
                     min={0.6}
                     max={4}
                     step={0.1}
                     unit="px"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        svg: { ...l.svg!, strokeWidth: v },
-                      }))
+                      patchTarget((l) => (l.svg ? { ...l, svg: { ...l.svg, strokeWidth: v } } : l))
                     }
                   />
                   <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                     <span className="text-xs text-[#A1A1AA]">Cor Vetorial</span>
                     <div className="flex items-center gap-2">
                       <ColorInput aria-label="Cor vetorial"
-                        
+                        mixed={Boolean(isMulti && merged.svg?.color.mixed)}
                         value={toHexColorInput(selectedLayer.svg.color)}
                         onChange={(e) =>
-                          onPatchLayer(
-                            selectedLayer.id,
-                            (l) => ({ ...l, svg: { ...l.svg!, color: e.target.value } }),
+                          patchTarget(
+                            (l) => (l.svg ? { ...l, svg: { ...l.svg, color: e.target.value } } : l),
                             "coalesced"
                           )
                         }
@@ -1251,14 +1840,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                             initialExpr: selectedLayer.fx?.color ?? "",
                             fallback: selectedLayer.svg!.color,
                             onApply: (expr) =>
-                              onPatchLayer(
-                                selectedLayer.id,
+                              patchTarget(
                                 (l) => ({ ...l, fx: { ...l.fx, color: expr } }),
                                 "discrete"
                               ),
                             onClear: () =>
-                              onPatchLayer(
-                                selectedLayer.id,
+                              patchTarget(
                                 (l) => {
                                   const fx = { ...l.fx };
                                   delete fx.color;
@@ -1274,16 +1861,18 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Alpha da Cor"
                     value={Math.round((selectedLayer.svg.colorAlpha ?? 1) * 100)}
+                    mixed={Boolean(isMulti && merged.svg?.colorAlpha.mixed)}
                     min={0}
                     max={100}
                     step={2}
                     unit="%"
                     {...sliderHandlers}
                     onChange={(v) =>
-                      onPatchLayer(selectedLayer.id, (l) => ({
-                        ...l,
-                        svg: { ...l.svg!, colorAlpha: Number((v / 100).toFixed(2)) },
-                      }))
+                      patchTarget((l) =>
+                        l.svg
+                          ? { ...l, svg: { ...l.svg, colorAlpha: Number((v / 100).toFixed(2)) } }
+                          : l
+                      )
                     }
                   />
                 </>
@@ -2865,18 +3454,23 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               selectedLayer.kind === "TEXT" ||
               selectedLayer.kind === "GROUP" ||
               selectedLayer.kind === "IMAGE";
+            const anyGlassEnabled = effectiveLayers.some((l) => l.glass.enabled);
             return (
             <>
               {supportsFullGlass ? (
                 <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs font-medium text-white">
-                  <span>Vidro Óptico & Desfoque</span>
+                  <span>
+                    Vidro Óptico & Desfoque{" "}
+                    {isMulti && merged.common.glass.enabled.mixed && (
+                      <span className="italic text-[#71717A] font-normal">(misto)</span>
+                    )}
+                  </span>
                   <input
                     type="checkbox"
-                    checked={selectedLayer.glass.enabled}
+                    checked={!(isMulti && merged.common.glass.enabled.mixed) && selectedLayer.glass.enabled}
                     onChange={(e) => {
                       const checked = e.target.checked;
-                      onPatchLayer(
-                        selectedLayer.id,
+                      patchTarget(
                         (l) => {
                           const nextText =
                             l.kind === "TEXT" && l.text && (l.glass.textMode ?? "GLYPH") === "GLYPH"
@@ -2900,13 +3494,17 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               ) : selectedLayer.kind === "SVG" ? (
                 <div className="space-y-2.5">
                   <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs font-medium text-white">
-                    <span>Dispersão Prismática no Ícone</span>
+                    <span>
+                      Dispersão Prismática no Ícone{" "}
+                      {isMulti && merged.common.glass.enabled.mixed && (
+                        <span className="italic text-[#71717A] font-normal">(misto)</span>
+                      )}
+                    </span>
                     <input
                       type="checkbox"
-                      checked={selectedLayer.glass.enabled}
+                      checked={!(isMulti && merged.common.glass.enabled.mixed) && selectedLayer.glass.enabled}
                       onChange={(e) =>
-                        onPatchLayer(
-                          selectedLayer.id,
+                        patchTarget(
                           (l) => ({
                             ...l,
                             glass: {
@@ -2923,17 +3521,18 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       }
                     />
                   </label>
-                  {selectedLayer.glass.enabled && (
+                  {anyGlassEnabled && (
                     <InspectorSlider
                       label="Dispersão RGB"
                       value={selectedLayer.glass.chromaticAberration}
+                      mixed={Boolean(isMulti && merged.common.glass.chromaticAberration.mixed)}
                       min={0}
                       max={6}
                       step={0.2}
                       unit="px"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, chromaticAberration: v },
                         }))
@@ -2947,7 +3546,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 </p>
               )}
 
-              {supportsFullGlass && selectedLayer.glass.enabled && (
+              {supportsFullGlass && anyGlassEnabled && (
                 <div className="space-y-3">
                   {/* 1-Click Optical Glass Presets */}
                   <div className="space-y-1.5">
@@ -2960,8 +3559,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           key={preset.label}
                           type="button"
                           onClick={() =>
-                            onPatchLayer(
-                              selectedLayer.id,
+                            patchTarget(
                               (l) => ({
                                 ...l,
                                 text:
@@ -2986,44 +3584,51 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
                   {selectedLayer.kind === "TEXT" && (
                     <div className="space-y-1.5">
-                      <span className="block text-[11px] text-[#A1A1AA]">Modo do Vidro no Texto</span>
+                      <span className="block text-[11px] text-[#A1A1AA]">
+                        Modo do Vidro no Texto{" "}
+                        {isMulti && merged.common.glass.textMode.mixed && (
+                          <span className="italic text-[#71717A]">(misto)</span>
+                        )}
+                      </span>
                       <div className="grid grid-cols-2 gap-1.5">
                         {(
                           [
                             { id: "GLYPH" as const, label: "Nas Letras (Vidro)" },
                             { id: "PILL" as const, label: "Pílula Atrás" },
                           ]
-                        ).map((tm) => (
-                          <button
-                            key={tm.id}
-                            type="button"
-                            onClick={() =>
-                              onPatchLayer(
-                                selectedLayer.id,
-                                (l) => ({
-                                  ...l,
-                                  text:
-                                    l.text
-                                      ? tm.id === "GLYPH" && (l.text.colorAlpha ?? 1) >= 0.85
-                                        ? { ...l.text, colorAlpha: 0.16 }
-                                        : tm.id === "PILL" && (l.text.colorAlpha ?? 1) <= 0.25
-                                        ? { ...l.text, colorAlpha: 1 }
-                                        : l.text
-                                      : l.text,
-                                  glass: { ...l.glass, textMode: tm.id },
-                                }),
-                                "discrete"
-                              )
-                            }
-                            className={`py-1.5 rounded-xl text-[11px] ${
-                              (selectedLayer.glass.textMode ?? "GLYPH") === tm.id
-                                ? "prism-pill-active"
-                                : "prism-pill-idle"
-                            }`}
-                          >
-                            {tm.label}
-                          </button>
-                        ))}
+                        ).map((tm) => {
+                          const active =
+                            !(isMulti && merged.common.glass.textMode.mixed) &&
+                            (selectedLayer.glass.textMode ?? "GLYPH") === tm.id;
+                          return (
+                            <button
+                              key={tm.id}
+                              type="button"
+                              onClick={() =>
+                                patchTarget(
+                                  (l) => ({
+                                    ...l,
+                                    text:
+                                      l.text
+                                        ? tm.id === "GLYPH" && (l.text.colorAlpha ?? 1) >= 0.85
+                                          ? { ...l.text, colorAlpha: 0.16 }
+                                          : tm.id === "PILL" && (l.text.colorAlpha ?? 1) <= 0.25
+                                          ? { ...l.text, colorAlpha: 1 }
+                                          : l.text
+                                        : l.text,
+                                    glass: { ...l.glass, textMode: tm.id },
+                                  }),
+                                  "discrete"
+                                )
+                              }
+                              className={`py-1.5 rounded-xl text-[11px] ${
+                                active ? "prism-pill-active" : "prism-pill-idle"
+                              }`}
+                            >
+                              {tm.label}
+                            </button>
+                          );
+                        })}
                       </div>
                       {(selectedLayer.glass.textMode ?? "GLYPH") === "GLYPH" &&
                         selectedLayer.text &&
@@ -3035,8 +3640,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                             <button
                               type="button"
                               onClick={() =>
-                                onPatchLayer(
-                                  selectedLayer.id,
+                                patchTarget(
                                   (l) =>
                                     l.text
                                       ? { ...l, text: { ...l.text, colorAlpha: 0.14 } }
@@ -3061,13 +3665,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Jateamento / Desfoque"
                       value={selectedLayer.glass.blurPx}
+                      mixed={Boolean(isMulti && merged.common.glass.blurPx.mixed)}
                       min={0}
                       max={80}
                       step={1}
                       unit="px"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, blurPx: v },
                         }))
@@ -3076,12 +3681,13 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Refração Óptica (Lente)"
                       value={selectedLayer.glass.refractionScale}
+                      mixed={Boolean(isMulti && merged.common.glass.refractionScale.mixed)}
                       min={0}
                       max={60}
                       step={1}
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, refractionScale: v },
                         }))
@@ -3090,13 +3696,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Chanfro da Lente (Bevel)"
                       value={selectedLayer.glass.bevelWidth ?? 22}
+                      mixed={Boolean(isMulti && merged.common.glass.bevelWidth.mixed)}
                       min={4}
                       max={64}
                       step={2}
                       unit="px"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, bevelWidth: v },
                         }))
@@ -3105,13 +3712,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Brilho Especular"
                       value={Math.round((selectedLayer.glass.specularIntensity ?? 0.45) * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.specularIntensity.mixed)}
                       min={0}
                       max={100}
                       step={2}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, specularIntensity: v / 100 },
                         }))
@@ -3127,11 +3735,10 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
                       <span className="text-xs text-[#A1A1AA]">Cor do Véu (Tint)</span>
                       <ColorInput aria-label="Cor do véu"
-                        
+                        mixed={Boolean(isMulti && merged.common.glass.tintColor.mixed)}
                         value={toHexColorInput(selectedLayer.glass.tintColor)}
                         onChange={(e) =>
-                          onPatchLayer(
-                            selectedLayer.id,
+                          patchTarget(
                             (l) => ({ ...l, glass: { ...l.glass, tintColor: e.target.value } }),
                             "coalesced"
                           )
@@ -3141,13 +3748,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Opacidade do Véu"
                       value={Math.round(selectedLayer.glass.frostOpacity * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.frostOpacity.mixed)}
                       min={0}
                       max={80}
                       step={1}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, frostOpacity: v / 100 },
                         }))
@@ -3156,13 +3764,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Granulação (Areia Fina)"
                       value={Math.round((selectedLayer.glass.noiseOpacity ?? 0.04) * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.noiseOpacity.mixed)}
                       min={0}
                       max={35}
                       step={1}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, noiseOpacity: v / 100 },
                         }))
@@ -3171,13 +3780,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Luminosidade"
                       value={Math.round((selectedLayer.glass.brightness ?? 1.06) * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.brightness.mixed)}
                       min={60}
                       max={160}
                       step={2}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, brightness: v / 100 },
                         }))
@@ -3186,13 +3796,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Contraste"
                       value={Math.round((selectedLayer.glass.contrast ?? 1.04) * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.contrast.mixed)}
                       min={80}
                       max={160}
                       step={2}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, contrast: v / 100 },
                         }))
@@ -3201,13 +3812,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Saturação"
                       value={Math.round(selectedLayer.glass.saturation * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.saturation.mixed)}
                       min={0}
                       max={240}
                       step={5}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, saturation: v / 100 },
                         }))
@@ -3223,13 +3835,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Borda Sutil"
                       value={Math.round(selectedLayer.glass.borderOpacity * 100)}
+                      mixed={Boolean(isMulti && merged.common.glass.borderOpacity.mixed)}
                       min={0}
                       max={70}
                       step={2}
                       unit="%"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, borderOpacity: v / 100 },
                         }))
@@ -3238,13 +3851,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Raio da Borda"
                       value={selectedLayer.glass.borderRadius}
+                      mixed={Boolean(isMulti && merged.common.glass.borderRadius.mixed)}
                       min={0}
                       max={160}
                       step={2}
                       unit="px"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, borderRadius: v },
                         }))
@@ -3253,13 +3867,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <InspectorSlider
                       label="Sombra"
                       value={selectedLayer.glass.shadowBlur}
+                      mixed={Boolean(isMulti && merged.common.glass.shadowBlur.mixed)}
                       min={0}
                       max={64}
                       step={2}
                       unit="px"
                       {...sliderHandlers}
                       onChange={(v) =>
-                        onPatchLayer(selectedLayer.id, (l) => ({
+                        patchTarget((l) => ({
                           ...l,
                           glass: { ...l.glass, shadowBlur: v },
                         }))
@@ -3279,13 +3894,14 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       <InspectorSlider
                         label="Dispersão RGB"
                         value={selectedLayer.glass.chromaticAberration}
+                        mixed={Boolean(isMulti && merged.common.glass.chromaticAberration.mixed)}
                         min={0}
                         max={6}
                         step={0.2}
                         unit="px"
                         {...sliderHandlers}
                         onChange={(v) =>
-                          onPatchLayer(selectedLayer.id, (l) => ({
+                          patchTarget((l) => ({
                             ...l,
                             glass: { ...l.glass, chromaticAberration: v },
                           }))
@@ -3300,6 +3916,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 <InspectorSlider
                   label="Opacidade"
                   value={selectedLayer.opacity}
+                  mixed={Boolean(isMulti && merged.common.opacity.mixed)}
                   min={0}
                   max={1}
                   step={0.02}
@@ -3310,14 +3927,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       initialExpr: selectedLayer.fx?.opacity ?? "",
                       fallback: String(selectedLayer.opacity),
                       onApply: (expr) =>
-                        onPatchLayer(
-                          selectedLayer.id,
+                        patchTarget(
                           (l) => ({ ...l, fx: { ...l.fx, opacity: expr } }),
                           "discrete"
                         ),
                       onClear: () =>
-                        onPatchLayer(
-                          selectedLayer.id,
+                        patchTarget(
                           (l) => {
                             const fx = { ...l.fx };
                             delete fx.opacity;
@@ -3328,7 +3943,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     })
                   }
                   {...sliderHandlers}
-                  onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, opacity: v }))}
+                  onChange={(v) => patchTarget((l) => ({ ...l, opacity: v }))}
                 />
 
                 <div className="flex items-center justify-between frosted-chrome-card px-3 py-2">
@@ -3341,14 +3956,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         initialExpr: selectedLayer.fx?.visible ?? "",
                         fallback: "1",
                         onApply: (expr) =>
-                          onPatchLayer(
-                            selectedLayer.id,
+                          patchTarget(
                             (l) => ({ ...l, fx: { ...l.fx, visible: expr } }),
                             "discrete"
                           ),
                         onClear: () =>
-                          onPatchLayer(
-                            selectedLayer.id,
+                          patchTarget(
                             (l) => {
                               const fx = { ...l.fx };
                               delete fx.visible;
@@ -3365,9 +3978,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   Blend Mode
                   <Select
                     value={selectedLayer.blendMode}
+                    mixed={Boolean(isMulti && merged.common.blendMode.mixed)}
                     onChange={(e) =>
-                      onPatchLayer(
-                        selectedLayer.id,
+                      patchTarget(
                         (l) => ({ ...l, blendMode: e.target.value as BlendModeCss }),
                         "discrete"
                       )
@@ -3388,89 +4001,49 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
           {layerTab === "TRANSFORM" && (
             <>
-              <div className="space-y-1.5">
-                <span className="block text-[11px] text-[#A1A1AA]">Alinhamento Rápido</span>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, x: 0.12 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Esquerda
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, x: 0.5 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Centro H
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, x: 0.88 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Direita
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, y: 0.14 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Topo
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, y: 0.5 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Centro V
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onPatchLayer(selectedLayer.id, (l) => ({ ...l, y: 0.86 }), "discrete")
-                    }
-                    className="prism-pill-idle py-1.5 rounded-lg text-[10px]"
-                  >
-                    Base
-                  </button>
-                </div>
-              </div>
+              {renderAlignAndTransformQuickBar(merged.count)}
 
               <InspectorSlider
-                label="Posição X"
-                value={Number((selectedLayer.x * 100).toFixed(1))}
+                label={isMulti ? "Posição X (Relativa)" : "Posição X"}
+                value={Number(((isMulti ? merged.common.x.value : selectedLayer.x) * 100).toFixed(1))}
+                mixed={Boolean(isMulti && merged.common.x.mixed)}
                 min={0}
                 max={100}
                 step={0.5}
                 unit="%"
                 {...sliderHandlers}
-                onChange={(v) =>
-                  onPatchLayer(selectedLayer.id, (l) => ({ ...l, x: Number((v / 100).toFixed(4)) }))
-                }
+                onChange={(v) => {
+                  if (isMulti) {
+                    const delta = v / 100 - merged.common.x.value;
+                    patchTarget((l) => ({
+                      ...l,
+                      x: Math.max(0, Math.min(1, Number((l.x + delta).toFixed(4)))),
+                    }));
+                  } else {
+                    patchTarget((l) => ({ ...l, x: Number((v / 100).toFixed(4)) }));
+                  }
+                }}
               />
               <InspectorSlider
-                label="Posição Y"
-                value={Number((selectedLayer.y * 100).toFixed(1))}
+                label={isMulti ? "Posição Y (Relativa)" : "Posição Y"}
+                value={Number(((isMulti ? merged.common.y.value : selectedLayer.y) * 100).toFixed(1))}
+                mixed={Boolean(isMulti && merged.common.y.mixed)}
                 min={0}
                 max={100}
                 step={0.5}
                 unit="%"
                 {...sliderHandlers}
-                onChange={(v) =>
-                  onPatchLayer(selectedLayer.id, (l) => ({ ...l, y: Number((v / 100).toFixed(4)) }))
-                }
+                onChange={(v) => {
+                  if (isMulti) {
+                    const delta = v / 100 - merged.common.y.value;
+                    patchTarget((l) => ({
+                      ...l,
+                      y: Math.max(0, Math.min(1, Number((l.y + delta).toFixed(4)))),
+                    }));
+                  } else {
+                    patchTarget((l) => ({ ...l, y: Number((v / 100).toFixed(4)) }));
+                  }
+                }}
               />
 
               {selectedLayer.kind !== "TEXT" && (
@@ -3478,22 +4051,24 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   <InspectorSlider
                     label="Largura"
                     value={selectedLayer.width}
+                    mixed={Boolean(isMulti && merged.common.width.mixed)}
                     min={selectedLayer.kind === "PROGRESS" ? 16 : 8}
                     max={2200}
                     step={selectedLayer.kind === "SVG" ? 2 : 4}
                     unit="px"
                     {...sliderHandlers}
-                    onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, width: v }))}
+                    onChange={(v) => patchTarget((l) => ({ ...l, width: v }))}
                   />
                   <InspectorSlider
                     label="Altura"
                     value={selectedLayer.height}
+                    mixed={Boolean(isMulti && merged.common.height.mixed)}
                     min={selectedLayer.kind === "PROGRESS" ? 2 : 8}
                     max={1400}
                     step={selectedLayer.kind === "PROGRESS" ? 1 : selectedLayer.kind === "SVG" ? 2 : 4}
                     unit="px"
                     {...sliderHandlers}
-                    onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, height: v }))}
+                    onChange={(v) => patchTarget((l) => ({ ...l, height: v }))}
                   />
                 </>
               )}
@@ -3501,6 +4076,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
               <InspectorSlider
                 label="Rotação"
                 value={selectedLayer.rotation}
+                mixed={Boolean(isMulti && merged.common.rotation.mixed)}
                 min={-180}
                 max={180}
                 step={1}
@@ -3512,14 +4088,12 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     initialExpr: selectedLayer.fx?.rotation ?? "",
                     fallback: String(selectedLayer.rotation),
                     onApply: (expr) =>
-                      onPatchLayer(
-                        selectedLayer.id,
+                      patchTarget(
                         (l) => ({ ...l, fx: { ...l.fx, rotation: expr } }),
                         "discrete"
                       ),
                     onClear: () =>
-                      onPatchLayer(
-                        selectedLayer.id,
+                      patchTarget(
                         (l) => {
                           const fx = { ...l.fx };
                           delete fx.rotation;
@@ -3530,7 +4104,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   })
                 }
                 {...sliderHandlers}
-                onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, rotation: v }))}
+                onChange={(v) => patchTarget((l) => ({ ...l, rotation: v }))}
               />
 
               <div className="space-y-2 pt-2.5 border-t border-white/10">
@@ -3538,9 +4112,9 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                   Ação ao Clicar (Widgets / Player)
                   <Select
                     value={selectedLayer.clickAction ?? "NONE"}
+                    mixed={Boolean(isMulti && merged.common.clickAction.mixed)}
                     onChange={(e) =>
-                      onPatchLayer(
-                        selectedLayer.id,
+                      patchTarget(
                         (l) => ({ ...l, clickAction: e.target.value as ClickAction }),
                         "discrete"
                       )
@@ -3558,7 +4132,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                     <option value="NEXT_GLOBAL_LIST">Próximo Valor da Lista</option>
                   </Select>
                 </label>
-                {(() => {
+                {!isMulti && (() => {
                   const action = selectedLayer.clickAction ?? "NONE";
                   const field = (
                     key: "clickUrl" | "clickTarget" | "clickGlobal" | "clickValue",
@@ -3571,7 +4145,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                         value={selectedLayer[key] ?? ""}
                         placeholder={placeholder}
                         onChange={(e) =>
-                          onPatchLayer(selectedLayer.id, (l) => ({ ...l, [key]: e.target.value }), "discrete")
+                          patchTarget((l) => ({ ...l, [key]: e.target.value }), "discrete")
                         }
                         className="mt-1 w-full bg-black border border-white/15 rounded-xl px-2.5 py-1.5 text-xs text-white outline-none"
                       />
@@ -3603,20 +4177,22 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                 <InspectorSlider
                   label="Eixo X"
                   value={selectedLayer.parallaxX}
+                  mixed={Boolean(isMulti && merged.common.parallaxX.mixed)}
                   min={-1.2}
                   max={1.2}
                   step={0.05}
                   {...sliderHandlers}
-                  onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, parallaxX: v }))}
+                  onChange={(v) => patchTarget((l) => ({ ...l, parallaxX: v }))}
                 />
                 <InspectorSlider
                   label="Eixo Y"
                   value={selectedLayer.parallaxY}
+                  mixed={Boolean(isMulti && merged.common.parallaxY.mixed)}
                   min={-1.2}
                   max={1.2}
                   step={0.05}
                   {...sliderHandlers}
-                  onChange={(v) => onPatchLayer(selectedLayer.id, (l) => ({ ...l, parallaxY: v }))}
+                  onChange={(v) => patchTarget((l) => ({ ...l, parallaxY: v }))}
                 />
               </div>
             </>

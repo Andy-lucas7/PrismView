@@ -993,6 +993,7 @@ pub struct BoundSubtree {
     pub center_base: [f32; 2],
     pub rot_base: f32,
     pub scale_base: f32,
+    pub flip: [bool; 2],
     /// Escala de UI do rebuild (offset do binding é em px lógicos).
     pub ui: f32,
     /// Delta do binding usado no rebuild.

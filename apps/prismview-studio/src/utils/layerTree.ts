@@ -51,6 +51,17 @@ export function collectAllLayerIds(layers: SceneLayer[]): string[] {
   return out;
 }
 
+export function collectLayerIdsByKind(layers: SceneLayer[], kind: SceneLayer["kind"]): string[] {
+  const out: string[] = [];
+  for (const layer of layers) {
+    if (layer.kind === kind) out.push(layer.id);
+    if (layer.children?.length) {
+      out.push(...collectLayerIdsByKind(layer.children, kind));
+    }
+  }
+  return out;
+}
+
 export function isDescendantOf(
   layers: SceneLayer[],
   ancestorId: string,
@@ -188,6 +199,39 @@ export function moveLayersZByIds(
   }
 
   return changed ? copy : layers;
+}
+
+/**
+ * Move as camadas selecionadas para a frente total (`toFront = true`, topo da pilha Z)
+ * ou para o fundo total (`toFront = false`, base da pilha Z do mesmo contêiner), preservando
+ * a ordem relativa entre as selecionadas.
+ */
+export function moveLayersZExtremeByIds(
+  layers: SceneLayer[],
+  ids: ReadonlySet<string>,
+  toFront: boolean
+): SceneLayer[] {
+  if (ids.size === 0) return layers;
+  const keep: SceneLayer[] = [];
+  const picked: SceneLayer[] = [];
+  for (const layer of layers) {
+    if (ids.has(layer.id)) picked.push(layer);
+    else keep.push(layer);
+  }
+  let next = toFront ? [...keep, ...picked] : [...picked, ...keep];
+  let changed = next.some((item, idx) => item !== layers[idx]);
+
+  next = next.map((layer) => {
+    if (!layer.children?.length) return layer;
+    const movedChildren = moveLayersZExtremeByIds(layer.children, ids, toFront);
+    if (movedChildren !== layer.children) {
+      changed = true;
+      return { ...layer, children: movedChildren };
+    }
+    return layer;
+  });
+
+  return changed ? next : layers;
 }
 
 function reassignIds(layer: SceneLayer, isRoot: boolean, suffixCopy: boolean): SceneLayer {

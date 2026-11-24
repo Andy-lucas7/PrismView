@@ -95,11 +95,13 @@ export interface SelectProps {
   disabled?: boolean;
   title?: string;
   id?: string;
+  /** Quando `true`, exibe "misto" no botão até que uma opção seja escolhida. */
+  mixed?: boolean;
   "aria-label"?: string;
 }
 
 /** Drop-in de `<select>`: mesmas props/`<option>`, mas com popover animado (o nativo é desenhado pelo SO). */
-export const Select: React.FC<SelectProps> = ({ value, onChange, children, className = "", disabled, title, id, ...aria }) => {
+export const Select: React.FC<SelectProps> = ({ value, onChange, children, className = "", disabled, title, id, mixed = false, ...aria }) => {
   const options = useMemo(() => collectOptions(children), [children]);
   const cur = options.find((o) => o.value === String(value));
   const [open, setOpen] = useState(false);
@@ -121,7 +123,7 @@ export const Select: React.FC<SelectProps> = ({ value, onChange, children, class
     if (!o || o.disabled) return;
     setOpen(false);
     btnRef.current?.focus();
-    if (o.value !== String(value)) {
+    if (o.value !== String(value) || mixed) {
       const ev = { target: { value: o.value }, currentTarget: { value: o.value } } as unknown as React.ChangeEvent<HTMLSelectElement>;
       onChange(ev);
     }
@@ -185,7 +187,9 @@ export const Select: React.FC<SelectProps> = ({ value, onChange, children, class
         onKeyDown={onKeyDown}
         className={`${className} flex items-center justify-between gap-2 text-left disabled:opacity-50`}
       >
-        <span className="min-w-0 flex-1 truncate">{cur ? cur.label : "—"}</span>
+        <span className="min-w-0 flex-1 truncate">
+          {mixed ? <span className="italic text-[#A1A1AA]">misto</span> : cur ? cur.label : "—"}
+        </span>
         <ChevronDown className={`h-3 w-3 shrink-0 text-[#A1A1AA] transition-transform duration-200 ${open ? "rotate-180" : ""}`} aria-hidden />
       </button>
       {createPortal(
@@ -205,7 +209,7 @@ export const Select: React.FC<SelectProps> = ({ value, onChange, children, class
               }}
             >
               {options.map((o, i) => {
-                const selected = o.value === String(value);
+                const selected = !mixed && o.value === String(value);
                 return (
                   <button
                     key={`${o.value}-${i}`}
@@ -244,6 +248,8 @@ export interface ColorInputProps {
   className?: string;
   disabled?: boolean;
   title?: string;
+  /** Quando `true`, indica que os itens selecionados têm cores diferentes ("misto"). */
+  mixed?: boolean;
   "aria-label"?: string;
 }
 
@@ -256,7 +262,7 @@ declare global {
 }
 
 /** Seletor HSV com popover animado. Mesmo contrato do `<input type="color">` (onChange contínuo, onBlur ao fechar). */
-export const ColorInput: React.FC<ColorInputProps> = ({ value, onChange, onBlur, className = "", disabled, title, ...aria }) => {
+export const ColorInput: React.FC<ColorInputProps> = ({ value, onChange, onBlur, className = "", disabled, title, mixed = false, ...aria }) => {
   const [open, setOpen] = useState(false);
   const [anchor, setAnchor] = useState<Anchor | null>(null);
   const [hsv, setHsv] = useState<Hsv>(() => hexToHsv(value) ?? { h: 0, s: 0, v: 1 });
@@ -323,13 +329,26 @@ export const ColorInput: React.FC<ColorInputProps> = ({ value, onChange, onBlur,
         ref={btnRef}
         type="button"
         aria-label={aria["aria-label"]}
-        title={title}
+        title={mixed ? `${title ? `${title} · ` : ""}misto` : title}
         aria-expanded={open}
         disabled={disabled}
         onClick={toggle}
-        className={`prism-color-swatch ${className}`}
-        style={{ backgroundColor: rgb ? value : "#000000" }}
-      />
+        className={`prism-color-swatch relative flex items-center justify-center ${className}`}
+        style={
+          mixed
+            ? {
+                backgroundImage:
+                  "linear-gradient(135deg, rgba(255,255,255,0.85) 0%, rgba(161,161,170,0.45) 50%, rgba(24,24,27,0.95) 100%)",
+              }
+            : { backgroundColor: rgb ? value : "#000000" }
+        }
+      >
+        {mixed && (
+          <span className="pointer-events-none text-[8px] font-mono-fx uppercase tracking-tight text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]">
+            misto
+          </span>
+        )}
+      </button>
       {createPortal(
         <AnimatePresence>
           {open && anchor && (
