@@ -65,3 +65,32 @@ export const SwapText: React.FC<{ id: string; children: React.ReactNode; classNa
     </span>
   );
 };
+
+/** Texto que se revela palavra por palavra (blur + sobe), estilo react-bits "BlurText". Só na montagem. */
+export const BlurText: React.FC<{ text: string; className?: string; delay?: number; stagger?: number }> = ({
+  text,
+  className,
+  delay = 0,
+  stagger = 0.045,
+}) => {
+  const reduced = Boolean(useReducedMotion());
+  if (reduced) return <span className={className}>{text}</span>;
+  const words = text.split(" ");
+  return (
+    <span className={className} aria-label={text}>
+      {words.map((w, i) => (
+        <motion.span
+          key={`${w}-${i}`}
+          aria-hidden
+          className="inline-block whitespace-pre"
+          initial={{ opacity: 0, y: 8, filter: `blur(${BLUR.exit}px)` }}
+          animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+          transition={{ duration: sec(DURATION.slow), ease: [...EASE.decelerate], delay: delay + i * stagger }}
+        >
+          {w}
+          {i < words.length - 1 ? " " : ""}
+        </motion.span>
+      ))}
+    </span>
+  );
+};

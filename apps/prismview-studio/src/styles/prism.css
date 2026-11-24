@@ -255,11 +255,11 @@ html.prism-transparent #root {
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 18px;
   overflow: hidden;
-  transition: transform var(--motion-fast, 160ms) var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1)), border-color var(--motion-fast, 160ms) ease, box-shadow var(--motion-fast, 160ms) ease;
+  transition: translate var(--motion-fast, 160ms) var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1)), border-color var(--motion-fast, 160ms) ease, box-shadow var(--motion-fast, 160ms) ease;
 }
 
 .prism-hub-card:hover {
-  transform: translateY(-2px);
+  translate: 0 -2px;
   border-color: rgba(255, 255, 255, 0.22);
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65);
 }
@@ -382,4 +382,49 @@ button:disabled {
 }
 .prism-color-swatch:disabled {
   opacity: 0.5;
+}
+
+/* ── Micro-interações (Etapa 6) ─────────────────────────────────────────────────────────── */
+/* Spotlight dos cards da grade: brilho que segue o ponteiro. */
+.prism-spot .prism-hub-card {
+  position: relative;
+}
+.prism-spot .prism-hub-card::after {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), rgba(255, 255, 255, 0.09), transparent 62%);
+  opacity: 0;
+  transition: opacity var(--motion-base, 280ms) ease;
+}
+.prism-spot .prism-hub-card:hover::after {
+  opacity: 1;
+}
+
+/* Botão principal: brilho que varre ao passar o mouse. */
+.prismatic-cta {
+  overflow: hidden;
+}
+.prismatic-cta::after {
+  content: "";
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 35%, rgba(139, 92, 246, 0.22) 50%, transparent 65%);
+  transform: translateX(-120%);
+}
+.prismatic-cta:hover:not(:disabled)::after {
+  transform: translateX(120%);
+  transition: transform 720ms var(--ease-decelerate, cubic-bezier(0.05, 0.7, 0.1, 1));
+}
+
+/* Slider: o polegar cresce ao arrastar. */
+input[type="range"].prism-slider::-webkit-slider-thumb {
+  transition: transform var(--motion-fast, 160ms) var(--ease-press, cubic-bezier(0.22, 1, 0.36, 1)), box-shadow var(--motion-fast, 160ms) ease;
+}
+input[type="range"].prism-slider:active::-webkit-slider-thumb {
+  transform: scale(1.22);
+  box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.12);
 }

@@ -162,7 +162,8 @@ Handoff: assim que o Studio entrega o 1º quadro, cross-fade snapshot → Studio
 | Carrossel | **Feito (2)**: `components/hub/ViewCarousel.tsx` + `HubLayout.tsx` nas 3 abas |
 | Expandir View → Studio | Pendente (1); `if (editing)` é corte seco |
 | Transição de abas | Pendente (4); `hubTab ===` é render condicional |
-| Grid como modo alternativo | Parcial (5): botão no canto + fade/blur; falta o morph por `layoutId` entre card e grid |
+| Grid como modo alternativo | **Feito (5)**: botão no canto; o mesmo card (`layoutId`) viaja entre carrossel e grade; o carrossel reabre na View que estava ao centro |
+| Micro-interações | **Feitas (6)**: `BlurText` nos títulos dos cards, stagger de entrada na grade, pílula deslizante na navegação lateral (`layoutId`), spotlight que segue o ponteiro nos cards da grade, brilho do botão principal, polegar do slider que cresce |
 | Intro | **Feita (3)**: `components/intro/PrismIntro.tsx` + `heroShader.ts` (GLSL, derretimento de vidro ao entrar); aparece 1× por sessão do Windows (`get_session_marker` = hora de logon da sessão, `engine/introGate.ts`) |
 
 **Aplicar já é instantâneo no PrismView** (commit `2363599`): o fade + blur da Etapa 1 roda **em paralelo** ao aplicar, sem atrasar o motor nativo.
