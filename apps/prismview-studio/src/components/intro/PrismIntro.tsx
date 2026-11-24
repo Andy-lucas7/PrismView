@@ -207,6 +207,7 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
     let uploadedTitle = false;
     let raf = 0;
     let lost = false;
+    let ambOrigin: number | null = null;
     const onLost = (e: Event) => {
       e.preventDefault();
       lost = true;
@@ -240,8 +241,11 @@ export const PrismIntro: React.FC<PrismIntroProps> = ({ onEnterStart, onDone, lo
       gl.uniform2f(loc.res, w, h);
       gl.uniform2f(loc.conv, w * 0.5, h * 0.42);
       gl.uniform2f(loc.titleCenter, w * 0.5, lerp(h * 0.42, h * 0.28, sw));
+      if (ambOrigin === null) ambOrigin = now;
+      // Ciclos em 20 voltas (180 s): múltiplos 1.0, 0.85, 1.10 e 0.70 completam 20, 17, 22 e 14 voltas exatas (0 salto).
+      const ambPhase = (((now - ambOrigin) % 180_000) / 9000) * Math.PI * 2;
       gl.uniform1f(loc.time, tt);
-      gl.uniform1f(loc.amb, ((now % 9000) / 9000) * Math.PI * 2);
+      gl.uniform1f(loc.amb, ambPhase);
       gl.uniform1f(loc.melt, m);
       const b = btnRef.current?.getBoundingClientRect();
       gl.uniform2f(loc.origin, (b ? b.left + b.width / 2 : size.w * 0.5) * k, (b ? b.top + b.height / 2 : size.h * 0.8) * k);
