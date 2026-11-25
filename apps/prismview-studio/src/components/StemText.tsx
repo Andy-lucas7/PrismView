@@ -108,7 +108,7 @@ function buildMask(p: StemTextProps, dpr: number): RasterMask | null {
   const src = document.createElement("canvas");
   src.width = Math.max(2, Math.round(cssW * scale));
   src.height = Math.max(2, Math.round(cssH0 * scale));
-  const ctx = src.getContext("2d");
+  const ctx = src.getContext("2d", { willReadFrequently: true });
   if (!ctx) return null;
   ctx.scale(scale, scale);
   ctx.font = font;

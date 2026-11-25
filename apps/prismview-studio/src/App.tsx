@@ -62,6 +62,22 @@ import { nativeCompatIssues } from "./utils/nativeCompat";
 const SAVE_RETRY_DELAYS_MS = [2000, 5000, 15000];
 /** Depois de "Aplicar": tempo para o motor abrir vídeo/modelos antes de ler `errors` do status. */
 const ENGINE_STATUS_CHECK_DELAY_MS = 2500;
+const EDITING_ID_KEY = "prismview.editingId.v1";
+function readSessionEditingId(): string | null {
+  try {
+    return sessionStorage.getItem(EDITING_ID_KEY);
+  } catch {
+    return null;
+  }
+}
+function writeSessionEditingId(id: string | null): void {
+  try {
+    if (id) sessionStorage.setItem(EDITING_ID_KEY, id);
+    else sessionStorage.removeItem(EDITING_ID_KEY);
+  } catch {
+    /* sem storage */
+  }
+}
 import { HubStillWarmer, HubThumbnail } from "./components/HubThumbnail";
 import { HubLayout, readHubView, writeHubView, type HubView } from "./components/hub/HubLayout";
 import { StudioHero, type HeroRect } from "./components/hub/StudioHero";
@@ -574,6 +590,7 @@ const StudioHubApp: React.FC = () => {
   const pendingSaveRef = useRef<PrismProject | null>(null);
   // Trava de ações pesadas (aplicar/fixar/exportar/importar/excluir); pausa/autostart têm estado próprio.
   const busyRef = useRef<string | null>(null);
+  const pendingApplyRef = useRef<{ proj: PrismProject; silent: boolean } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [pauseBusy, setPauseBusy] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
@@ -694,17 +711,35 @@ const StudioHubApp: React.FC = () => {
       setBrokenProjects(broken);
       if (saved.length > 0) {
         // Border migration: legacy 3D configs (30/60/120 FPS, single modelSrc) → schema 2
-        setProjects(saved.map((p) => normalizeProjectScene3D(p)));
+        const normalized = saved.map((p) => normalizeProjectScene3D(p));
+        setProjects(normalized);
+        const savedEditId = readSessionEditingId();
+        if (savedEditId) {
+          const found = normalized.find((p) => p.id === savedEditId);
+          if (found) setEditing((cur) => cur ?? found);
+          else writeSessionEditingId(null);
+        }
       } else if (broken.length > 0) {
         // Projetos ilegíveis (em quarentena): não semear modelos por cima, só avisar.
         setProjects([]);
       } else {
         const defaults = createDefaultProjects();
         setProjects(defaults);
+        const savedEditId = readSessionEditingId();
+        if (savedEditId) {
+          const found = defaults.find((p) => p.id === savedEditId);
+          if (found) setEditing((cur) => cur ?? found);
+        }
         void Promise.all(defaults.map((p) => saveProjectOrReport(p)));
       }
     } else {
-      setProjects(createDefaultProjects());
+      const defaults = createDefaultProjects();
+      setProjects(defaults);
+      const savedEditId = readSessionEditingId();
+      if (savedEditId) {
+        const found = defaults.find((p) => p.id === savedEditId);
+        if (found) setEditing((cur) => cur ?? found);
+      }
     }
 
     if (rtRes.status === "fulfilled") {
@@ -1121,6 +1156,11 @@ const StudioHubApp: React.FC = () => {
   const applyWallpaper = async (proj: PrismProject, silent = false) => {
     // Clique explícito sempre vence qualquer autosave enfileirado.
     desktopSyncPendingRef.current = null;
+    if (busyRef.current?.startsWith("apply:")) {
+      // Último clique vence: enfileira em vez de descartar durante troca frenética.
+      pendingApplyRef.current = { proj, silent };
+      return;
+    }
     await withBusy(
       `apply:${proj.id}`,
       async () => {
@@ -1178,6 +1218,11 @@ const StudioHubApp: React.FC = () => {
       },
       silent
     );
+    const queued = pendingApplyRef.current;
+    if (queued) {
+      pendingApplyRef.current = null;
+      void applyWallpaper(queued.proj, queued.silent);
+    }
   };
 
   const clearWallpaper = async () => {
@@ -1502,6 +1547,10 @@ const StudioHubApp: React.FC = () => {
 
   const togglePause = async () => {
     if (pauseBusy) return;
+    if (!isTauriRuntime()) {
+      notify("Disponível apenas no app desktop.");
+      return;
+    }
     const nextPaused = !runtimeRef.current.paused;
     setPauseBusy(true);
     // Feedback imediato no botão Ativo/Pausado sem esperar outras ações do Hub.
@@ -1672,6 +1721,7 @@ const StudioHubApp: React.FC = () => {
   /** Abre o Studio: o card cresce até preencher a tela; só então o Studio monta e o hero some em fade. */
   function openStudio(project: PrismProject): void {
     if (phaseRef.current !== "idle") return;
+    writeSessionEditingId(project.id);
     phaseRef.current = "opening";
     setPhase("opening");
     setHubFocusId(project.id);
@@ -1742,6 +1792,7 @@ const StudioHubApp: React.FC = () => {
       return;
     }
     if (!editing) return;
+    writeSessionEditingId(null);
     const proj = editing;
     setEditingTxActive(false);
     void flushPendingSave();
@@ -1858,9 +1909,17 @@ const StudioHubApp: React.FC = () => {
               </span>
             </div>
             <span
-              title={runtime.paused ? "Motor pausado" : "Motor ativo"}
+              title={
+                !isTauriRuntime()
+                  ? "Modo navegador (motor desktop desconectado)"
+                  : runtime.paused
+                  ? "Motor pausado"
+                  : "Motor ativo"
+              }
               className={`w-2 h-2 rounded-full ${
-                !runtime.paused ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]" : "bg-[#52525B]"
+                isTauriRuntime() && !runtime.paused
+                  ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.7)]"
+                  : "bg-[#52525B]"
               }`}
             />
           </div>
@@ -2486,7 +2545,7 @@ const StudioHubApp: React.FC = () => {
                             <button
                               type="button"
                               onClick={() => applyWallpaper(wp)}
-                              disabled={busy !== null}
+                              disabled={busy !== null && (!busy.startsWith("apply:") || busy === `apply:${wp.id}`)}
                               aria-busy={busy === `apply:${wp.id}`}
                               className={`${LOCK_CLS} prismatic-cta py-2 text-xs flex items-center justify-center gap-1.5`}
                             >
@@ -3158,7 +3217,9 @@ const StudioHubApp: React.FC = () => {
 
 applyMotionCssVars();
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+const rootEl = document.getElementById("root") as HTMLElement & { __prismRoot?: ReturnType<typeof ReactDOM.createRoot> };
+const root = (rootEl.__prismRoot ??= ReactDOM.createRoot(rootEl));
+root.render(
   <React.StrictMode>
     {/* Respeita "reduzir movimento" do sistema em todas as animações do framer-motion. */}
     <MotionConfig reducedMotion="user">

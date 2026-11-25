@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   CANVAS_MARGIN_PX,
   clampSplit,
+  effectivePanelWidth,
   nudgeSplit,
   PANEL_GAP_PX,
   PANEL_OPEN_KEY,
@@ -97,4 +98,8 @@ test("margem direita do canvas: painel aberto deixa folga leve do painel, recolh
   assert.equal(stageRightInset(true), PANEL_WIDTH_PX + PANEL_GAP_PX + CANVAS_MARGIN_PX);
   assert.equal(stageRightInset(false), CANVAS_MARGIN_PX);
   assert.ok(stageRightInset(true) > stageRightInset(false));
+  assert.equal(effectivePanelWidth(1440), PANEL_WIDTH_PX);
+  assert.equal(effectivePanelWidth(640), 333);
+  assert.equal(effectivePanelWidth(480), 250);
+  assert.ok(stageRightInset(true, 480) < stageRightInset(true, 1440));
 });

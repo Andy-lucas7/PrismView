@@ -83,6 +83,15 @@ export function nudgeSplit(current: number, steps: number, step = SPLIT_STEP): n
 export const PANEL_WIDTH_PX = 352;
 export const PANEL_GAP_PX = 16;
 export const CANVAS_MARGIN_PX = 12;
-export function stageRightInset(open: boolean): number {
-  return open ? PANEL_WIDTH_PX + PANEL_GAP_PX + CANVAS_MARGIN_PX : CANVAS_MARGIN_PX;
+
+/** Largura efetiva do painel lateral (encolhe em janelas muito estreitas para não empurrar o canvas). */
+export function effectivePanelWidth(viewportW?: number): number {
+  if (viewportW === undefined || !Number.isFinite(viewportW) || viewportW >= 760) {
+    return PANEL_WIDTH_PX;
+  }
+  return Math.max(220, Math.min(PANEL_WIDTH_PX, Math.round(viewportW * 0.52)));
+}
+
+export function stageRightInset(open: boolean, viewportW?: number): number {
+  return open ? effectivePanelWidth(viewportW) + PANEL_GAP_PX + CANVAS_MARGIN_PX : CANVAS_MARGIN_PX;
 }

@@ -129,14 +129,14 @@ export const StudioSidePanel: React.FC<StudioSidePanelProps> = ({ properties, la
     <aside
       ref={rootRef}
       aria-label="Painel do editor: propriedades e camadas"
-      style={{ width: PANEL_WIDTH_PX }}
+      style={{ width: `min(${PANEL_WIDTH_PX}px, max(220px, 52vw))` }}
       className="fixed top-20 right-4 bottom-4 z-30 frosted-chrome frosted-chrome-panel flex flex-col overflow-hidden"
     >
       <section
         ref={topRef}
         aria-label="Propriedades"
         style={{ flexBasis: `${(split * 100).toFixed(2)}%` }}
-        className="flex min-h-[170px] shrink-0 grow-0 flex-col overflow-hidden"
+        className="flex min-h-0 shrink-0 grow-0 flex-col overflow-y-auto"
       >
         {properties}
       </section>
@@ -160,7 +160,7 @@ export const StudioSidePanel: React.FC<StudioSidePanelProps> = ({ properties, la
         <span className="pointer-events-none absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-white/12 transition-colors group-hover:bg-white/35 group-focus-visible:bg-white/60" />
         <span className="pointer-events-none absolute left-1/2 top-1/2 h-1 w-9 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/20 transition-colors group-hover:bg-white/55 group-focus-visible:bg-white" />
       </div>
-      <section aria-label="Camadas" className="flex min-h-[150px] min-w-0 flex-1 flex-col overflow-hidden">
+      <section aria-label="Camadas" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {layers}
       </section>
     </aside>

@@ -457,25 +457,35 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   // (zero vertical clipping on 1536×864 / 125% DPI or short windows, matching exact desktop monitor aspect).
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [stageBounds, setStageBounds] = useState<{ w: number; h: number }>({ w: 960, h: 540 });
+  const [viewportW, setViewportW] = useState<number>(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1440
+  );
   useEffect(() => {
     const el = stageRef.current;
     if (!el) return;
     const update = () => {
-      const w = Math.max(160, el.clientWidth);
-      const h = Math.max(120, el.clientHeight);
+      const w = Math.max(80, el.clientWidth);
+      const h = Math.max(80, el.clientHeight);
       setStageBounds((prev) =>
         Math.abs(prev.w - w) > 1 || Math.abs(prev.h - h) > 1 ? { w, h } : prev
       );
+      if (typeof window !== "undefined") {
+        setViewportW((prev) => (prev === window.innerWidth ? prev : window.innerWidth));
+      }
     };
     update();
     const ro = new ResizeObserver(update);
     ro.observe(el);
-    return () => ro.disconnect();
+    window.addEventListener("resize", update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", update);
+    };
   }, []);
 
   const stageFrameStyle = useMemo<React.CSSProperties>(() => {
-    const availW = Math.max(160, stageBounds.w);
-    const availH = Math.max(120, stageBounds.h);
+    const availW = Math.max(80, stageBounds.w);
+    const availH = Math.max(80, stageBounds.h);
     if (project.packageType === "WIDGET") {
       const ratio = canvasLogicalW / Math.max(1, canvasLogicalH);
       const maxW = Math.min(680, canvasLogicalW, availW);
@@ -2312,14 +2322,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   return (
     <div className="relative w-full h-full bg-pureBlack overflow-hidden">
       {/* Top Floating Bar (Stationary during drag) */}
-      <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-3">
-        <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-2">
+      <header className="fixed top-4 left-4 right-4 z-30 flex items-center justify-between gap-2 sm:gap-3 min-w-0">
+        <div className="frosted-chrome rounded-full px-2 py-1.5 flex items-center gap-1.5 sm:gap-2 min-w-0 shrink">
           <button
             type="button"
             aria-label="Voltar ao Hub"
             title="Voltar ao Hub"
             onClick={onBack}
-            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition"
+            className="w-8 h-8 shrink-0 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
@@ -2327,19 +2337,19 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             aria-label="Nome do projeto"
             value={project.title}
             onChange={(e) => applyCoalescedChange({ ...project, title: e.target.value })}
-            className="bg-transparent text-xs font-semibold text-white outline-none px-1.5 w-48"
+            className="bg-transparent text-xs font-semibold text-white outline-none px-1.5 w-20 sm:w-32 lg:w-48 min-w-0"
           />
           {saveStatus && onSaveNow && <SaveStatusChip status={saveStatus} onSaveNow={onSaveNow} />}
-          <span className="px-2.5 py-1 rounded-full bg-white/10 text-[10px] uppercase tracking-wider text-[#A1A1AA]">
+          <span className="hidden sm:inline-flex px-2.5 py-1 rounded-full bg-white/10 text-[10px] uppercase tracking-wider text-[#A1A1AA] shrink-0">
             {project.packageType === "WIDGET" ? ".widget.prism" : ".prism"}
           </span>
-          <span className="h-4 w-px bg-white/15 mx-0.5" />
+          <span className="hidden sm:inline-block h-4 w-px bg-white/15 mx-0.5 shrink-0" />
           <button aria-label="Desfazer (Ctrl+Z)"
             type="button"
             onClick={handleUndo}
             disabled={!history.canUndo}
             title="Desfazer (Ctrl+Z)"
-            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
+            className={`w-7 h-7 shrink-0 rounded-full flex items-center justify-center transition ${
               history.canUndo
                 ? "text-white hover:bg-white/15"
                 : "text-[#52525B] cursor-not-allowed"
@@ -2352,7 +2362,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             onClick={handleRedo}
             disabled={!history.canRedo}
             title="Refazer (Ctrl+Y)"
-            className={`w-7 h-7 rounded-full flex items-center justify-center transition ${
+            className={`w-7 h-7 shrink-0 rounded-full flex items-center justify-center transition ${
               history.canRedo
                 ? "text-white hover:bg-white/15"
                 : "text-[#52525B] cursor-not-allowed"
@@ -2366,14 +2376,14 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               type="button"
               onClick={onOpenHelp}
               title="Ajuda, fórmulas e atalhos (F1)"
-              className="w-7 h-7 rounded-full flex items-center justify-center transition text-[#A1A1AA] hover:text-white hover:bg-white/15"
+              className="w-7 h-7 shrink-0 rounded-full flex items-center justify-center transition text-[#A1A1AA] hover:text-white hover:bg-white/15"
             >
               <BookOpen className="w-3.5 h-3.5" />
             </button>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <AnimatePresence initial={false}>{statusHint && (
             <motion.span {...POP} className="frosted-chrome rounded-full px-3 py-1.5 text-[11px] text-white/90">
               {statusHint}
@@ -2436,25 +2446,39 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
             {panelOpen ? <PanelRightClose className="w-4 h-4" /> : <PanelRightOpen className="w-4 h-4" />}
           </button>
           <button
+            type="button"
             onClick={onExport}
             disabled={exporting}
             aria-busy={exporting}
-            className="frosted-chrome rounded-full px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-[#A1A1AA]"
+            aria-label={exporting ? "Exportando…" : "Exportar"}
+            title={exporting ? "Exportando…" : "Exportar .prism"}
+            className="frosted-chrome rounded-full px-2.5 md:px-4 py-2 text-xs text-[#A1A1AA] hover:text-white transition flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:text-[#A1A1AA]"
           >
-            <Download className={`w-3.5 h-3.5 ${exporting ? "animate-pulse" : ""}`} />
-            {exporting ? "Exportando…" : "Exportar"}
+            <Download className={`w-3.5 h-3.5 shrink-0 ${exporting ? "animate-pulse" : ""}`} />
+            <span className="hidden md:inline">{exporting ? "Exportando…" : "Exportar"}</span>
           </button>
           <button
             type="button"
             onClick={onApply}
             disabled={applying}
             aria-busy={applying}
+            aria-label={
+              applying
+                ? project.packageType === "WIDGET"
+                  ? "Fixando…"
+                  : "Aplicando…"
+                : project.packageType === "WIDGET"
+                  ? "Fixar Widget na Tela"
+                  : "Aplicar no Desktop"
+            }
             title={
               compatIssues.length > 0
                 ? `${compatIssues.length} item(ns) não aparecem no desktop (veja o Inspetor)`
-                : undefined
+                : project.packageType === "WIDGET"
+                  ? "Fixar Widget na Tela"
+                  : "Aplicar no Desktop"
             }
-            className="relative prismatic-cta px-6 py-2 text-xs flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+            className="relative prismatic-cta px-3 md:px-6 py-2 text-xs flex items-center gap-2 whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed"
           >
             {compatIssues.length > 0 && (
               <span
@@ -2464,14 +2488,16 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
                 {compatIssues.length}
               </span>
             )}
-            <Sparkles className={`w-3.5 h-3.5 ${applying ? "animate-spin" : ""}`} />
-            {applying
-              ? project.packageType === "WIDGET"
-                ? "Fixando…"
-                : "Aplicando…"
-              : project.packageType === "WIDGET"
-                ? "Fixar Widget na Tela"
-                : "Aplicar no Desktop"}
+            <Sparkles className={`w-3.5 h-3.5 shrink-0 ${applying ? "animate-spin" : ""}`} />
+            <span className="hidden md:inline">
+              {applying
+                ? project.packageType === "WIDGET"
+                  ? "Fixando…"
+                  : "Aplicando…"
+                : project.packageType === "WIDGET"
+                  ? "Fixar Widget na Tela"
+                  : "Aplicar no Desktop"}
+            </span>
           </button>
         </div>
       </header>
@@ -2494,7 +2520,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
       <div
         className="absolute inset-0 pt-16 pb-3 pl-3"
-        style={{ paddingRight: stageRightInset(panelOpen) }}
+        style={{ paddingRight: stageRightInset(panelOpen, viewportW) }}
       >
         <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <div

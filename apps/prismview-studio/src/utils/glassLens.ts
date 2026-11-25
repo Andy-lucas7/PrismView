@@ -219,11 +219,11 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   // packed normal map (R=nx, G=ny, B=edgeSlope, A=sharpAlpha) on the GPU. The CPU pass below only
   // runs lazily for the CSS fallback.
 
-  // 1. Sharp alpha mask canvas
+  // 1. Sharp alpha mask canvas (willReadFrequently avoids GPU->CPU readback warnings in stemStretch & CPU fallback)
   const maskCanvas = document.createElement("canvas");
   maskCanvas.width = cw;
   maskCanvas.height = ch;
-  const maskCtx = maskCanvas.getContext("2d");
+  const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
   if (!maskCtx) return null;
   drawTextOnto(maskCtx, 0);
 
@@ -231,7 +231,7 @@ export function getGlyphGlassMaps(params: GlyphGlassParams): GlyphGlassMaps | nu
   const heightCanvas = document.createElement("canvas");
   heightCanvas.width = cw;
   heightCanvas.height = ch;
-  const heightCtx = heightCanvas.getContext("2d");
+  const heightCtx = heightCanvas.getContext("2d", { willReadFrequently: true });
   if (!heightCtx) return null;
   const heightSigmaPx = Math.max(0.8, heightBlurPx * renderScale);
   drawTextOnto(heightCtx, heightBlurPx);
