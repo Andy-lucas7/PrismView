@@ -1572,6 +1572,10 @@ pub struct EngineStatus {
     /// No máximo `ENGINE_ISSUES_MAX`; limpo a cada cena nova.
     #[serde(default)]
     pub errors: Vec<EngineIssue>,
+    /// Data de modificação do executável do motor em execução (s desde 1970; 0 = motor antigo).
+    /// O Studio compara com o .exe no disco e reinicia um motor desatualizado antes de aplicar.
+    #[serde(default)]
+    pub exe_stamp: u64,
 }
 
 /// Teto de `EngineStatus::errors`.

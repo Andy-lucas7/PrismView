@@ -1179,6 +1179,12 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
                 return null;
               })()}
               mediaElementsRef={mediaElementsRef}
+              mirrorForGlass={(() => {
+                // Vidro acima (mesmo nível ou dentro de grupos acima): ele lê este efeito como fundo.
+                const hasGlass = (ls: SceneLayer[]): boolean =>
+                  ls.some((l) => !l.hidden && (l.glass?.enabled || (l.children ? hasGlass(l.children) : false)));
+                return hasGlass(siblings.slice(siblings.indexOf(layer) + 1));
+              })()}
               effect={layer.shader}
               width={wPx}
               height={hPx}

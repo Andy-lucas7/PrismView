@@ -41,6 +41,42 @@ interface GpuContext {
   particleDrawLayout: any;
 }
 
+/**
+ * Saída estável de cada camada Espectro para quem está em cima (`sample_input`). O canvas
+ * WebGPU é descartado depois de apresentado, então ler o canvas fora do quadro devolve
+ * transparente: o produtor copia o quadro para `tex` (GPU→GPU, no mesmo encoder) só enquanto
+ * houver consumidores.
+ */
+export interface EspectroOutput {
+  tex: any;
+  w: number;
+  h: number;
+  version: number;
+  consumers: number;
+  canvas: HTMLCanvasElement | null;
+}
+const outputs = new Map<string, EspectroOutput>();
+
+export function espectroOutput(layerId: string): EspectroOutput {
+  let o = outputs.get(layerId);
+  if (!o) {
+    o = { tex: null, w: 0, h: 0, version: 0, consumers: 0, canvas: null };
+    outputs.set(layerId, o);
+  }
+  return o;
+}
+
+/** Produtor desmontado: solta a textura; o registro some quando ninguém mais o usa. */
+export function releaseEspectroOutput(layerId: string): void {
+  const o = outputs.get(layerId);
+  if (!o) return;
+  o.tex?.destroy();
+  o.tex = null;
+  o.canvas = null;
+  o.version++;
+  if (o.consumers <= 0) outputs.delete(layerId);
+}
+
 let ctxPromise: Promise<GpuContext | null> | null = null;
 const cache = new Map<string, Promise<EspectroCompiled>>();
 const CACHE_MAX = 24;

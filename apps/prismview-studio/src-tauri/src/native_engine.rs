@@ -162,6 +162,16 @@ fn pipe_request(request: &Value) -> Result<Value, String> {
     exchange_pipe(pipe, &payload)
 }
 
+/// Data de modificação de um executável (s desde 1970), como o motor reporta em `exe_stamp`.
+fn exe_stamp_of(path: &Path) -> Result<u64, String> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| e.to_string())
+}
+
 fn engine_exe() -> Result<PathBuf, String> {
     if let Some(custom) = std::env::var_os("PRISMVIEW_ENGINE_EXE") {
         let path = PathBuf::from(custom);
@@ -596,6 +606,40 @@ impl NativeEngine {
         }
     }
 
+    /// `true` se o motor no ar é de outro build que o .exe no disco e foi encerrado (o chamador
+    /// sobe o novo). Motor ocupado ou sem resposta de status: não mexe.
+    fn restart_if_stale(&self) -> bool {
+        let Ok(local) = engine_exe().and_then(|p| exe_stamp_of(&p)) else {
+            return false;
+        };
+        let Ok(response) = pipe_try_once(&json!({ "cmd": "GET_STATUS" })) else {
+            return false;
+        };
+        let running = response
+            .get("engine")
+            .and_then(|e| e.get("exe_stamp"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if running == local {
+            return false;
+        }
+        eprintln!("[native_engine] motor desatualizado (build {running} ≠ {local}): reiniciando");
+        let _ = pipe_try_once(&json!({ "cmd": "SHUTDOWN" }));
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while Instant::now() < deadline {
+            if pipe_try_once(&json!({ "cmd": "PING" })).is_err() {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        if let Ok(mut slot) = self.lock_child() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.wait();
+            }
+        }
+        true
+    }
+
     /// Garante que existe um processo do motor respondendo no pipe (sem roundtrip extra de status).
     fn ensure_started(&self) -> Result<(), String> {
         // Responder OU estar ocupado (BUSY) = motor vivo: nunca subir um segundo processo.
@@ -604,7 +648,10 @@ impl NativeEngine {
             Err(e) => is_engine_busy(&e),
         };
         if alive(pipe_try_once(&json!({ "cmd": "PING" }))) {
-            return Ok(()); // já há um engine respondendo no pipe (< 1ms)
+            // Motor de um build anterior (ex.: dev recompilou): não entende a cena nova. Reinicia.
+            if !self.restart_if_stale() {
+                return Ok(()); // já há um engine respondendo no pipe (< 1ms)
+            }
         }
 
         let mut child_slot = self.lock_child()?;

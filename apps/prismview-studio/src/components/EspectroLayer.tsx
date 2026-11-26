@@ -17,14 +17,23 @@ import {
   type ReactiveSignal,
 } from "../types/prism";
 import type { BackdropSourceInfo } from "../utils/opticalGlassWebGL";
-import { compileEspectro, getEspectroGpu, webgpuAvailable, type EspectroCompiled } from "../engine/espectro/espectroGpu";
+import {
+  compileEspectro,
+  espectroOutput,
+  getEspectroGpu,
+  releaseEspectroOutput,
+  webgpuAvailable,
+  type EspectroCompiled,
+} from "../engine/espectro/espectroGpu";
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
 
 export interface EspectroLayerProps {
   layerId: string;
   /** Camada Espectro/3D logo abaixo (entrada de `sample_input`); null = usa o fundo. */
   inputLayerId?: string | null;
-  /** Canvases das camadas (3D e Espectro) do compositor: a entrada é lida daqui. */
+  /** Há vidro acima desta camada: mantém um espelho 2D legível pelo vidro (WebGL). */
+  mirrorForGlass?: boolean;
+  /** Canvases das camadas (3D e espelhos para o vidro) do compositor. */
   mediaElementsRef?: React.MutableRefObject<Map<string, HTMLVideoElement | HTMLImageElement | HTMLCanvasElement>>;
   effect: EspectroEffect;
   /** Tamanho da camada em px CSS. */
@@ -84,6 +93,18 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
     };
   }, [props.effect.code]);
 
+  // Consumidor da camada de baixo: pede ao produtor a cópia estável da saída dele.
+  useEffect(() => {
+    const id = props.inputLayerId;
+    if (!id) return;
+    const o = espectroOutput(id);
+    o.consumers++;
+    return () => {
+      o.consumers--;
+      if (o.consumers <= 0 && !o.canvas) releaseEspectroOutput(id);
+    };
+  }, [props.inputLayerId]);
+
   // Retoma o loop quando sai da pausa.
   useEffect(() => {
     if (!props.paused) setResumeTick((t) => t + 1);
@@ -105,6 +126,14 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
     let bdKey = "";
     let prevTex: any = null;
     let inputTex: any = null;
+    // Entrada vinda de outra camada Espectro (registro estável na GPU).
+    let inputVersion = -1;
+    let inputFromFx: any = null;
+    // Espelho 2D para o vidro (só com vidro acima): o canvas WebGPU não é legível fora do quadro.
+    let mirror: HTMLCanvasElement | null = null;
+    let mirrorCtx: CanvasRenderingContext2D | null = null;
+    // Pausado (miniaturas): continua desenhando até o fundo carregar, depois para.
+    let bdReady = false;
     // Partículas (//@particles): buffer na VRAM, nunca lido de volta pela CPU.
     const particleCount = compiled.particleCompute ? compiled.parse.particles : 0;
     let particleBuf: any = null;
@@ -196,7 +225,46 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
     };
 
     // Entrada encadeada: canvas da camada de baixo copiado na GPU (sem passar pela CPU).
+    const updateInputRect = (p: EspectroLayerProps, el: Element) => {
+      const mine = canvas.getBoundingClientRect();
+      const theirs = el.getBoundingClientRect();
+      const fw = Math.max(1, p.frameW);
+      const fh = Math.max(1, p.frameH);
+      const sx = p.width > 0 ? mine.width / p.width : 1;
+      const sy = p.height > 0 ? mine.height / p.height : 1;
+      const rootLeft = mine.left - (p.centerX - p.width / 2) * sx;
+      const rootTop = mine.top - (p.centerY - p.height / 2) * sy;
+      inputRect[0] = (theirs.left - rootLeft) / sx / fw;
+      inputRect[1] = (theirs.top - rootTop) / sy / fh;
+      inputRect[2] = theirs.width / sx / fw;
+      inputRect[3] = theirs.height / sy / fh;
+    };
+
     const ensureInput = (p: EspectroLayerProps) => {
+      // 1) Efeito Espectro abaixo: usa a cópia estável dele direto (sem cópia extra aqui).
+      const fx = p.inputLayerId ? espectroOutput(p.inputLayerId) : null;
+      if (fx && fx.canvas) {
+        if (inputTex) {
+          inputTex.destroy();
+          inputTex = null;
+        }
+        if (fx.version !== inputVersion || inputFromFx !== fx.tex) {
+          inputVersion = fx.version;
+          inputFromFx = fx.tex;
+          inputRectAge = 999;
+          bindDirty = true;
+        }
+        if (fx.tex && ++inputRectAge > 30) {
+          inputRectAge = 0;
+          updateInputRect(p, fx.canvas);
+        }
+        return;
+      }
+      if (inputFromFx) {
+        inputFromFx = null;
+        bindDirty = true;
+      }
+      // 2) Cena 3D abaixo: canvas WebGL copiado para a GPU.
       const el = p.inputLayerId ? (p.mediaElementsRef?.current.get(p.inputLayerId) as HTMLCanvasElement | undefined) : undefined;
       if (!el || !(el instanceof HTMLCanvasElement) || el.width < 1 || el.height < 1) {
         if (inputTex) {
@@ -208,8 +276,6 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       }
       if (!inputTex || inputW !== el.width || inputH !== el.height) {
         inputTex?.destroy();
-      particleTex?.destroy();
-      particleBuf?.destroy();
         inputTex = device.createTexture({ size: [el.width, el.height], format: "rgba8unorm", usage: TEX_USAGE });
         inputW = el.width;
         inputH = el.height;
@@ -224,18 +290,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       // Onde a entrada está no quadro: pelo DOM, relativo ao próprio canvas (a cada ~0,5 s).
       if (++inputRectAge > 30) {
         inputRectAge = 0;
-        const mine = canvas.getBoundingClientRect();
-        const theirs = el.getBoundingClientRect();
-        const fw = Math.max(1, p.frameW);
-        const fh = Math.max(1, p.frameH);
-        const sx = p.width > 0 ? mine.width / p.width : 1;
-        const sy = p.height > 0 ? mine.height / p.height : 1;
-        const rootLeft = mine.left - (p.centerX - p.width / 2) * sx;
-        const rootTop = mine.top - (p.centerY - p.height / 2) * sy;
-        inputRect[0] = (theirs.left - rootLeft) / sx / fw;
-        inputRect[1] = (theirs.top - rootTop) / sy / fh;
-        inputRect[2] = theirs.width / sx / fw;
-        inputRect[3] = theirs.height / sy / fh;
+        updateInputRect(p, el);
       }
     };
 
@@ -257,7 +312,10 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       try {
         if (bd && el) {
           const ready = bd.kind !== "video" || (el as HTMLVideoElement).readyState >= 2;
-          if (ready) device.queue.copyExternalImageToTexture({ source: el }, { texture: bdTex }, [w, h]);
+          if (ready) {
+            device.queue.copyExternalImageToTexture({ source: el }, { texture: bdTex }, [w, h]);
+            bdReady = true;
+          }
         } else {
           const fc = propsRef.current.fallbackColor;
           const c = parseHexColor(/^#[0-9a-fA-F]{6,8}$/.test(fc) ? fc : "#060608");
@@ -266,6 +324,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
           solid[2] = c[2] * 255;
           solid[3] = 255;
           device.queue.writeTexture({ texture: bdTex }, solid, { bytesPerRow: 4 }, [1, 1]);
+          bdReady = true;
         }
         bdKey = key;
       } catch {
@@ -326,7 +385,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
               { binding: 8, resource: view(userTex[3]) },
               { binding: 9, resource: gpuCtx.repeatSampler },
               { binding: 10, resource: (state ?? clearTex).createView() },
-              { binding: 11, resource: (inputTex ?? bdTex).createView() },
+              { binding: 11, resource: (inputFromFx ?? inputTex ?? bdTex).createView() },
               { binding: 12, resource: (particles ?? clearTex).createView() },
             ];
           // `effect` lê o estado novo; `simulate` lê o anterior.
@@ -375,7 +434,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
         globals[33] = p.mediaProgress ?? 0;
         globals[34] = p.mediaHasSession ? 1 : 0;
         globals[35] = 0;
-        if (inputTex) {
+        if (inputTex || inputFromFx) {
           globals[36] = inputRect[0];
           globals[37] = inputRect[1];
           globals[38] = inputRect[2];
@@ -428,11 +487,43 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
         pass.setBindGroup(0, bindGroup);
         pass.draw(3);
         pass.end();
+        // Cópia estável para o efeito de cima (só se alguém a usa).
+        const outReg = espectroOutput(p.layerId);
+        outReg.canvas = canvas;
+        if (outReg.consumers > 0) {
+          if (!outReg.tex || outReg.w !== cw || outReg.h !== ch) {
+            outReg.tex?.destroy();
+            outReg.tex = device.createTexture({ size: [cw, ch], format: gpuCtx.format, usage: TEX_USAGE });
+            outReg.w = cw;
+            outReg.h = ch;
+            outReg.version++;
+          }
+          enc.copyTextureToTexture({ texture: out }, { texture: outReg.tex }, [cw, ch]);
+        }
         // Memória entre quadros: o quadro de agora vira o `sample_previous` do próximo.
         if (feedback && prevTex) enc.copyTextureToTexture({ texture: out }, { texture: prevTex }, [cw, ch]);
         device.queue.submit([enc.finish()]);
+        // Espelho 2D para o vidro, ainda dentro do quadro (o canvas WebGPU ainda é legível).
+        if (p.mirrorForGlass) {
+          if (!mirror) {
+            mirror = document.createElement("canvas");
+            mirrorCtx = mirror.getContext("2d");
+            p.mediaElementsRef?.current.set(p.layerId, mirror);
+          }
+          if (mirror.width !== cw || mirror.height !== ch) {
+            mirror.width = cw;
+            mirror.height = ch;
+          }
+          mirrorCtx?.clearRect(0, 0, cw, ch);
+          mirrorCtx?.drawImage(canvas, 0, 0);
+        } else if (mirror) {
+          p.mediaElementsRef?.current.delete(p.layerId);
+          mirror = null;
+          mirrorCtx = null;
+        }
       }
-      if (!p.paused && document.visibilityState === "visible") raf = requestAnimationFrame(frame);
+      // Pausado (miniaturas do Hub): segue até o fundo carregar, para não congelar um quadro vazio.
+      if ((!p.paused || !bdReady) && document.visibilityState === "visible") raf = requestAnimationFrame(frame);
     };
 
     const onVis = () => {
@@ -475,6 +566,10 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       bdTex?.destroy();
       prevTex?.destroy();
       inputTex?.destroy();
+      particleTex?.destroy();
+      particleBuf?.destroy();
+      releaseEspectroOutput(propsRef.current.layerId);
+      if (mirror) propsRef.current.mediaElementsRef?.current.delete(propsRef.current.layerId);
       stateTex?.destroy();
       statePrev?.destroy();
       whiteTex?.destroy();
@@ -491,14 +586,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
   return (
     <div style={{ width: `${props.width}px`, height: `${props.height}px`, position: "relative" }}>
       <canvas
-        ref={(el) => {
-          canvasRef.current = el;
-          // Disponível como entrada para o efeito de cima (`sample_input`).
-          const map = props.mediaElementsRef?.current;
-          if (!map) return;
-          if (el) map.set(props.layerId, el);
-          else map.delete(props.layerId);
-        }}
+        ref={canvasRef}
         style={{ width: "100%", height: "100%", display: "block" }}
       />
       {status !== "ok" && !props.isThumbnail && (
