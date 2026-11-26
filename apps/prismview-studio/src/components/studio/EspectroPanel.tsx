@@ -342,11 +342,12 @@ export const EspectroPanel: React.FC<EspectroPanelProps> = ({
           </p>
           <button
             type="button"
-            onClick={() => onCreateLayer(createEspectroEffect())}
+            onClick={() => onCreateLayer(createEspectroEffect("blank"))}
             className="prism-pill-active rounded-full px-4 py-2 text-xs flex items-center gap-1.5"
           >
-            <Plus className="w-3.5 h-3.5" /> Chuva no vidro
+            <Plus className="w-3.5 h-3.5" /> Novo efeito
           </button>
+          <span className="text-[11px] text-[#71717A]">ou escolha um modelo em "+ Novo efeito…" acima</span>
         </div>
       ) : (
         <>

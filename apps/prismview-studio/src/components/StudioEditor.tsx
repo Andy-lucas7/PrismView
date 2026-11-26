@@ -1,5 +1,5 @@
 import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { COLLAPSE, POP, ROW } from "./motion/Presence";
+import { COLLAPSE, POP, ROW, SIDE_PANEL } from "./motion/Presence";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowDown,
@@ -2555,6 +2555,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         style={{
           paddingRight: stageRightInset(panelOpen, viewportW),
           paddingLeft: espectroOpen ? "calc(min(460px, 42vw) + 24px)" : undefined,
+          // O canvas acompanha os painéis abrindo/fechando em vez de pular.
+          transition: "padding 260ms cubic-bezier(0.2, 0, 0, 1)",
         }}
       >
         <div ref={stageRef} className="w-full h-full flex items-center justify-center">
@@ -2859,8 +2861,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
 
       {/* PAINEL ÚNICO (direita): propriedades em cima, camadas embaixo, divisória arrastável.
           Recolhido (Ctrl+\) o canvas ocupa a largura toda; o painel nem fica montado. */}
+      <AnimatePresence initial={false}>
       {panelOpen && (
       <StudioSidePanel
+        key="studio-side-panel"
         layers={layersPanel}
         properties={
       <StudioInspector
@@ -2956,9 +2960,11 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         }
       />
       )}
+      </AnimatePresence>
 
+      <AnimatePresence initial={false}>
       {espectroOpen && (
-        <div className="absolute top-16 bottom-3 left-3 z-40">
+        <motion.div key="espectro-panel" {...SIDE_PANEL.left} className="absolute top-16 bottom-3 left-3 z-40">
           <Suspense fallback={null}>
             <LazyEspectroPanel
               effect={selectedLayer?.kind === "SHADER" ? selectedLayer.shader ?? null : null}
@@ -2984,8 +2990,9 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
               onFlushSave={onFlushSave}
             />
           </Suspense>
-        </div>
+        </motion.div>
       )}
+      </AnimatePresence>
 
       {/* Menu de botão direito: só monta quando aberto (Etapa 8) */}
       {contextMenu && (

@@ -95,7 +95,7 @@ export function createLayer(kind: LayerKind, name?: string): SceneLayer {
   } else if (kind === "SCENE_3D") {
     base.scene3d = defaultScene3D();
   } else if (kind === "SHADER") {
-    base.shader = createEspectroEffect();
+    base.shader = createEspectroEffect("blank");
   } else if (kind === "GROUP") {
     base.width = 520;
     base.height = 240;

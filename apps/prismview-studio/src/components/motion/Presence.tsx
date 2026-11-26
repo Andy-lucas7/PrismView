@@ -39,6 +39,16 @@ export const ROW = {
   style: { overflow: "clip", overflowClipMargin: 12 },
 } as const;
 
+/** Painel lateral que entra/sai pela borda (painel do Studio à direita, Modo Espectro à esquerda). */
+const panelEnter = { duration: sec(DURATION.slow), ease: [...EASE.decelerate] as [number, number, number, number] };
+const panel = (dx: number) =>
+  ({
+    initial: { opacity: 0, x: dx },
+    animate: { opacity: 1, x: 0, transition: panelEnter },
+    exit: { opacity: 0, x: dx, transition: exitT },
+  }) as const;
+export const SIDE_PANEL = { left: panel(-24), right: panel(24) } as const;
+
 /** Troca de aba com muito conteúdo (inspetor): só fade + deslize curto, sem blur no painel inteiro. */
 export const TAB_LITE = {
   initial: { opacity: 0, y: 6 },

@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { SIDE_PANEL } from "../motion/Presence";
 import {
   nudgeSplit,
   PANEL_WIDTH_PX,
@@ -126,7 +128,8 @@ export const StudioSidePanel: React.FC<StudioSidePanelProps> = ({ properties, la
   );
 
   return (
-    <aside
+    <motion.aside
+      {...SIDE_PANEL.right}
       ref={rootRef}
       aria-label="Painel do editor: propriedades e camadas"
       style={{ width: `min(${PANEL_WIDTH_PX}px, max(220px, 52vw))` }}
@@ -163,6 +166,6 @@ export const StudioSidePanel: React.FC<StudioSidePanelProps> = ({ properties, la
       <section aria-label="Camadas" className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         {layers}
       </section>
-    </aside>
+    </motion.aside>
   );
 };

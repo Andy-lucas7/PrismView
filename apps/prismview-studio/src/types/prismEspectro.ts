@@ -525,49 +525,118 @@ export interface EspectroTemplate {
 
 export const ESPECTRO_TEMPLATES: EspectroTemplate[] = [
   {
+    id: "blank",
+    name: "Em branco",
+    description: "Ponto de partida: lê o fundo e mostra onde escrever o seu efeito.",
+    code: `//@param intensity: float = 0.5 range(0, 1) label("Intensidade")
+
+// Comece aqui. uv vai de (0,0) no canto de cima à esquerda até (1,1) embaixo à direita.
+// Abra "Referência" no painel para ver tudo o que dá para usar.
+fn effect(uv: vec2f) -> vec4f {
+  let bg = sample_backdrop(uv);
+  let wave = 0.75 + 0.25 * sin(prism.time * 1.5 + uv.x * 8.0);
+  return vec4f(mix(bg.rgb, bg.rgb * wave, params.intensity), 1.0);
+}
+`,
+  },
+  {
     id: "rain-glass",
     name: "Chuva no vidro",
-    description: "Gotas escorrendo que refratam o fundo, com vidro embaçado entre elas.",
-    code: `//@param density: float = 0.55 range(0, 1) label("Densidade")
-//@param speed: float = 0.35 range(0, 2) label("Velocidade")
-//@param refraction: float = 0.06 range(0, 0.2) label("Refração")
-//@param fog: float = 0.4 range(0, 2) label("Embaçado")
-//@param tint: color = #c8dcff label("Tom do vidro")
+    description: "Gotas paradas na janela que refratam o fundo (lente invertida), escorrem devagar e somem, mais a chuva caindo atrás.",
+    code: `//@param density: float = 0.75 range(0, 1) label("Quantidade de gotas")
+//@param size: float = 1 range(0.3, 2) label("Tamanho das gotas")
+//@param life: float = 15 range(2, 40) label("Tempo na janela (s)")
+//@param slide: float = 0.35 range(0, 1) label("Escorrer")
+//@param refraction: float = 1 range(0, 3) label("Refração")
+//@param downpour: float = 0.5 range(0, 1) label("Chuva caindo")
+//@param fog: float = 0 range(0, 2) label("Embaçado")
 
-// xy = desvio da gota, z = máscara (1 dentro da gota/rastro)
-fn drop_layer(uv: vec2f, t: f32, scale: f32) -> vec3f {
+// Mesma técnica das gotas de janela do Wallpaper Engine: cada gota é uma pequena lente que
+// amostra o fundo deslocado pela normal da gota (maior = desloca mais). Aqui o "emissor" é uma
+// grade: cada célula tem no máximo uma gota viva, que nasce num ponto aleatório, fica
+// \`life\` segundos escorrendo devagar e some; depois renasce em outro lugar.
+// Retorno: xy = deslocamento em uv, z = cobertura (0..1), w = borda (escurece a beirada).
+fn drop_layer(uv: vec2f, cells: f32, seed: f32, big: f32) -> vec4f {
   let aspect = prism.resolution.x / max(prism.resolution.y, 1.0);
-  var p = uv * vec2f(aspect, 1.0) * scale;
-  let column = floor(p.x);
-  p.y -= t * (0.6 + hash21(vec2f(column, 1.7)) * 0.8);
+  let p = uv * vec2f(aspect, 1.0) * cells;
   let cell = floor(p);
-  let f = fract(p) - 0.5;
-  let h = hash21(cell);
-  if (h > params.density) {
-    return vec3f(0.0);
+  let f = fract(p);
+  let h0 = hash21(cell + seed);
+  let period = params.life * (0.67 + 0.66 * h0);
+  let t = prism.time + h0 * period;
+  let cycle = floor(t / period);
+  let age = fract(t / period);
+  let id = cell + vec2f(seed, cycle * 17.31);
+  if (hash21(id) > params.density) {
+    return vec4f(0.0);
   }
-  let wobble = sin(t * 3.0 + h * 40.0) * 0.05;
-  let c = vec2f((h - 0.5) * 0.5 + wobble, (fract(h * 13.1) - 0.5) * 0.6);
-  let d = f - c;
-  let r = 0.12 + fract(h * 7.3) * 0.1;
-  let m = smoothstep(r, r * 0.55, length(d * vec2f(1.0, 0.8)));
-  let trail = smoothstep(0.05, 0.0, abs(f.x - c.x)) * smoothstep(c.y, c.y - 0.45, f.y) * 0.35;
-  return vec3f(d * m, max(m, trail));
+  let h2 = hash21(id + 3.7);
+  let h3 = hash21(id + 9.1);
+  let h4 = hash21(id + 5.3);
+  let r = min(0.42, (0.14 + 0.2 * h2) * params.size * big);
+  // Escorre para baixo dentro da célula; gotas maiores descem mais.
+  let fall = params.slide * h2 * (0.9 - 2.0 * r) * 0.8;
+  let room = max(0.0, 1.0 - 2.0 * r - fall);
+  let center = vec2f(r + (1.0 - 2.0 * r) * h3, r + room * h4 + fall * age);
+  var d = f - center;
+  // Contorno irregular e base mais achatada, como água na vertical.
+  let ang = atan2(d.y, d.x);
+  let wobble = 1.0 + 0.1 * sin(ang * 3.0 + h3 * 6.28) + 0.05 * sin(ang * 5.0 + h4 * 6.28);
+  d.y *= select(1.0, 1.18, d.y > 0.0);
+  let q = length(d) / (r * wobble);
+  if (q >= 1.0) {
+    return vec4f(0.0);
+  }
+  let born = smoothstep(0.0, 0.015, age);
+  let dying = smoothstep(1.0, 0.9, age);
+  let alpha = (0.35 + 0.65 * hash21(id + 1.9)) * born * dying;
+  let mask = smoothstep(1.0, 0.82, q) * alpha;
+  let n = d / r;
+  let radius_uv = r / cells;
+  let offset = -n * radius_uv * (1.2 + params.refraction * 1.8) * vec2f(1.0 / aspect, 1.0);
+  let rim = smoothstep(0.55, 1.0, q) * mask;
+  return vec4f(offset, mask, rim);
+}
+
+// Chuva caindo (atrás do vidro): riscos finos e rápidos, levemente inclinados.
+fn streaks(uv: vec2f, cols: f32, speed: f32, seed: f32) -> f32 {
+  let aspect = prism.resolution.x / max(prism.resolution.y, 1.0);
+  var q = uv * vec2f(aspect, 1.0);
+  q.x += q.y * 0.12;
+  let x = q.x * cols;
+  let col = floor(x);
+  let h = hash21(vec2f(col, seed));
+  if (h > params.downpour) {
+    return 0.0;
+  }
+  let len = 0.05 + 0.08 * hash21(vec2f(col, seed + 2.0));
+  let y = fract(q.y * 0.7 - prism.time * speed * (0.8 + 0.4 * h) + h * 13.0);
+  let across = 1.0 - smoothstep(0.0, 0.18, abs(fract(x) - 0.5));
+  return across * smoothstep(0.0, len, y) * step(y, len + 0.02) * (1.0 - y / (len + 0.02));
 }
 
 fn effect(uv: vec2f) -> vec4f {
-  let t = prism.time * params.speed;
-  let a = drop_layer(uv, t, 9.0);
-  let b = drop_layer(uv + vec2f(0.37, 0.11), t * 0.8, 17.0);
-  let n = a.xy * a.z + b.xy * b.z * 0.6;
-  let mask = clamp(a.z + b.z, 0.0, 1.0);
-  let o = params.fog * 0.01 * (1.0 - mask);
-  let fogged = (sample_backdrop(uv + vec2f(o, o)) + sample_backdrop(uv + vec2f(-o, o)) +
-                sample_backdrop(uv + vec2f(o, -o)) + sample_backdrop(uv - vec2f(o, o))) * 0.25;
-  let drop = sample_backdrop(uv - n * params.refraction * 4.0);
-  var col = mix(fogged.rgb * params.tint.rgb, drop.rgb * 1.08, mask);
-  col += pow(mask, 3.0) * 0.06;
-  return vec4f(col, 1.0);
+  // Da gota maior (na frente) para a menor: a de cima cobre a de baixo.
+  var drop = drop_layer(uv, 7.0, 31.0, 1.35);
+  let mid = drop_layer(uv, 14.0, 7.0, 1.0);
+  drop = select(mid, drop, drop.z > mid.z);
+  let small = drop_layer(uv, 28.0, 3.0, 0.8);
+  drop = select(small, drop, drop.z > small.z);
+
+  let o = params.fog * 0.006;
+  var bg = sample_backdrop(uv).rgb;
+  if (o > 0.0) {
+    bg = (sample_backdrop(uv + vec2f(o, o)).rgb + sample_backdrop(uv + vec2f(-o, o)).rgb +
+          sample_backdrop(uv + vec2f(o, -o)).rgb + sample_backdrop(uv - vec2f(o, o)).rgb) * 0.25;
+  }
+  let rain = streaks(uv, 150.0, 1.6, 7.0) + streaks(uv, 90.0, 1.2, 3.0) * 0.7;
+  bg += sample_backdrop(uv + vec2f(0.003, 0.0)).rgb * rain * 0.22;
+
+  // Dentro da gota: fundo refratado, beirada mais escura e um brilho pequeno no alto.
+  let lens = sample_backdrop(uv + drop.xy).rgb;
+  let spec = smoothstep(0.012, 0.0, length(drop.xy * vec2f(1.0, -1.0) - vec2f(0.004, 0.006))) * 0.25 * drop.z;
+  let inside = lens * (1.0 - drop.w * 0.45) + spec;
+  return vec4f(mix(bg, inside, drop.z), 1.0);
 }
 `,
   },
@@ -738,7 +807,7 @@ fn effect(uv: vec2f) -> vec4f {
   },
 ];
 
-export function createEspectroEffect(templateId = "rain-glass"): EspectroEffect {
+export function createEspectroEffect(templateId = "blank"): EspectroEffect {
   const t = ESPECTRO_TEMPLATES.find((x) => x.id === templateId) ?? ESPECTRO_TEMPLATES[0];
   return { name: t.name, description: t.description, code: t.code, params: {} };
 }
