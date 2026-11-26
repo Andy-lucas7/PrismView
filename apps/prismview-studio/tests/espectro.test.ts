@@ -139,7 +139,6 @@ test(".prismfx leva texturas embutidas e rejeita data URL estranha", () => {
 
 test("fixture do motor em dia com os modelos", () => {
   // Checkout com autocrlf grava CRLF: compara o conteúdo, não o fim de linha.
-  assert.equal(readFileSync(FIXTURE, "utf8").replace(/
-/g, "
-"), fixtureNow(), "rode: node tests/espectro.test.ts --write");
+  const onDisk = readFileSync(FIXTURE, "utf8").replace(/\r\n/g, "\n");
+  assert.equal(onDisk, fixtureNow(), "rode: node tests/espectro.test.ts --write");
 });
