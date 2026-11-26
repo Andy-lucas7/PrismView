@@ -42,6 +42,9 @@ pub(super) struct Frame<'a> {
     pub(super) fx: &'a LayerBindingSolver,
     /// Efeitos Espectro (`None` na foto limpa do wallpaper do Windows: efeito não entra).
     pub(super) espectro: Option<&'a mut EspectroRenderer>,
+    /// Última saída de efeito Espectro ou 3D desenhada (textura, área 0..1): entrada encadeada
+    /// (`sample_input`) do próximo efeito.
+    pub(super) chain: Option<(TextureId, [f32; 4])>,
     pub(super) ui: f32,
     pub(super) vw: f32,
     pub(super) vh: f32,
@@ -908,6 +911,12 @@ impl Frame<'_> {
             .color([1.0, 1.0, 1.0, opacity])
             .uv(cover_uv(out.size.0, out.size.1, size.w, size.h));
         self.canvas.push(z, blend, out.id, inst);
+        let (vw, vh) = (self.vw.max(1.0), self.vh.max(1.0));
+        let s = xf.scale();
+        self.chain = Some((
+            out.id,
+            [(xf.t[0] - half[0] * s) / vw, (xf.t[1] - half[1] * s) / vh, 2.0 * half[0] * s / vw, 2.0 * half[1] * s / vh],
+        ));
         // 3D full-bleed: vira o backdrop do vidro desenhado por cima (preserva alpha da cena 3D).
         if fill_parent {
             self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true, false));
@@ -966,6 +975,9 @@ impl Frame<'_> {
             backdrop,
             backdrop_opaque,
             textures,
+            input: self.chain.map(|(id, _)| id),
+            input_rect: self.chain.map_or([0.0, 0.0, 1.0, 1.0], |(_, r)| r),
+            z,
         };
         let px = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
         let Some(espectro) = self.espectro.as_deref_mut() else {
@@ -989,6 +1001,7 @@ impl Frame<'_> {
             .color([1.0, 1.0, 1.0, opacity])
             .uv([0.0, 0.0, 1.0, 1.0]);
         self.canvas.push(z, blend, id, inst);
+        self.chain = Some((id, layer_rect));
     }
 
     /// Camada de vídeo: frame atual do decoder (zero-copy), cover na caixa, cantos arredondados.

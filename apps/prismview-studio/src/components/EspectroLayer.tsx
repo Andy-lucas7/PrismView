@@ -20,6 +20,11 @@ import { compileEspectro, getEspectroGpu, webgpuAvailable, type EspectroCompiled
 import { type PowerState, powerCapsFor } from "../engine/powerGovernor";
 
 export interface EspectroLayerProps {
+  layerId: string;
+  /** Camada Espectro/3D logo abaixo (entrada de `sample_input`); null = usa o fundo. */
+  inputLayerId?: string | null;
+  /** Canvases das camadas (3D e Espectro) do compositor: a entrada é lida daqui. */
+  mediaElementsRef?: React.MutableRefObject<Map<string, HTMLVideoElement | HTMLImageElement | HTMLCanvasElement>>;
   effect: EspectroEffect;
   /** Tamanho da camada em px CSS. */
   width: number;
@@ -98,6 +103,11 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
     let bdH = 0;
     let bdKey = "";
     let prevTex: any = null;
+    let inputTex: any = null;
+    let inputW = 0;
+    let inputH = 0;
+    const inputRect = new Float32Array(4);
+    let inputRectAge = 999;
     let whiteTex: any = null;
     const userTex: any[] = Array(ESPECTRO_MAX_TEXTURES).fill(null);
     const userSrc: string[] = Array(ESPECTRO_MAX_TEXTURES).fill("");
@@ -176,6 +186,48 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       }
     };
 
+    // Entrada encadeada: canvas da camada de baixo copiado na GPU (sem passar pela CPU).
+    const ensureInput = (p: EspectroLayerProps) => {
+      const el = p.inputLayerId ? (p.mediaElementsRef?.current.get(p.inputLayerId) as HTMLCanvasElement | undefined) : undefined;
+      if (!el || !(el instanceof HTMLCanvasElement) || el.width < 1 || el.height < 1) {
+        if (inputTex) {
+          inputTex.destroy();
+          inputTex = null;
+          bindDirty = true;
+        }
+        return;
+      }
+      if (!inputTex || inputW !== el.width || inputH !== el.height) {
+        inputTex?.destroy();
+        inputTex = device.createTexture({ size: [el.width, el.height], format: "rgba8unorm", usage: TEX_USAGE });
+        inputW = el.width;
+        inputH = el.height;
+        inputRectAge = 999;
+        bindDirty = true;
+      }
+      try {
+        device.queue.copyExternalImageToTexture({ source: el }, { texture: inputTex }, [inputW, inputH]);
+      } catch {
+        /* quadro da entrada indisponível: mantém o anterior */
+      }
+      // Onde a entrada está no quadro: pelo DOM, relativo ao próprio canvas (a cada ~0,5 s).
+      if (++inputRectAge > 30) {
+        inputRectAge = 0;
+        const mine = canvas.getBoundingClientRect();
+        const theirs = el.getBoundingClientRect();
+        const fw = Math.max(1, p.frameW);
+        const fh = Math.max(1, p.frameH);
+        const sx = p.width > 0 ? mine.width / p.width : 1;
+        const sy = p.height > 0 ? mine.height / p.height : 1;
+        const rootLeft = mine.left - (p.centerX - p.width / 2) * sx;
+        const rootTop = mine.top - (p.centerY - p.height / 2) * sy;
+        inputRect[0] = (theirs.left - rootLeft) / sx / fw;
+        inputRect[1] = (theirs.top - rootTop) / sy / fh;
+        inputRect[2] = theirs.width / sx / fw;
+        inputRect[3] = theirs.height / sy / fh;
+      }
+    };
+
     const ensureBackdrop = (bd: BackdropSourceInfo | null) => {
       const el = bd?.element as any;
       const w = bd ? Math.max(1, Math.round((el?.videoWidth || el?.naturalWidth || el?.width || bd.intrinsicW) as number)) : 1;
@@ -218,7 +270,8 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       const fpsCap = Math.min(p.isThumbnail ? 15 : 60, caps.fpsCap ?? 60);
       if (now - lastDraw >= 1000 / fpsCap - 1) {
         lastDraw = now;
-        const dpr = Math.min(window.devicePixelRatio || 1, caps.dprCap) * caps.renderScaleCap;
+        // `//@scale`: efeito em resolução menor; o canvas é ampliado pelo CSS.
+        const dpr = Math.min(window.devicePixelRatio || 1, caps.dprCap) * caps.renderScaleCap * compiled.parse.scale;
         const cw = Math.max(1, Math.round(p.width * dpr));
         const ch = Math.max(1, Math.round(p.height * dpr));
         if (canvas.width !== cw || canvas.height !== ch) {
@@ -241,6 +294,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
         }
         ensureBackdrop(p.backdrop);
         loadUserTextures();
+        ensureInput(p);
         if (bindDirty || !bindGroup) {
           bindDirty = false;
           const view = (t: any) => (t ?? whiteTex).createView();
@@ -256,6 +310,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
               { binding: 8, resource: view(userTex[3]) },
               { binding: 9, resource: gpuCtx.repeatSampler },
               { binding: 10, resource: view(state) },
+              { binding: 11, resource: (inputTex ?? bdTex).createView() },
             ];
           // `effect` lê o estado novo; `simulate` lê o anterior.
           bindGroup = device.createBindGroup({ layout: gpuCtx.layout, entries: entries(stateTex) });
@@ -301,6 +356,17 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
         globals[33] = p.mediaProgress ?? 0;
         globals[34] = p.mediaHasSession ? 1 : 0;
         globals[35] = 0;
+        if (inputTex) {
+          globals[36] = inputRect[0];
+          globals[37] = inputRect[1];
+          globals[38] = inputRect[2];
+          globals[39] = inputRect[3];
+        } else {
+          globals[36] = globals[12];
+          globals[37] = globals[13];
+          globals[38] = globals[14];
+          globals[39] = globals[15];
+        }
         last = now;
         frameIndex++;
         packEspectroParams(compiled.parse, p.effect.params, params);
@@ -366,6 +432,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       paramsBuf?.destroy();
       bdTex?.destroy();
       prevTex?.destroy();
+      inputTex?.destroy();
       stateTex?.destroy();
       statePrev?.destroy();
       whiteTex?.destroy();
@@ -380,7 +447,17 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
 
   return (
     <div style={{ width: `${props.width}px`, height: `${props.height}px`, position: "relative" }}>
-      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+      <canvas
+        ref={(el) => {
+          canvasRef.current = el;
+          // Disponível como entrada para o efeito de cima (`sample_input`).
+          const map = props.mediaElementsRef?.current;
+          if (!map) return;
+          if (el) map.set(props.layerId, el);
+          else map.delete(props.layerId);
+        }}
+        style={{ width: "100%", height: "100%", display: "block" }}
+      />
       {status !== "ok" && !props.isThumbnail && (
         <div className="absolute inset-0 flex items-center justify-center text-[11px] text-[#A1A1AA] bg-black/30 pointer-events-none text-center px-4">
           {status === "loading"

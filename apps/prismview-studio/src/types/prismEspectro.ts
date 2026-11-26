@@ -47,6 +47,8 @@ export interface EspectroEffect {
   nativeFeedback?: boolean;
   /** O código define `simulate`: o motor roda o passe de estado (`prism_sim`). */
   nativeSimulate?: boolean;
+  /** `//@scale`: fração da resolução da camada em que o efeito roda (0.25..1). */
+  nativeScale?: number;
 }
 
 export interface EspectroTextureRef {
@@ -68,16 +70,17 @@ export const ESPECTRO_MAX_PARAMS = 32;
 export const ESPECTRO_MAX_CODE_CHARS = 64 * 1024;
 
 /** Tamanho do uniform `prism` (PrismGlobals) em floats; o motor Rust usa o mesmo número. */
-export const ESPECTRO_GLOBALS_FLOATS = 36;
+export const ESPECTRO_GLOBALS_FLOATS = 40;
 
 /**
  * Prelúdio comum (Studio WebGPU e motor wgpu). Layout de `PrismGlobals` (bytes):
  * 0 resolution · 8 time · 12 delta · 16 cursor · 24 frame_size · 32 layer_rect · 48 backdrop_rect
  * · 64 audio (level, bass, mid, treble) · 80 beat · 84 battery · 88 has_backdrop · 92 backdrop_opaque
  * · 96 click (uv do último clique) · 104 click_age (s; 1e6 = nenhum) · 108 frame
- * · 112 input (mouse_down, key_pulse, typing_energy, idle_s) · 128 media (playing, progress, has_session, 0) → 144.
+ * · 112 input (mouse_down, key_pulse, typing_energy, idle_s) · 128 media (playing, progress, has_session, 0)
+ * · 144 input_rect (área da camada de entrada no quadro, 0..1) → 160.
  * Bindings: 0 prism · 1 backdrop · 2 sampler (clamp) · 3 params · 4 quadro anterior · 5..8 texturas
- * · 9 sampler (repeat) · 10 estado da simulação.
+ * · 9 sampler (repeat) · 10 estado da simulação · 11 entrada (camada de efeito/3D logo abaixo, ou o fundo).
  */
 export const ESPECTRO_PRELUDE = `// ── Prelúdio Espectro (PrismView) ──
 struct PrismGlobals {
@@ -98,6 +101,7 @@ struct PrismGlobals {
   frame: f32,
   input: vec4f,
   media: vec4f,
+  input_rect: vec4f,
 };
 @group(0) @binding(0) var<uniform> prism: PrismGlobals;
 @group(0) @binding(1) var prism_backdrop: texture_2d<f32>;
@@ -109,6 +113,7 @@ struct PrismGlobals {
 @group(0) @binding(8) var prism_tex3: texture_2d<f32>;
 @group(0) @binding(9) var prism_repeat: sampler;
 @group(0) @binding(10) var prism_state: texture_2d<f32>;
+@group(0) @binding(11) var prism_input: texture_2d<f32>;
 
 fn frame_uv(uv: vec2f) -> vec2f {
   return prism.layer_rect.xy + uv * prism.layer_rect.zw;
@@ -125,6 +130,13 @@ fn sample_backdrop(uv: vec2f) -> vec4f {
 // Quadro anterior deste efeito (cor final pré-multiplicada; transparente no 1º quadro).
 fn sample_previous(uv: vec2f) -> vec4f {
   return textureSampleLevel(prism_prev, prism_sampler, uv, 0.0);
+}
+// Camada de baixo: saída do efeito Espectro ou da cena 3D logo abaixo desta camada
+// (sem nenhuma, é o fundo). Encadeia efeitos: um efeito trabalha sobre o resultado do outro.
+fn sample_input(uv: vec2f) -> vec4f {
+  let f = frame_uv(uv);
+  let b = (f - prism.input_rect.xy) / max(prism.input_rect.zw, vec2f(1e-5));
+  return textureSampleLevel(prism_input, prism_sampler, clamp(b, vec2f(0.0), vec2f(1.0)), 0.0);
 }
 // Estado da simulação (anterior dentro de \`simulate\`, atual dentro de \`effect\`).
 fn sample_state(uv: vec2f) -> vec4f {
@@ -182,6 +194,8 @@ export interface EspectroParseResult {
   errors: { line: number; message: string }[];
   /** Bytes do uniform `params` (múltiplo de 16, mínimo 16). */
   paramsSize: number;
+  /** `//@scale 0.5`: o efeito roda nessa fração da resolução (economia; o compositor amplia). */
+  scale: number;
 }
 
 function parseOptNumber(rest: string, key: string): number | undefined {
@@ -233,9 +247,17 @@ export function parseEspectroParams(code: string): EspectroParseResult {
   const errors: EspectroParseResult["errors"] = [];
   const seen = new Set<string>();
   let offset = 0;
+  let scale = 1;
   const lines = code.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const sc = line.match(/^\s*\/\/@scale\s+([0-9.]+)\s*$/);
+    if (sc) {
+      const v = Number(sc[1]);
+      if (Number.isFinite(v) && v >= 0.25 && v <= 1) scale = v;
+      else errors.push({ line: i + 1, message: "Use //@scale entre 0.25 e 1 (ex.: //@scale 0.5)." });
+      continue;
+    }
     if (line.includes("//@texture")) {
       const t = line.match(TEXTURE_RE);
       if (!t) {
@@ -286,7 +308,7 @@ export function parseEspectroParams(code: string): EspectroParseResult {
     offset += size;
   }
   const paramsSize = Math.max(16, Math.ceil(offset / 16) * 16);
-  return { params, textures, errors, paramsSize };
+  return { params, textures, errors, paramsSize, scale };
 }
 
 const TEXTURE_RE = /^\s*\/\/@texture\s+([A-Za-z][A-Za-z0-9_]*)\b(.*)$/;
@@ -403,6 +425,7 @@ export function withNativeEspectro(effect: EspectroEffect): EspectroEffect {
     nativeTextures,
     nativeFeedback: usesPrevious(effect.code),
     nativeSimulate: usesSimulation(effect.code),
+    nativeScale: build.parse.scale,
   };
 }
 

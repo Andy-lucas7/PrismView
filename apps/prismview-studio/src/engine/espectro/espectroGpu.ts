@@ -68,6 +68,7 @@ export function getEspectroGpu(): Promise<GpuContext | null> {
         { binding: 8, visibility: STAGE, texture: { sampleType: "float" } },
         { binding: 9, visibility: STAGE, sampler: { type: "filtering" } },
         { binding: 10, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 11, visibility: STAGE, texture: { sampleType: "float" } },
       ],
     });
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });

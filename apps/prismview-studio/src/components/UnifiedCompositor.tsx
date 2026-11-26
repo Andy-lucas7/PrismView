@@ -1138,6 +1138,16 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         {layer.kind === "SHADER" && layer.shader && !lite && (
           <Suspense fallback={<div style={{ width: `${wPx}px`, height: `${hPx}px` }} />}>
             <LazyEspectroLayer
+              layerId={layer.id}
+              inputLayerId={(() => {
+                // Entrada encadeada: efeito Espectro ou cena 3D mais próxima abaixo (mesmo nível).
+                for (let i = siblings.indexOf(layer) - 1; i >= 0; i--) {
+                  const s = siblings[i];
+                  if (!s.hidden && (s.kind === "SHADER" || s.kind === "SCENE_3D")) return s.id;
+                }
+                return null;
+              })()}
+              mediaElementsRef={mediaElementsRef}
               effect={layer.shader}
               width={wPx}
               height={hPx}

@@ -268,6 +268,7 @@ impl Ctx {
                     "textures": textures,
                     "feedback": boolean(fx, "nativeFeedback", false),
                     "simulate": boolean(fx, "nativeSimulate", false),
+                    "scale": number(fx, "nativeScale", 1.0).clamp(0.25, 1.0),
                 });
             }
             // Tipo desconhecido (versão futura do Estúdio): filhos continuam visíveis.

@@ -535,7 +535,7 @@ pub enum LayerKind {
 /// Efeito do Modo Espectro já montado pelo Estúdio: WGSL completo (prelúdio + parâmetros +
 /// código do usuário + entradas `prism_vs`/`prism_fs`) e o uniform `params` empacotado.
 /// O layout dos uniforms vive só no Estúdio (`types/prismEspectro.ts`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShaderEffect {
     #[serde(default)]
     pub name: String,
@@ -551,6 +551,27 @@ pub struct ShaderEffect {
     /// O efeito define `simulate`: passe de estado `prism_sim` antes do efeito.
     #[serde(default)]
     pub simulate: bool,
+    /// `//@scale`: fração da resolução da camada (0.25..=1).
+    #[serde(default = "default_shader_scale")]
+    pub scale: f32,
+}
+
+fn default_shader_scale() -> f32 {
+    1.0
+}
+
+impl Default for ShaderEffect {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            wgsl: String::new(),
+            params: Vec::new(),
+            textures: Vec::new(),
+            feedback: false,
+            simulate: false,
+            scale: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

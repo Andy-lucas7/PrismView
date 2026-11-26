@@ -20,7 +20,7 @@ use super::compositor::{Compositor2D, TextureId};
 use super::signals::SignalSnapshot;
 
 /// Floats de `PrismGlobals` (mesmo número que `ESPECTRO_GLOBALS_FLOATS` no Estúdio).
-pub const GLOBALS_FLOATS: usize = 36;
+pub const GLOBALS_FLOATS: usize = 40;
 /// Slots de textura do usuário (`prism_tex0..3`).
 pub const MAX_TEXTURES: usize = 4;
 /// Formato dos alvos (o compositor amostra; não-sRGB como o resto do 2D).
@@ -49,6 +49,12 @@ pub struct EspectroPlacement {
     pub backdrop_opaque: bool,
     /// Imagens do usuário já carregadas no compositor (`None` = branco).
     pub textures: [Option<TextureId>; MAX_TEXTURES],
+    /// Entrada encadeada (`sample_input`): saída do efeito/3D logo abaixo; `None` = o fundo.
+    pub input: Option<TextureId>,
+    /// Área da entrada no quadro (0..1).
+    pub input_rect: [f32; 4],
+    /// Ordem Z da camada: os efeitos de baixo renderizam antes (a saída deles é entrada dos de cima).
+    pub z: u32,
 }
 
 struct Fallback {
@@ -144,6 +150,8 @@ impl Default for Inputs {
 pub struct EspectroRenderer {
     shared: Option<Shared>,
     slots: HashMap<String, Slot>,
+    /// Chaves dos slots em ordem Z (refeita só na construção da lista, nunca por quadro).
+    order: Vec<String>,
     /// Canto do monitor de cada saída no desktop virtual (px físicos): cursor por monitor.
     origins: HashMap<String, (i32, i32)>,
     epoch: u64,
@@ -269,6 +277,7 @@ impl EspectroRenderer {
         Self {
             shared: None,
             slots: HashMap::new(),
+            order: Vec::new(),
             origins: HashMap::new(),
             epoch: 0,
             t0: Instant::now(),
@@ -372,6 +381,7 @@ impl EspectroRenderer {
                 texture(8),
                 sampler(9),
                 texture(10),
+                texture(11),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -460,7 +470,12 @@ impl EspectroRenderer {
         frame_px: (f32, f32),
         placement: EspectroPlacement,
     ) -> Option<TextureId> {
-        let px = (px.0.clamp(1, MAX_TARGET_DIM), px.1.clamp(1, MAX_TARGET_DIM));
+        // `//@scale`: alvo menor, ampliado pelo compositor (economia de preenchimento).
+        let scale = if effect.scale.is_finite() { effect.scale.clamp(0.25, 1.0) } else { 1.0 };
+        let px = (
+            ((px.0 as f32 * scale).round() as u32).clamp(1, MAX_TARGET_DIM),
+            ((px.1 as f32 * scale).round() as u32).clamp(1, MAX_TARGET_DIM),
+        );
         let epoch = self.epoch;
         let hash = hash_wgsl(&effect.wgsl);
         self.shared(device, queue);
@@ -560,6 +575,10 @@ impl EspectroRenderer {
             }
             keep
         });
+        let slots = &self.slots;
+        self.order.clear();
+        self.order.extend(slots.keys().cloned());
+        self.order.sort_by_key(|k| slots.get(k).map_or(0, |s| s.placement.z));
     }
 
     /// Solta todas as texturas (hibernação / device perdido / cena nova).
@@ -569,6 +588,7 @@ impl EspectroRenderer {
                 compositor.release_texture(id);
             }
         }
+        self.order.clear();
     }
 
     /// Renderiza os efeitos da saída `canvas_key` em `encoder` (antes do passe 2D que os compõe).
@@ -590,7 +610,11 @@ impl EspectroRenderer {
         let inputs = self.inputs;
         let origin = self.origins.get(canvas_key).copied().unwrap_or((0, 0));
         let g = &mut self.globals;
-        for slot in self.slots.values_mut() {
+        // De baixo para cima: a saída de um efeito já está pronta quando o de cima a lê.
+        for key in &self.order {
+            let Some(slot) = self.slots.get_mut(key) else {
+                continue;
+            };
             if slot.canvas != canvas_key {
                 continue;
             }
@@ -603,7 +627,15 @@ impl EspectroRenderer {
 
             // Chave das texturas ligadas (fundo + imagens do usuário, com versão). FNV-1a, sem alocação.
             let mut key = 0xcbf2_9ce4_8422_2325u64;
-            let ids = [backdrop.map(|(_, id)| id), p.textures[0], p.textures[1], p.textures[2], p.textures[3]];
+            let input = view_of(p.input);
+            let ids = [
+                backdrop.map(|(_, id)| id),
+                p.textures[0],
+                p.textures[1],
+                p.textures[2],
+                p.textures[3],
+                input.map(|(_, id)| id),
+            ];
             for id in ids {
                 let (a, b) = match id.filter(|id| compositor.texture_view(*id).is_some()) {
                     Some(id) => (u64::from(id.raw()) + 1, compositor.texture_version(id)),
@@ -621,6 +653,7 @@ impl EspectroRenderer {
                     let bd_view = backdrop.map_or(&shared.dark.view, |(v, _)| v);
                     let user = |i: usize| view_of(p.textures[i]).map_or(&shared.white.view, |(v, _)| v);
                     let prev = target.prev.as_ref().map_or(&shared.clear.view, |t| &t.view);
+                    let input_view = input.map_or(bd_view, |(v, _)| v);
                     let globals_buf = &slot.globals_buf;
                     let params_buf = &slot.params_buf;
                     let make = |state: &wgpu::TextureView| {
@@ -639,6 +672,7 @@ impl EspectroRenderer {
                                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(user(3)) },
                                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&shared.repeat) },
                                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(state) },
+                                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(input_view) },
                             ],
                         })
                     };
@@ -690,6 +724,9 @@ impl EspectroRenderer {
             g[33] = inputs.media[1];
             g[34] = inputs.media[2];
             g[35] = 0.0;
+            // Sem entrada encadeada, `sample_input` cai no fundo.
+            let input_rect = if input.is_some() { p.input_rect } else { p.backdrop_rect };
+            g[36..40].copy_from_slice(&input_rect);
             slot.frame = slot.frame.saturating_add(1);
             queue.write_buffer(&slot.globals_buf, 0, bytemuck::cast_slice(&g[..]));
             if slot.params_dirty {
