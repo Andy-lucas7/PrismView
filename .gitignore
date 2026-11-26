@@ -5,3 +5,4 @@ _backup_antes_sala3d/
 e.restoreContext()
 CLAUDE.md
 .claudeignore
+apps/prismview-studio/src-tauri/binaries/

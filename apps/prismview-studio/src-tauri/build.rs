@@ -97,6 +97,19 @@ fn build_native_engine() {
         println!("cargo:warning=OUT_DIR ausente; motor não copiado");
         return;
     };
+    // Instalador (`npm run installer`): o Tauri empacota o motor como `externalBin`, que precisa
+    // existir em `src-tauri/binaries/prismview-engine-<triple>.exe` antes do `tauri_build`.
+    if release && !target.is_empty() {
+        let sidecar = manifest_dir
+            .join("binaries")
+            .join(format!("prismview-engine-{target}{}", if cfg!(windows) { ".exe" } else { "" }));
+        let copied = std::fs::create_dir_all(sidecar.parent().unwrap_or(manifest_dir.as_path()))
+            .and_then(|_| copy_if_changed(&built, &sidecar));
+        if let Err(e) = copied {
+            println!("cargo:warning=motor não copiado para {}: {e}", sidecar.display());
+        }
+    }
+
     let dest = dest_dir.join(exe_name());
     if let Err(e) = copy_if_changed(&built, &dest) {
         // Motor em execução segura o .exe (Windows): avisa em vez de falhar o build.

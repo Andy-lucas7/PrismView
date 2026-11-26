@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview --port 1420",
     "tauri": "tauri",
+    "installer": "tauri build --config src-tauri/tauri.installer.conf.json",
     "gen:motion": "node scripts/gen-motion.mjs",
     "build:vstem": "node scripts/build-vstem-wasm.mjs",
     "test": "node scripts/gen-motion.mjs --check && node --test tests/fxEngine.test.ts tests/scene3dQuick.test.ts tests/importReview.test.ts tests/hubLiveBudget.test.ts tests/hubStillCache.test.ts tests/frameJank.test.ts tests/stemStretch.test.ts tests/colorMath.test.ts tests/textLayoutParity.test.ts tests/fxDocs.test.ts tests/helpContent.test.ts tests/vstemWasm.test.ts tests/panelSplit.test.ts tests/multiSelect.test.ts tests/align.test.ts tests/videoOutput.test.ts tests/espectro.test.ts"
