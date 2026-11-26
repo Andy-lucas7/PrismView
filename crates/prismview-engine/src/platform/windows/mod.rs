@@ -50,7 +50,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer, RegisterWindowMessageW,
 };
 
-pub use dcomp_surface::wallpaper_presenter;
+pub use dcomp_surface::{compositor_refresh_period, wallpaper_presenter};
 pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;

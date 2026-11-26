@@ -59,7 +59,7 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, log_file, open_studio, parse_tray_enabled, resolve_font_files,
+    acquire_single_instance, compositor_refresh_period, log_file, open_studio, parse_tray_enabled, resolve_font_files,
     run as run_loop, set_windows_desktop_wallpaper, trim_working_set, wallpaper_presenter,
     ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder, SensorsConfig, TrayAction,
     Win32DesktopHost, Win32SystemSensors,
@@ -101,6 +101,9 @@ const MAX_SCENE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const SCENE3D_UNBOUND: u64 = u64::MAX;
 /// Intervalo mínimo entre quadros de widgets com molas em movimento (sem bloqueio de VSync).
 const WIDGET_MIN_FRAME: Duration = Duration::from_micros(8_333);
+/// Folga para molas/cursor esperarem o próximo quadro de vídeo/3D em vez de gerar um próprio:
+/// cobre vídeo de 50–60 FPS contra a cadência de 16 ms das molas.
+const FRAME_RIDE_SLACK: Duration = Duration::from_millis(4);
 
 /// Reaberturas de um vídeo com erro (1 s, 5 s, 30 s; depois desiste até a próxima cena).
 const VIDEO_RETRY_DELAYS: [Duration; 3] = [
@@ -1607,6 +1610,9 @@ impl NativeApp {
     fn rebuild_outputs(&mut self, host: &mut Win32DesktopHost) {
         self.release_gpu_resources(false);
         self.rebuild_at = None;
+        // Monitores/refresh podem ter mudado: teto de FPS = período de composição do DWM.
+        self.governor
+            .set_display_interval(compositor_refresh_period().unwrap_or(Duration::ZERO));
 
         if !self.wallpaper_wanted {
             // Só widgets: nenhuma janela no WorkerW (o fundo do Windows segue visível).
@@ -2276,7 +2282,6 @@ impl LoopHandler for NativeApp {
             .unwrap_or(Duration::from_millis(16))
             .max(frame_interval)
             .max(Duration::from_millis(16));
-        let binding_at = bindings_moving.then(|| now + binding_cadence);
         let governor_at = self.governor.next_deadline(now);
         // Caixa 3D recém-construída por este render e 3D ainda sem quadro: volta já.
         let scene3d_at = scene3d_at.or_else(|| {
@@ -2285,6 +2290,14 @@ impl LoopHandler for NativeApp {
                 && self.scene3d_placement(host).is_some();
             pending.then(Instant::now)
         });
+        // Vídeo/3D já trazem quadros contínuos: se o próximo deles cai até ~1 cadência à frente,
+        // molas e cursor pegam carona nele (o `process_signals` daquela iteração lê o cursor e
+        // marca `dirty`). Sem isso, um quadro próprio do parallax caía entre dois quadros do vídeo
+        // (60 FPS de vídeo + mouse = ~78 quadros/s, cada um com cópia DComp e espera de compositor).
+        let continuous_at = [video_at, scene3d_at].into_iter().flatten().min();
+        let ride_continuous =
+            continuous_at.is_some_and(|at| at <= now + binding_cadence + FRAME_RIDE_SLACK);
+        let binding_at = (bindings_moving && !ride_continuous).then(|| now + binding_cadence);
         // Widgets: relógio, molas 2D, 3D pendente e retentativas (só os visíveis acordam o loop).
         let mut widget_at: Option<Instant> = widget3d_at;
         let mut push = |at: Instant| widget_at = Some(widget_at.map_or(at, |cur| cur.min(at)));
@@ -2319,6 +2332,7 @@ impl LoopHandler for NativeApp {
         // cursor exato continua sendo lido em `process_signals` no instante de cada quadro; ao
         // assentar, `MOUSE` volta imediatamente para `wake_mask` (0% CPU em repouso, <0,1ms wake).
         let frame_scheduled = scene3d_at.is_some()
+            || ride_continuous
             || binding_at.is_some()
             || throttle_at.is_some()
             || widget3d_at.is_some();

@@ -36,7 +36,7 @@ use ::windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice2, IDCompositionDesktopDevice, IDCompositionSurface, IDCompositionTarget,
     IDCompositionVisual2,
 };
-use ::windows::Win32::Graphics::Dwm::DwmFlush;
+use ::windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_SAMPLE_DESC,
@@ -419,6 +419,26 @@ impl Drop for DCompSurfacePresenter {
             let _ = CloseHandle(self.fence_event);
         }
     }
+}
+
+/// Período de composição do DWM (= refresh do monitor que ele segue). Quadros mais rápidos que
+/// isto nunca chegam à tela: o motor usa como teto de FPS no modo Normal. `None` se indisponível.
+pub fn compositor_refresh_period() -> Option<std::time::Duration> {
+    let mut info = DWM_TIMING_INFO {
+        cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: estrutura com `cbSize` correto; HWND nulo = composição global do desktop.
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.ok()?;
+    let (num, den) = (info.rateRefresh.uiNumerator, info.rateRefresh.uiDenominator);
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let period = std::time::Duration::from_nanos(1_000_000_000 * u64::from(den) / u64::from(num));
+    // Valores absurdos (driver/VM): ignora em vez de travar ou soltar o FPS.
+    (std::time::Duration::from_micros(2_000)..=std::time::Duration::from_millis(50))
+        .contains(&period)
+        .then_some(period)
 }
 
 /// Apresentador do wallpaper para a janela `window` (ver doc do módulo).
