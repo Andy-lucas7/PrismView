@@ -62,6 +62,7 @@ use crate::platform::windows::{
     acquire_single_instance, compositor_refresh_period, log_file, open_studio, parse_tray_enabled, resolve_font_files,
     run as run_loop, set_windows_desktop_wallpaper, trim_working_set, wallpaper_presenter,
     ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder, SensorsConfig, TrayAction,
+    VideoOutputOptions,
     Win32DesktopHost, Win32SystemSensors,
 };
 use crate::platform::{
@@ -115,6 +116,8 @@ const VIDEO_RETRY_DELAYS: [Duration; 3] = [
 /// Decoder de um arquivo de vídeo da cena.
 struct VideoSlot {
     path: PathBuf,
+    /// Resolução/FPS pedidos ao decoder (mudou = reabre).
+    options: VideoOutputOptions,
     decoder: MfVideoDecoder,
     paused: bool,
     /// Erro atual já registrado (log + status): não repetir a cada iteração.
@@ -153,6 +156,8 @@ struct NativeApp {
     scene: Option<PrismScene>,
     ctx: EvalContext,
     outputs: Vec<Output>,
+    /// Altura do monitor mais alto (px físicos): teto automático da decodificação de vídeo.
+    max_monitor_height: Option<u32>,
     clear_color: [f32; 4],
     dirty: bool,
     paused: bool,
@@ -318,6 +323,7 @@ impl NativeApp {
             scene: None,
             ctx: EvalContext::default(),
             outputs: Vec::new(),
+            max_monitor_height: None,
             clear_color: DEFAULT_CLEAR,
             dirty: false,
             paused: false,
@@ -383,6 +389,7 @@ impl NativeApp {
             self.drop_scene3d();
             return;
         };
+        let scale_cap = self.scene3d_scale_cap();
         let Some(shared) = self.ensure_scene3d_infra() else {
             return;
         };
@@ -392,7 +399,7 @@ impl NativeApp {
         let proxy = self.proxy;
         if self.scene3d.is_none() {
             let mut scene3d = Scene3dRenderer::new(shared, gpu, Scene3dOptions::default());
-            scene3d.set_render_scale_cap(self.governor.caps().render_scale_cap);
+            scene3d.set_render_scale_cap(scale_cap);
             scene3d.set_msaa_cap(self.governor.caps().msaa);
             if let Some(proxy) = proxy {
                 scene3d.set_waker(Some(Arc::new(move || {
@@ -403,6 +410,7 @@ impl NativeApp {
             self.scene3d_bound_gen = SCENE3D_UNBOUND;
         }
         if let (Some(scene3d), Some(loader)) = (self.scene3d.as_mut(), self.loader.as_mut()) {
+            scene3d.set_render_scale_cap(scale_cap);
             scene3d.set_config(gpu, config, loader);
             scene3d.set_media_cover(gpu, &self.ctx.media.cover_path);
         }
@@ -1066,6 +1074,13 @@ impl NativeApp {
         self.scene3d.as_ref().is_some_and(Scene3dRenderer::has_formulas) || self.widgets.iter().any(WidgetRuntime::has_formulas)
     }
 
+    /// Teto da escala de render do 3D: o do governador limitado pela qualidade da cena
+    /// (`Max` = resolução do monitor).
+    fn scene3d_scale_cap(&self) -> f32 {
+        let quality = self.scene.as_ref().map_or(1.0, |s| s.quality.resolution_scale());
+        self.governor.caps().render_scale_cap.min(quality)
+    }
+
     /// Aplica a decisão do governador: pós-processamento, hibernação de VRAM, redesenho.
     fn apply_power(&mut self, update: GovernorUpdate) {
         if update.caps_changed {
@@ -1073,8 +1088,9 @@ impl NativeApp {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_post_processing(caps.post_processing);
             }
+            let scale_cap = self.scene3d_scale_cap();
             if let Some(scene3d) = self.scene3d.as_mut() {
-                scene3d.set_render_scale_cap(caps.render_scale_cap);
+                scene3d.set_render_scale_cap(scale_cap);
                 scene3d.set_msaa_cap(caps.msaa);
             }
             for w in &mut self.widgets {
@@ -1285,8 +1301,23 @@ impl NativeApp {
             .as_ref()
             .map(SceneRenderer::video_sources)
             .unwrap_or_default();
+        // Automático: vídeo maior que o monitor mais alto é decodificado na altura dele.
+        let auto_max_height = self.max_monitor_height;
+        let wanted: Vec<(PathBuf, VideoOutputOptions)> = wanted
+            .into_iter()
+            .map(|(path, _background, playback)| {
+                let options = VideoOutputOptions {
+                    fps_limit: playback.fps_limit,
+                    height: playback.height,
+                    auto_max_height,
+                };
+                (path, options)
+            })
+            .collect();
         let same = wanted.len() == self.videos.len()
-            && wanted.iter().all(|(p, _)| self.videos.iter().any(|v| v.path == *p));
+            && wanted
+                .iter()
+                .all(|(p, o)| self.videos.iter().any(|v| v.path == *p && v.options == *o));
         if same {
             return;
         }
@@ -1294,7 +1325,7 @@ impl NativeApp {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
-        for (path, _background) in wanted {
+        for (path, options) in wanted {
             if !path.is_file() {
                 push_issue(&mut self.issues, None, format!("Vídeo não encontrado: {}", path.display()));
                 continue;
@@ -1305,6 +1336,7 @@ impl NativeApp {
                 continue;
             }
             decoder.set_looping(true);
+            decoder.set_output_options(options);
             if let Some(proxy) = self.proxy {
                 decoder.set_waker(Arc::new(move || {
                     proxy.wake();
@@ -1315,6 +1347,7 @@ impl NativeApp {
             match decoder.open_async(&path) {
                 Ok(()) => self.videos.push(VideoSlot {
                     path,
+                    options,
                     decoder,
                     paused: false,
                     error_reported: false,
@@ -1635,6 +1668,8 @@ impl NativeApp {
                 (i.id.clone(), i.width, i.height, i.scale_factor, (i.x, i.y))
             })
             .collect();
+        // Antes do `ensure_renderer` (que abre os vídeos): resolução automática do vídeo.
+        self.max_monitor_height = monitors.iter().map(|m| m.2).max();
 
         let mut pending: Vec<(String, f32, (i32, i32), WindowSurface)> = Vec::with_capacity(monitors.len());
         for (monitor_id, width, height, scale, origin) in monitors {

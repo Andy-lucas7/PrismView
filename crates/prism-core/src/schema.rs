@@ -626,6 +626,9 @@ pub struct LayerNode {
     /// `width_px`/`height_px` são ignorados.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fill_parent: bool,
+    /// Reprodução de camadas `Video` (FPS e altura de decodificação).
+    #[serde(default, skip_serializing_if = "VideoPlayback::is_default")]
+    pub video: VideoPlayback,
     #[serde(default)]
     pub children: Vec<LayerNode>,
 }
@@ -723,6 +726,7 @@ impl Default for LayerNode {
             touch: TouchAction::default(),
             scene3d: None,
             fill_parent: false,
+            video: VideoPlayback::default(),
             children: Vec::new(),
         }
     }
@@ -782,6 +786,8 @@ pub enum BackgroundSource {
         muted: bool,
         #[serde(default = "default_true")]
         loop_video: bool,
+        #[serde(default, skip_serializing_if = "VideoPlayback::is_default")]
+        playback: VideoPlayback,
     },
     CarouselFolder {
         path: String,
@@ -795,6 +801,51 @@ pub enum BackgroundSource {
         project_json_path: String,
         item_type: String,
     },
+}
+
+/// Reprodução de vídeo escolhida no Estúdio.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct VideoPlayback {
+    /// Teto de quadros por segundo. `0` = quadro parado (o decoder dorme); ausente = o do arquivo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps_limit: Option<f32>,
+    /// Altura de decodificação em pixels (largura segue a proporção). Ausente = automática:
+    /// a altura do monitor se o vídeo for maior que ele, senão a do arquivo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl VideoPlayback {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Qualidade de reflexos e luz (vidro e 3D) relativa à resolução do monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RenderQuality {
+    Low,
+    Medium,
+    High,
+    #[default]
+    Max,
+}
+
+impl RenderQuality {
+    pub fn is_max(&self) -> bool {
+        *self == Self::Max
+    }
+
+    /// Fração da resolução do monitor usada pelos passes de reflexo/luz.
+    pub fn resolution_scale(self) -> f32 {
+        match self {
+            Self::Low => 0.35,
+            Self::Medium => 0.5,
+            Self::High => 0.75,
+            Self::Max => 1.0,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -932,6 +983,9 @@ pub struct PrismScene {
     /// vez do fator de DPI do monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_size: Option<[f32; 2]>,
+    /// Qualidade de reflexos/luz (vidro e 3D). `Max` = resolução cheia do monitor.
+    #[serde(default, skip_serializing_if = "RenderQuality::is_max")]
+    pub quality: RenderQuality,
 }
 
 fn default_scene_title() -> String {
@@ -957,6 +1011,7 @@ impl Default for PrismScene {
             layers: Vec::new(),
             bindings: Vec::new(),
             logical_size: None,
+            quality: RenderQuality::Max,
         }
     }
 }

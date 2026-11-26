@@ -465,6 +465,18 @@ impl GlassRenderer {
         true
     }
 
+    /// Qualidade dos reflexos: fração da resolução da saída na base da pirâmide (1,0 = cheia).
+    /// `true` se mudou (os alvos são refeitos no próximo quadro; refazer o quadro).
+    pub fn set_resolution_scale(&mut self, scale: f32) -> bool {
+        let scale = if scale.is_finite() { scale.clamp(0.1, 1.0) } else { 1.0 };
+        if (self.blur.res_scale - scale).abs() < 1e-4 {
+            return false;
+        }
+        self.blur.res_scale = scale;
+        self.blur.release();
+        true
+    }
+
     /// Invalida resultados de blur de um backdrop que foi trocado/liberado.
     pub fn invalidate_backdrop(&mut self, content_hash: u64) {
         self.blur.invalidate_content(content_hash);
@@ -774,15 +786,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mip_sizes_cap_base_and_halve() {
-        let sizes = mip_sizes((3840, 2160));
-        assert_eq!(sizes[0], (1080, 608));
-        assert_eq!(sizes[1], (540, 304));
-        assert_eq!(sizes[2], (270, 152));
-        assert_eq!(sizes[3], (135, 76));
-        assert_eq!(sizes[4], (68, 38));
+    fn mip_sizes_follow_quality_and_halve() {
+        // Max: base na resolução da saída.
+        let full = mip_sizes((1920, 1080), 1.0);
+        assert_eq!(full[0], (1920, 1080));
+        assert_eq!(full[1], (960, 540));
+        // Medium (0,5) em 4K.
+        let sizes = mip_sizes((3840, 2160), 0.5);
+        assert_eq!(sizes[0], (1920, 1080));
+        assert_eq!(sizes[1], (960, 540));
+        assert_eq!(sizes[4], (120, 68));
 
-        let tiny = mip_sizes((16, 16));
+        let tiny = mip_sizes((16, 16), 0.35);
         assert_eq!(tiny[0], (16, 16));
     }
 

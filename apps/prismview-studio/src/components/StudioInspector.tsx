@@ -1,4 +1,5 @@
 import { NativeCompatPanel } from "./NativeCompatPanel";
+import { VideoOutputControls } from "./studio/VideoOutputControls";
 import { Select, ColorInput } from "./ui/Controls";
 import { AnimatePresence, motion } from "framer-motion";
 import { COLLAPSE } from "./motion/Presence";
@@ -77,6 +78,7 @@ import {
   SceneLayer,
   validateReactiveBinding3D,
 } from "../types/prism";
+import type { RenderQuality } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
 import { Scene3DOutliner } from "./Scene3DOutliner";
 import { Scene3DQuickActions } from "./Scene3DQuickActions";
@@ -181,6 +183,14 @@ export interface StudioInspectorProps {
   onRecordStep: () => void;
   onFlushSave?: () => void;
 }
+
+/** Qualidade de reflexos/luz do desktop (`PrismProject.renderQuality`). */
+const RENDER_QUALITY_OPTIONS: { value: RenderQuality; label: string; title: string }[] = [
+  { value: "LOW", label: "Baixa", title: "35% da resolução do monitor" },
+  { value: "MEDIUM", label: "Média", title: "50% da resolução do monitor" },
+  { value: "HIGH", label: "Alta", title: "75% da resolução do monitor" },
+  { value: "MAX", label: "Máxima", title: "Resolução do monitor" },
+];
 
 export const StudioInspector: React.FC<StudioInspectorProps> = ({
   compatIssues = [],
@@ -617,6 +627,37 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
     return (
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        <div className="space-y-2 pb-3 border-b border-white/10">
+          <span className="block text-[11px] font-medium uppercase tracking-wider text-[#A1A1AA]">
+            Qualidade de reflexos e luz
+          </span>
+          <div className="grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Qualidade de reflexos e luz">
+            {RENDER_QUALITY_OPTIONS.map((q) => {
+              const active = (project.renderQuality ?? "MAX") === q.value;
+              return (
+                <button
+                  key={q.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  title={q.title}
+                  onClick={() =>
+                    onApplyDiscreteProject({
+                      ...project,
+                      renderQuality: q.value === "MAX" ? undefined : q.value,
+                    })
+                  }
+                  className={`py-1.5 rounded-xl text-[11px] ${active ? "prism-pill-active" : "prism-pill-idle"}`}
+                >
+                  {q.label}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-[#71717A]">
+            Vidro e 3D no desktop. Máxima = resolução do monitor.
+          </p>
+        </div>
         {isWidget && (
           <div className="space-y-3 pb-3 border-b border-white/10">
             <div className="space-y-2">
@@ -1525,6 +1566,23 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       )
                     }
                   />
+                  {!isMulti && (
+                    <VideoOutputControls
+                      src={selectedLayer.video.src}
+                      fpsLimit={selectedLayer.video.fpsLimit}
+                      decodeHeight={selectedLayer.video.decodeHeight}
+                      sliderHandlers={sliderHandlers}
+                      onFpsChange={(fpsLimit) =>
+                        patchTarget((l) => (l.video ? { ...l, video: { ...l.video, fpsLimit } } : l))
+                      }
+                      onHeightChange={(decodeHeight) =>
+                        patchTarget(
+                          (l) => (l.video ? { ...l, video: { ...l.video, decodeHeight } } : l),
+                          "discrete"
+                        )
+                      }
+                    />
+                  )}
                   <label className="flex items-center justify-between frosted-chrome-card px-3 py-2 text-xs">
                     <span>
                       Sem áudio{" "}

@@ -391,10 +391,45 @@ fn import_slot(bridge: &GpuBridge, handle: HANDLE, width: u32, height: u32) -> P
 /// Acorda a thread de render (ex.: `LoopProxy::wake`) quando a abertura assíncrona termina.
 pub type VideoWaker = Arc<dyn Fn() + Send + Sync>;
 
+/// Saída pedida ao decoder (resolução e ritmo). Padrão = como o arquivo.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VideoOutputOptions {
+    /// Teto de FPS. `Some(0)` = só o 1º quadro (o worker dorme); acima do arquivo = sem efeito.
+    pub fps_limit: Option<f32>,
+    /// Altura escolhida (largura pela proporção). `None` = automática (`auto_max_height`).
+    pub height: Option<u32>,
+    /// Automático: se o vídeo for mais alto que isto (monitor), decodifica nesta altura.
+    pub auto_max_height: Option<u32>,
+}
+
+impl VideoOutputOptions {
+    /// Altura de saída para um vídeo `native_h` de altura (`None` = a do arquivo).
+    fn target_height(&self, native_h: u32) -> Option<u32> {
+        let h = match self.height {
+            Some(h) => h,
+            None => self.auto_max_height.filter(|&m| native_h > m)?,
+        };
+        let h = h.clamp(2, 8192) & !1;
+        (h != native_h).then_some(h)
+    }
+
+    /// Intervalo mínimo entre quadros (ms) para `native_ms`; `None` = todos os quadros.
+    fn keep_interval_ms(&self, native_ms: u64) -> Option<u64> {
+        let fps = self.fps_limit.filter(|f| f.is_finite() && *f > 0.0)?;
+        let ms = (1000.0 / fps).round() as u64;
+        (ms > native_ms).then_some(ms)
+    }
+
+    fn is_still(&self) -> bool {
+        self.fps_limit.is_some_and(|f| f <= 0.0)
+    }
+}
+
 struct WorkerArgs {
     path: PathBuf,
     device: ID3D11Device,
     wake: Option<VideoWaker>,
+    options: VideoOutputOptions,
 }
 
 struct OpenedStream {
@@ -450,6 +485,11 @@ struct Pipeline {
     /// Tamanho real das texturas do MF (podem ter padding, ex.: 1088 linhas).
     src_extent: Option<(u32, u32)>,
     frame_ms: u64,
+    /// Teto de FPS: só copia quadros com PTS ≥ `next_keep_ms` (os demais nem saem do decoder).
+    keep_interval_ms: Option<u64>,
+    next_keep_ms: u64,
+    /// FPS 0: publica o 1º quadro e para de decodificar.
+    still: bool,
 }
 
 enum Step {
@@ -525,12 +565,42 @@ impl Pipeline {
                 "SetCurrentMediaType(ARGB32)",
             )?;
 
-            let current = ctx(
+            let mut current = ctx(
                 reader.GetCurrentMediaType(FIRST_VIDEO_STREAM),
                 "GetCurrentMediaType",
             )?;
             let packed = ctx(current.GetUINT64(&MF_MT_FRAME_SIZE), "MF_MT_FRAME_SIZE")?;
-            let (width, height) = ((packed >> 32) as u32, packed as u32);
+            let (mut width, mut height) = ((packed >> 32) as u32, packed as u32);
+            // Resolução escolhida: o video processor do MF redimensiona na GPU junto com a
+            // conversão de cor (nada de 4K decodificado para uma tela 1080p). Se o driver
+            // recusar, segue na resolução do arquivo.
+            if let Some(target_h) = (width > 0 && height > 0)
+                .then(|| args.options.target_height(height))
+                .flatten()
+            {
+                let target_w = ((u64::from(width) * u64::from(target_h) + u64::from(height) / 2)
+                    / u64::from(height))
+                .clamp(2, 16384) as u32
+                    & !1;
+                let scaled = ctx(MFCreateMediaType(), "MFCreateMediaType")?;
+                ctx(scaled.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video), "MF_MT_MAJOR_TYPE")?;
+                ctx(scaled.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32), "MF_MT_SUBTYPE")?;
+                ctx(
+                    scaled.SetUINT64(&MF_MT_FRAME_SIZE, (u64::from(target_w) << 32) | u64::from(target_h)),
+                    "MF_MT_FRAME_SIZE",
+                )?;
+                if reader.SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &scaled).is_ok() {
+                    if let Ok(t) = reader.GetCurrentMediaType(FIRST_VIDEO_STREAM) {
+                        if let Ok(p) = t.GetUINT64(&MF_MT_FRAME_SIZE) {
+                            (width, height) = ((p >> 32) as u32, p as u32);
+                            current = t;
+                        }
+                    }
+                } else {
+                    eprintln!("[prismview-engine] vídeo: o MF recusou {target_w}x{target_h}; usando {width}x{height}");
+                    let _ = reader.SetCurrentMediaType(FIRST_VIDEO_STREAM, None, &output);
+                }
+            }
             if width == 0 || height == 0 {
                 return Err(format!("dimensões de vídeo inválidas: {width}x{height}"));
             }
@@ -625,6 +695,9 @@ impl Pipeline {
                 height,
                 src_extent: None,
                 frame_ms,
+                keep_interval_ms: args.options.keep_interval_ms(frame_ms),
+                next_keep_ms: 0,
+                still: args.options.is_still(),
             };
             Ok((pipeline, OpenedStream { info, handles }))
         }
@@ -670,8 +743,17 @@ impl Pipeline {
         let Some(sample) = sample else {
             return Ok(Step::Skip); // gap/stream tick
         };
+        let ts_ms = u64::try_from(timestamp).unwrap_or(0) / 10_000;
+        // Teto de FPS: quadro antes da hora nem é copiado (sem cópia GPU, sem quadro no render).
+        if let Some(interval) = self.keep_interval_ms {
+            if ts_ms.saturating_add(self.frame_ms / 2) < self.next_keep_ms {
+                return Ok(Step::Skip);
+            }
+            let next = self.next_keep_ms.saturating_add(interval);
+            self.next_keep_ms = if next <= ts_ms { ts_ms + interval } else { next };
+        }
         self.copy_sample(&sample, slot)?;
-        Ok(Step::Frame(u64::try_from(timestamp).unwrap_or(0) / 10_000))
+        Ok(Step::Frame(ts_ms))
     }
 
     /// Troca de tipo no meio do stream: só aceitamos se a resolução não mudou (o anel tem
@@ -788,6 +870,7 @@ impl Pipeline {
             if let Some((position_ms, new_gen)) = seek {
                 match self.seek(position_ms) {
                     Ok(()) => {
+                        self.next_keep_ms = 0;
                         gen = new_gen;
                         loop_base_ms = 0;
                         last_ts_ms = 0;
@@ -818,6 +901,11 @@ impl Pipeline {
                         pts_ms: loop_base_ms + ts_ms,
                         gen,
                     };
+                    if self.still {
+                        // FPS 0: este quadro fica na tela; o worker dorme até seek/close.
+                        st.end_of_stream = true;
+                        st.looping = false;
+                    }
                     drop(st);
                     shared.cv.notify_all();
                 }
@@ -828,6 +916,7 @@ impl Pipeline {
                         // PTS continua monotônico entre voltas (o relógio do render não salta).
                         loop_base_ms += last_ts_ms + self.frame_ms;
                         last_ts_ms = 0;
+                        self.next_keep_ms = 0;
                         if let Err(e) = self.seek(0) {
                             fail(shared, None, e);
                         }
@@ -924,6 +1013,7 @@ pub struct MfVideoDecoder {
     looping: bool,
     paused: bool,
     generation: u64,
+    options: VideoOutputOptions,
 }
 
 impl Default for MfVideoDecoder {
@@ -943,6 +1033,7 @@ impl MfVideoDecoder {
             looping: true,
             paused: false,
             generation: 0,
+            options: VideoOutputOptions::default(),
         }
     }
 
@@ -962,6 +1053,11 @@ impl MfVideoDecoder {
                 .session
                 .as_ref()
                 .is_some_and(|s| s.shared.failed.load(Ordering::Acquire))
+    }
+
+    /// Resolução/FPS de saída. Vale para a próxima abertura (`open_async`).
+    pub fn set_output_options(&mut self, options: VideoOutputOptions) {
+        self.options = options;
     }
 
     /// Acorda o loop quando uma abertura assíncrona termina (sucesso ou erro).
@@ -986,6 +1082,7 @@ impl MfVideoDecoder {
             path: path.to_path_buf(),
             device: bridge.d3d11.clone(),
             wake: self.waker.clone(),
+            options: self.options,
         };
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
@@ -1085,6 +1182,8 @@ impl MfVideoDecoder {
         } else {
             DEFAULT_FRAME_MS
         };
+        // Com teto de FPS, o próximo quadro vem a cada intervalo do teto (não do arquivo).
+        let frame_ms = self.options.keep_interval_ms(frame_ms).unwrap_or(frame_ms);
         self.generation += 1;
         self.session = Some(Session {
             shared,
