@@ -3,6 +3,7 @@ name = "prism-vstem-wasm"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "GPL-3.0-or-later"
 description = "Alongamento vetorial por haste (prism-core::vstem) para o Estúdio, em WebAssembly (C ABI, sem wasm-bindgen)."
 
 # Fora do workspace do app (alvo wasm32, lockfile próprio): compilar com

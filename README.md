@@ -4,57 +4,97 @@
 
 ### Seu desktop não precisa ser um depósito de ícones. Pode ser um lugar vivo.
 
-*Wallpapers animados, widgets de vidro e cenas em 3D, desenhados por você e guardados na luz do seu próprio monitor.*
+*Wallpapers animados, widgets de vidro e cenas em 3D, feitos por você, rodando no seu próprio computador.*
+
+[Licença: GPL-3.0](LICENSE) · Só Windows 10/11
 
 </div>
 
 ---
 
-## A ideia
+## O que é
 
-Todo dia, milhões de pessoas abrem o computador e encontram a mesma coisa: uma imagem parada, esquecida atrás das janelas. É o cômodo onde passamos horas e que nunca mudamos de lugar.
+O PrismView é um programa para Windows que troca o papel de parede parado por um **papel de parede vivo**. Ele tem duas partes:
 
-O **PrismView** nasce de uma pergunta simples: *e se esse espaço respirasse?*
+- **Studio**: o editor. Você monta o wallpaper camada por camada (texto, imagem, vídeo, vidro, 3D, efeitos) e vê o resultado na hora.
+- **Motor**: o programa leve que desenha o wallpaper atrás dos ícones do desktop. Ele é nativo (Rust + DirectX 12, sem navegador embutido), então gasta pouco e continua rodando mesmo com o Studio fechado.
 
-Um relógio que parece ter sido soprado em vidro. Uma capa de álbum que flutua em 3D enquanto a música toca. Uma tela que reage ao tom do seu dia, ao pulso da sua máquina, ao movimento do seu cursor. Nada de enfeite genérico: algo que é **seu**, feito do seu jeito.
+Tudo roda na sua máquina. Sem conta, sem nuvem, sem coleta de dados.
 
-## O que ele é
+## Recursos
 
-Um estúdio para criar, e um lar para exibir.
+- **Wallpapers vivos**: vídeo, imagem, composições e cenas 3D, em um ou em todos os monitores.
+- **Widgets**: relógio, data, barras, ícones e capa da música que flutuam sobre o desktop, onde você quiser.
+- **Vidro óptico**: material translúcido com desfoque, refração, dispersão de cor e brilho.
+- **Cenas 3D**: modelos `.glb`/`.gltf` com luz realista, animações, esqueleto e a "Sala 3D" para posicionar tudo com o mouse.
+- **Reage ao mundo**: música (graves, médios, agudos, batida), uso de CPU/GPU/RAM, bateria, hora do dia, mouse e teclado.
+- **Fórmulas ƒx**: textos e valores que mudam sozinhos (hora, música tocando, clima da máquina etc.).
+- **Economia de energia**: pausa quando uma janela cobre o desktop, baixa o ritmo na bateria e tem modos Eco/Ultra/Congelado.
+- **Pacotes `.prism`**: tudo que você cria vira um arquivo para guardar, trocar ou presentear.
 
-- **Wallpapers vivos.** Vídeos, imagens, composições e cenas tridimensionais que ocupam o fundo do seu desktop, em um monitor ou em todos.
-- **Widgets independentes.** Pequenas peças de vidro, como relógio, data, barras e ícones, que flutuam sobre o seu papel de parede, onde você quiser.
-- **Um estúdio de verdade.** Você monta camada por camada, agrupa, ajusta, compõe, vê o resultado enquanto cria. Sem código, sem burocracia.
-- **Vidro óptico.** O material central da identidade visual: translúcido, com refração e luz, que se curva sobre o que está atrás dele.
-- **Um mundo que reage.** O desktop pode responder à música que toca, ao uso do seu processador, à hora do dia, ao mouse.
-- **Compartilhável.** Tudo que você cria vira um pacote `.prism`, para guardar, trocar e presentear.
+## Modo Espectro
 
-## O que ele acredita
+O Modo Espectro é para quem quer ir além dos blocos prontos: você escreve um **efeito próprio em WGSL** (a linguagem de shader do WebGPU) e ele vira uma camada do wallpaper.
 
-**1. A beleza é funcional.**
-Um ambiente bonito não é futilidade: é onde sua cabeça mora durante o trabalho. Cuidar dele é cuidar de você.
+- Abra pelo ícone de arco-íris no topo do Studio.
+- Escreva uma função `effect(uv)` que devolve uma cor. O editor mostra erros com a linha certa.
+- Crie controles com comentários, por exemplo `//@param brilho: float = 0.5 range(0,1)`. Eles aparecem como sliders no painel.
+- Use o que está atrás (`sample_backdrop`), o quadro anterior (`sample_previous`), suas próprias texturas (`//@texture`), simulação (`simulate`) e até **partículas** (`//@particles`, até 200 mil) com física pronta (gravidade, vento, força do mouse, quicar nas bordas).
+- O efeito recebe hora, mouse, clique, música e telemetria.
+- Exporte e importe efeitos como arquivos `.prismfx`.
 
-**2. Criar deve ser livre.**
-Você não deveria precisar ser programador, designer ou artista 3D para ter um desktop com identidade. A ferramenta se adapta à sua ideia, não o contrário.
+O mesmo código roda na prévia do Studio (WebGPU) e no motor do desktop.
 
-**3. Bonito não pode ser pesado.**
-Um wallpaper que consome sua máquina é um convidado mal-educado. O PrismView se cala quando você abre um jogo, descansa quando você não está olhando e respeita o hardware que você tem.
+## Como instalar
 
-**4. O que é seu é seu.**
-Tudo roda localmente, na sua máquina. Sem conta, sem nuvem obrigatória, sem ninguém espiando o que você escolheu pôr na tela.
+Baixe o instalador na página de [Releases](../../releases) (quando houver uma versão publicada) e execute. Ele instala só para o seu usuário, sem pedir administrador.
 
-## Para quem é
+Requisitos: Windows 10 ou 11 (64 bits) e uma placa de vídeo com DirectX 12.
 
-Para quem passa o dia inteiro diante de uma tela e acha que ela merece mais. Para quem gosta de montar o próprio ambiente. Para quem já desenhou um desktop perfeito na cabeça e nunca encontrou a ferramenta que o realizasse.
+## Como compilar
 
-## Em uma frase
+### O que você precisa
 
-> **PrismView é o que acontece quando o fundo de tela deixa de ser pano de fundo e vira obra.**
+- [Node.js](https://nodejs.org/) 22.18 ou mais novo
+- [Rust](https://rustup.rs/) estável (alvo `x86_64-pc-windows-msvc`)
+- Visual Studio Build Tools com "Desenvolvimento para desktop com C++"
+- WebView2 (já vem no Windows 11)
 
----
+### Passos
 
-<div align="center">
+```bash
+git clone https://github.com/Andy-lucas7/PrismView.git
+cd PrismView/apps/prismview-studio
+npm install
 
-*Feito para Windows. Construído com cuidado, luz e um pouco de teimosia.*
+npm run tauri dev      # abre o Studio em modo de desenvolvimento
+npm run installer      # gera o instalador (.exe)
+```
 
-</div>
+O `npm run tauri dev` também compila o motor (`prismview-engine`) e o coloca ao lado do Studio.
+
+### Testes
+
+```bash
+npm test                          # testes do Studio (TypeScript)
+cargo test -p prism-core          # núcleo compartilhado
+cargo test -p prismview-engine    # motor nativo
+```
+
+### Estrutura
+
+| Pasta | O que tem |
+| --- | --- |
+| `apps/prismview-studio/` | Studio (React + Three.js) |
+| `apps/prismview-studio/src-tauri/` | Lado Rust do Studio (Tauri 2) |
+| `crates/prismview-engine/` | Motor nativo do wallpaper (wgpu + Win32) |
+| `crates/prism-core/` | Formato das cenas, fórmulas ƒx, pacote `.prism` |
+| `crates/prism-vstem-wasm/` | Alongamento de texto em WebAssembly |
+
+## Licença
+
+O PrismView é software livre, sob a **GNU General Public License v3.0 ou posterior** ([LICENSE](LICENSE)).
+
+Em resumo: você pode usar, estudar, mudar e redistribuir. Se distribuir uma versão modificada, ela também precisa ser GPL e com o código aberto.
+
+As fontes incluídas (Outfit, Inter, JetBrains Mono) seguem a SIL Open Font License. Os decodificadores Draco/Basis em `public/decoders` seguem a Apache-2.0.
