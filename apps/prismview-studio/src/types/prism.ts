@@ -3,3 +3,4 @@ export * from "./prismBase";
 export * from "./prismScene3D";
 export * from "./prismFactory";
 export * from "./prismTemplates";
+export * from "./prismEspectro";

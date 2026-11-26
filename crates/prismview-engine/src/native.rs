@@ -1765,15 +1765,19 @@ impl NativeApp {
                 .and_then(|s| s.ui_scale(sw as f32, sh as f32))
                 .unwrap_or(output.scale);
             let status = match renderer.as_deref_mut() {
-                Some(r) => r.render(
-                    gpu,
-                    &mut output.surface,
-                    &mut output.canvas,
-                    &output.monitor_id,
-                    ui_scale,
-                    &self.ctx,
-                    color,
-                ),
+                Some(r) => {
+                    // Efeitos Espectro: cursor/clique no monitor desta saída.
+                    r.set_output_origin(&output.monitor_id, output.origin);
+                    r.render(
+                        gpu,
+                        &mut output.surface,
+                        &mut output.canvas,
+                        &output.monitor_id,
+                        ui_scale,
+                        &self.ctx,
+                        color,
+                    )
+                }
                 None => output.surface.clear(gpu, color),
             };
             match status {
@@ -1872,6 +1876,7 @@ impl NativeApp {
                         .as_ref()
                         .map_or_else(|| "Unavailable".to_string(), |g| g.adapter_name().to_string()),
                     power_state: self.governor.state().as_str().to_string(),
+                    exe_stamp: exe_stamp(),
                 },
             },
             IpcRequest::LoadScene { scene, .. } => {
@@ -2406,4 +2411,17 @@ impl LoopHandler for NativeApp {
         self.widgets.clear();
         self.release_gpu_resources(true);
     }
+}
+
+/// Data de modificação deste executável (s desde 1970; 0 se indisponível), lida uma vez.
+fn exe_stamp() -> u64 {
+    static STAMP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STAMP.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(std::fs::metadata)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs())
+    })
 }

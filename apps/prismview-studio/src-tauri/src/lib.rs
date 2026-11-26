@@ -10,6 +10,7 @@ mod reactive_sensors;
 mod vis_events;
 mod projects;
 mod package;
+mod espectro;
 mod session;
 mod widgets;
 mod tray;
@@ -967,6 +968,8 @@ pub fn run() {
             package::pick_save_archive_path,
             package::import_prism_archive,
             package::pick_local_file,
+            espectro::export_prismfx,
+            espectro::save_espectro_texture,
             get_live_telemetry,
             media_control,
             set_studio_reactive_sensors,

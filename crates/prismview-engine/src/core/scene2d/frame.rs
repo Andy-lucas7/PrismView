@@ -40,6 +40,11 @@ pub(super) struct Frame<'a> {
     pub(super) asset_root: Option<&'a Path>,
     /// Deltas dos bindings reativos por camada (somados à base; nunca gravados nela).
     pub(super) fx: &'a LayerBindingSolver,
+    /// Efeitos Espectro (`None` na foto limpa do wallpaper do Windows: efeito não entra).
+    pub(super) espectro: Option<&'a mut EspectroRenderer>,
+    /// Última saída de efeito Espectro ou 3D desenhada (textura, área 0..1): entrada encadeada
+    /// (`sample_input`) do próximo efeito.
+    pub(super) chain: Option<(TextureId, [f32; 4])>,
     pub(super) ui: f32,
     pub(super) vw: f32,
     pub(super) vh: f32,
@@ -498,6 +503,7 @@ impl Frame<'_> {
             LayerKind::Image => self.draw_image(layer, size, &xf, z, blend, opacity),
             LayerKind::Scene3d => self.draw_scene3d(size, &xf, z, blend, opacity, layer.fill_parent),
             LayerKind::Video => self.draw_video(layer, size, &xf, z, blend, opacity),
+            LayerKind::Shader => self.draw_espectro(layer, size, &xf, z, blend, opacity),
             LayerKind::Svg | LayerKind::Icon => self.draw_svg(layer, size, &xf, z, blend, opacity),
             // DepthSubject (segmentação) ainda não tem renderer.
             LayerKind::Stack | LayerKind::Group | LayerKind::DepthSubject => {}
@@ -905,10 +911,97 @@ impl Frame<'_> {
             .color([1.0, 1.0, 1.0, opacity])
             .uv(cover_uv(out.size.0, out.size.1, size.w, size.h));
         self.canvas.push(z, blend, out.id, inst);
+        let (vw, vh) = (self.vw.max(1.0), self.vh.max(1.0));
+        let s = xf.scale();
+        self.chain = Some((
+            out.id,
+            [(xf.t[0] - half[0] * s) / vw, (xf.t[1] - half[1] * s) / vh, 2.0 * half[0] * s / vw, 2.0 * half[1] * s / vh],
+        ));
         // 3D full-bleed: vira o backdrop do vidro desenhado por cima (preserva alpha da cena 3D).
         if fill_parent {
             self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true, false));
         }
+    }
+
+    /// Camada SHADER (Modo Espectro): o efeito renderiza num alvo do tamanho da caixa (em
+    /// `SceneRenderer::render`, antes deste passe) e aqui entra como textura pré-multiplicada.
+    /// O fundo que `sample_backdrop` lê é a mídia de fundo (o mesmo backdrop do vidro).
+    pub(super) fn draw_espectro(
+        &mut self,
+        layer: &LayerNode,
+        size: Size,
+        xf: &Affine,
+        z: u32,
+        blend: BlendKind,
+        opacity: f32,
+    ) {
+        let Some(effect) = layer.shader.as_ref() else {
+            return;
+        };
+        if size.w <= 0.0 || size.h <= 0.0 || opacity <= 0.0 {
+            return;
+        }
+        let scale = xf.scale();
+        let (vw, vh) = (self.vw.max(1.0), self.vh.max(1.0));
+        let (w, h) = (size.w * scale, size.h * scale);
+        let layer_rect = [(xf.t[0] - w * 0.5) / vw, (xf.t[1] - h * 0.5) / vh, w / vw, h / vh];
+        let (backdrop, backdrop_rect, backdrop_opaque) = match self.backdrop.as_ref() {
+            Some(bd) => {
+                // `uv_rect` = região da textura que cobre a viewport → onde a textura cai no quadro.
+                let [u0, v0, u1, v1] = bd.uv_rect;
+                let du = (u1 - u0).max(1e-6);
+                let dv = (v1 - v0).max(1e-6);
+                (Some(bd.texture), [-u0 / du, -v0 / dv, 1.0 / du, 1.0 / dv], bd.opaque)
+            }
+            None => (None, [0.0, 0.0, 1.0, 1.0], false),
+        };
+        // Imagens do usuário (`//@texture`): decodificadas em segundo plano pelo cache de imagens;
+        // enquanto carregam o slot fica branco e `poll_images` refaz a lista quando chegam.
+        let mut textures = [None; MAX_TEXTURES];
+        for (slot, raw) in textures.iter_mut().zip(effect.textures.iter()) {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            if let Some(path) = self.resolve_asset(raw) {
+                *slot = self
+                    .images
+                    .get(&path, (self.vw as u32, self.vh as u32), self.compositor, self.device, self.queue)
+                    .map(|img| img.id);
+            }
+        }
+        let placement = EspectroPlacement {
+            layer_rect,
+            backdrop_rect,
+            backdrop,
+            backdrop_opaque,
+            textures,
+            input: self.chain.map(|(id, _)| id),
+            input_rect: self.chain.map_or([0.0, 0.0, 1.0, 1.0], |(_, r)| r),
+            z,
+        };
+        let px = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
+        let Some(espectro) = self.espectro.as_deref_mut() else {
+            return;
+        };
+        let Some(id) = espectro.place(
+            self.device,
+            self.queue,
+            &mut *self.compositor,
+            self.canvas_key,
+            &layer.id,
+            effect,
+            px,
+            (vw, vh),
+            placement,
+        ) else {
+            return;
+        };
+        let inst = QuadInstance::new(xf.t, [size.w * 0.5, size.h * 0.5], xf.m, scale)
+            .kind(QuadKind::Texture)
+            .color([1.0, 1.0, 1.0, opacity])
+            .uv([0.0, 0.0, 1.0, 1.0]);
+        self.canvas.push(z, blend, id, inst);
+        self.chain = Some((id, layer_rect));
     }
 
     /// Camada de vídeo: frame atual do decoder (zero-copy), cover na caixa, cantos arredondados.

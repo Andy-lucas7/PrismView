@@ -82,6 +82,7 @@ import type { RenderQuality } from "../types/prism";
 import { FxButton } from "./FxExpressionPopover";
 import { Scene3DOutliner } from "./Scene3DOutliner";
 import { Scene3DQuickActions } from "./Scene3DQuickActions";
+import { EspectroParams } from "./studio/EspectroParams";
 import type { Scene3DEditorApi } from "./Scene3DLayer";
 import type { Scene3DObjectTree } from "../engine/scene3d/modelTree";
 
@@ -182,6 +183,8 @@ export interface StudioInspectorProps {
   onCommitTx: () => void;
   onRecordStep: () => void;
   onFlushSave?: () => void;
+  /** Abre o Modo Espectro (camada SHADER selecionada). */
+  onOpenEspectro?: () => void;
 }
 
 /** Qualidade relativa à resolução do monitor (vidro: `PrismProject.glassQuality`; 3D: `renderScale`). */
@@ -243,6 +246,7 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
   onCommitTx,
   onRecordStep,
   onFlushSave,
+  onOpenEspectro,
 }) => {
   const [layerTab, setLayerTab] = useState<LayerTab>("CONTENT");
   const [showOptics, setShowOptics] = useState(false);
@@ -1971,6 +1975,38 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                       </button>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {selectedLayer.kind === "SHADER" && selectedLayer.shader && !isMulti && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-[#A1A1AA]">Efeito: {selectedLayer.shader.name}</span>
+                    {onOpenEspectro && (
+                      <button
+                        type="button"
+                        onClick={onOpenEspectro}
+                        className="prism-pill-idle rounded-full px-3 py-1 text-[11px]"
+                        title="Editar o código do efeito no Modo Espectro"
+                      >
+                        Editar código
+                      </button>
+                    )}
+                  </div>
+                  <EspectroParams
+                    effect={selectedLayer.shader}
+                    onChange={(name, value, commit) =>
+                      onPatchLayer(
+                        selectedLayer.id,
+                        (l) => (l.shader ? { ...l, shader: { ...l.shader, params: { ...l.shader.params, [name]: value } } } : l),
+                        commit
+                      )
+                    }
+                    onBeginTx={onBeginTx}
+                    onCommitTx={onCommitTx}
+                    onRecordStep={onRecordStep}
+                    onFlushSave={onFlushSave}
+                  />
                 </div>
               )}
 

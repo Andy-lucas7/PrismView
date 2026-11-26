@@ -27,6 +27,7 @@ import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3D
 
 import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, ensureSystemFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, supportsCorsUrl } from "./UnifiedCompositorParts";
 import { snapAxisInto, type SnapAxisBuffer } from "../utils/align";
+const LazyEspectroLayer = React.lazy(() => import("./EspectroLayer"));
 
 export type LayerResizePatch = {
   width?: number;
@@ -673,7 +674,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     layer.height >= 900 &&
     (layer.kind === "VIDEO" ||
       layer.kind === "IMAGE" ||
-      layer.kind === "SCENE_3D");
+      layer.kind === "SCENE_3D" ||
+      layer.kind === "SHADER");
 
   // 4.5: per-render memo. Glass layers sharing a topIndex reuse one result, and each candidate's
   // visible/opacity formulas are evaluated at most once per render.
@@ -700,15 +702,18 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     return alive;
   };
 
-  const resolveBackdropForTopIndex = (topIndex: number): BackdropResolution => {
-    const hit = backdropByTopIndex.get(topIndex);
+  // `mediaOnly`: só mídia/3D (o `sample_backdrop` dos efeitos Espectro); senão o vidro também
+  // enxerga o efeito Espectro logo abaixo (canvas WebGPU ao vivo, sem cópia na CPU).
+  const resolveBackdropForTopIndex = (topIndex: number, mediaOnly = false): BackdropResolution => {
+    const memoKey = mediaOnly ? -1 - topIndex : topIndex;
+    const hit = backdropByTopIndex.get(memoKey);
     if (hit) return hit;
-    const res = computeBackdropForTopIndex(topIndex);
-    backdropByTopIndex.set(topIndex, res);
+    const res = computeBackdropForTopIndex(topIndex, mediaOnly);
+    backdropByTopIndex.set(memoKey, res);
     return res;
   };
 
-  const computeBackdropForTopIndex = (topIndex: number): BackdropResolution => {
+  const computeBackdropForTopIndex = (topIndex: number, mediaOnly = false): BackdropResolution => {
     if (lite) return { backdrop: null, hasIntermediateHtml: false };
 
     let hasIntermediateHtml = false;
@@ -716,6 +721,34 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       const candidate = project.layers[i];
       if (!isBackdropCandidateAlive(i)) continue;
 
+      if (candidate.kind === "SHADER" && !mediaOnly) {
+        const el = mediaElementsRef.current.get(candidate.id) as HTMLCanvasElement | undefined;
+        const full = isLayerFullBleed(candidate, true);
+        const bw = full ? size.w : candidate.width * scale;
+        const bh = full ? size.h : candidate.height * scale;
+        const coversScene = full || (bw >= size.w * 0.6 && bh >= size.h * 0.6);
+        if (coversScene && el && el.width > 1 && el.height > 1) {
+          return {
+            backdrop: {
+              key: `fx|${candidate.id}`,
+              kind: "canvas",
+              live: true,
+              element: el,
+              intrinsicW: el.width,
+              intrinsicH: el.height,
+              drawLeft: full ? 0 : candidate.x * size.w - bw * 0.5,
+              drawTop: full ? 0 : candidate.y * size.h - bh * 0.5,
+              drawW: Math.max(1, bw),
+              drawH: Math.max(1, bh),
+              frameToken: videoFrameTokenRef.current,
+              // Efeito com transparência: o que está embaixo dele aparece por baixo no vidro.
+              underlay: computeBackdropForTopIndex(i).backdrop ?? undefined,
+            },
+            hasIntermediateHtml,
+          };
+        }
+        continue;
+      }
       if (candidate.kind === "SCENE_3D") {
         const el = mediaElementsRef.current.get(candidate.id) as HTMLCanvasElement | undefined;
         const full = isLayerFullBleed(candidate, true);
@@ -928,8 +961,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         ? layer.image.borderRadius * containerScale
         : g.borderRadius * containerScale;
 
-    const resolvedBackdrop = g.enabled
-      ? resolveBackdropForTopIndex(topIndex)
+    const resolvedBackdrop = g.enabled || layer.kind === "SHADER"
+      ? resolveBackdropForTopIndex(topIndex, layer.kind === "SHADER" && !g.enabled)
       : { backdrop: null, hasIntermediateHtml: false };
     const plateUseCssFallback =
       lite || isTransparentWidget || resolvedBackdrop.hasIntermediateHtml || !resolvedBackdrop.backdrop;
@@ -1132,6 +1165,45 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               opacity: g.enabled ? opacity : undefined,
             }}
           />
+        )}
+        {layer.kind === "SHADER" && layer.shader && !lite && (
+          <Suspense fallback={<div style={{ width: `${wPx}px`, height: `${hPx}px` }} />}>
+            <LazyEspectroLayer
+              layerId={layer.id}
+              inputLayerId={(() => {
+                // Entrada encadeada: efeito Espectro ou cena 3D mais próxima abaixo (mesmo nível).
+                for (let i = siblings.indexOf(layer) - 1; i >= 0; i--) {
+                  const s = siblings[i];
+                  if (!s.hidden && (s.kind === "SHADER" || s.kind === "SCENE_3D")) return s.id;
+                }
+                return null;
+              })()}
+              mediaElementsRef={mediaElementsRef}
+              mirrorForGlass={(() => {
+                // Vidro acima (mesmo nível ou dentro de grupos acima): ele lê este efeito como fundo.
+                const hasGlass = (ls: SceneLayer[]): boolean =>
+                  ls.some((l) => !l.hidden && (l.glass?.enabled || (l.children ? hasGlass(l.children) : false)));
+                return hasGlass(siblings.slice(siblings.indexOf(layer) + 1));
+              })()}
+              effect={layer.shader}
+              width={wPx}
+              height={hPx}
+              centerX={isFullBleedBackdrop ? size.w / 2 : layerCenterX}
+              centerY={isFullBleedBackdrop ? size.h / 2 : layerCenterY}
+              frameW={size.w}
+              frameH={size.h}
+              backdrop={resolvedBackdrop.backdrop}
+              fallbackColor={project.backgroundColor}
+              paused={paused}
+              isThumbnail={isThumbnail}
+              powerState={powerState}
+              reactiveSignalRef={reactiveSignalRef}
+              batteryPercent={telemetry.battery_percent}
+              mediaPlaying={Boolean(telemetry.media.playing)}
+              mediaProgress={computeLiveMediaProgress(telemetry.media, now.getTime()).ratio}
+              mediaHasSession={Boolean(telemetry.media.title || telemetry.media.artist)}
+            />
+          </Suspense>
         )}
         {layer.kind === "SCENE_3D" && !lite && (
           <div

@@ -465,6 +465,11 @@ impl GlassRenderer {
         true
     }
 
+    /// Qualidade atual (fração da resolução da saída): também dimensiona a captura do fundo.
+    pub fn resolution_scale(&self) -> f32 {
+        self.blur.res_scale
+    }
+
     /// Qualidade dos reflexos: fração da resolução da saída na base da pirâmide (1,0 = cheia).
     /// `true` se mudou (os alvos são refeitos no próximo quadro; refazer o quadro).
     pub fn set_resolution_scale(&mut self, scale: f32) -> bool {

@@ -41,6 +41,7 @@ use prism_core::schema::{
     TouchActionType, VideoPlayback, VisibilityCondition,
 };
 
+use super::espectro::{EspectroPlacement, EspectroRenderer, MAX_TEXTURES};
 use super::bindings::{LayerBindingSolver, LayerFx};
 use super::compositor::{
     BlendKind, BoundSubtree, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind,
@@ -218,6 +219,8 @@ pub struct SceneRenderer {
     layer_bindings: LayerBindingSolver,
     /// Textura final da cena 3D (camada `Scene3d`), se o chamador já renderizou uma.
     scene3d_out: Option<Scene3dOutput>,
+    /// Efeitos WGSL do Modo Espectro (camadas `Shader`), um alvo por saída e camada.
+    espectro: EspectroRenderer,
 }
 
 impl SceneRenderer {
@@ -244,6 +247,7 @@ impl SceneRenderer {
             asset_root: None,
             layer_bindings: LayerBindingSolver::new(),
             scene3d_out: None,
+            espectro: EspectroRenderer::new(),
         }
     }
 
@@ -296,8 +300,13 @@ impl SceneRenderer {
     /// Avança os bindings 2D/vidro com o snapshot do quadro. `true` se a lista precisa ser refeita
     /// (algum delta mudou). Cena sem bindings = custo zero.
     pub fn apply_signals(&mut self, snap: &SignalSnapshot, dt: f32) -> bool {
+        // Efeitos Espectro animam por tempo/áudio: todo quadro é redesenho (sem rebuild da lista).
+        let espectro = self.espectro.is_active();
+        if espectro {
+            self.espectro.observe(snap);
+        }
         if self.scene.is_none() || !self.layer_bindings.solve(snap, dt) {
-            return false;
+            return espectro;
         }
         // Não é mudança estrutural: o `render` reaplica o delta nas instâncias (caminho rápido)
         // e só refaz a lista se a subárvore não permitir.
@@ -386,12 +395,27 @@ impl SceneRenderer {
         if self.deps.intersects(DirtyFlags::SYSTEM_METRICS) {
             demand |= SignalKind::TELEMETRY | SignalKind::POWER;
         }
+        // `PrismGlobals`: áudio, cursor e bateria.
+        if self.espectro.is_active() {
+            demand |= SignalKind::AUDIO | SignalKind::MOUSE | SignalKind::POWER;
+        }
         demand
     }
 
     /// Molas 2D ainda em movimento (o loop deve continuar desenhando).
     pub fn bindings_animating(&self) -> bool {
-        self.layer_bindings.is_animating()
+        self.layer_bindings.is_animating() || self.espectro.is_active()
+    }
+
+    /// Canto do monitor da saída `canvas_key` no desktop virtual: cursor/clique dos efeitos
+    /// Espectro em coordenadas daquele monitor.
+    pub fn set_output_origin(&mut self, canvas_key: &str, origin: (i32, i32)) {
+        self.espectro.set_output_origin(canvas_key, origin);
+    }
+
+    /// Erros de compilação de efeitos Espectro desde a última chamada: `(camada, mensagem)`.
+    pub fn take_espectro_issues(&mut self) -> Vec<(String, String)> {
+        self.espectro.take_issues()
     }
 
     fn has_touch_actions(&self) -> bool {
@@ -551,6 +575,9 @@ impl SceneRenderer {
     /// Hibernação de VRAM (Fase 5): solta pirâmide de blur e mapas de glifo do vidro.
     pub fn release_glass_gpu(&mut self) {
         self.glass.release();
+        // Alvos dos efeitos Espectro também: a retomada refaz a lista e os recria.
+        self.espectro.release_gpu(&mut self.compositor);
+        self.version += 1;
     }
 
     /// PowerGovernor: liga/desliga pós-processamento (blur do vidro). `true` se o quadro precisa
@@ -665,6 +692,8 @@ impl SceneRenderer {
                 scratch: &mut self.key_scratch,
                 asset_root: self.asset_root.as_deref(),
                 fx: &empty_fx,
+                espectro: None,
+                chain: None,
                 ui: scale,
                 vw: w as f32,
                 vh: h as f32,
@@ -808,6 +837,7 @@ impl SceneRenderer {
         }
         self.text.clear();
         self.glass.release();
+        self.espectro.release_gpu(&mut self.compositor);
     }
 
     pub fn set_scene(&mut self, scene: PrismScene, ctx: &EvalContext) {
@@ -970,12 +1000,25 @@ impl SceneRenderer {
         }
 
         let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        // Efeito Espectro animando: o vidro recaptura o quadro composto abaixo dele (que já inclui
+        // os efeitos), como faz com vídeo. Sem vidro, custo zero.
+        if has_glass && self.espectro.is_active() {
+            self.live_token = self.live_token.wrapping_add(1);
+        }
         let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
         let mut capture_backdrop = false;
         if has_glass {
-            let mut recreated = canvas.ensure_backdrop(gpu.device(), (w, h), self.compositor.format());
+            // Qualidade do vidro: o quadro que o vidro refrata/desfoca é capturado nessa fração da
+            // resolução (LOW 35% = ~8× menos pixels que MAX). A captura, o downsample e a refração
+            // nítida ficam proporcionalmente mais baratos e mais suaves.
+            let q = self.glass.resolution_scale();
+            let bd_size = (
+                ((w as f32 * q).round() as u32).max(1),
+                ((h as f32 * q).round() as u32).max(1),
+            );
+            let mut recreated = canvas.ensure_backdrop(gpu.device(), bd_size, self.compositor.format());
             if multi_stage {
-                recreated |= canvas.ensure_backdrop_snap(gpu.device(), (w, h), self.compositor.format());
+                recreated |= canvas.ensure_backdrop_snap(gpu.device(), bd_size, self.compositor.format());
             } else {
                 canvas.backdrop_snap = None;
             }
@@ -992,8 +1035,11 @@ impl SceneRenderer {
         let compositor = &self.compositor;
         let text = &self.text;
         let glass = &mut self.glass;
+        let espectro = &mut self.espectro;
 
         surface.render_with(gpu, |encoder, view| {
+            // Efeitos Espectro primeiro: o passe 2D amostra os alvos deles.
+            espectro.encode(canvas_key, gpu.device(), gpu.queue(), encoder, compositor);
             Self::record_composited_frame(
                 compositor,
                 text,
@@ -1174,6 +1220,7 @@ impl SceneRenderer {
             layer.begin(size.0, size.1);
         }
         self.glass.begin_build();
+        self.espectro.begin_build();
         let serial = self.text.begin_pass();
 
         if let Some(scene) = self.scene.as_ref() {
@@ -1196,6 +1243,8 @@ impl SceneRenderer {
                 scratch: &mut self.key_scratch,
                 asset_root: self.asset_root.as_deref(),
                 fx: &self.layer_bindings,
+                espectro: Some(&mut self.espectro),
+                chain: None,
                 ui,
                 vw: size.0 as f32,
                 vh: size.1 as f32,
@@ -1203,6 +1252,7 @@ impl SceneRenderer {
             };
             frame.build();
         }
+        self.espectro.end_build(canvas_key, &mut self.compositor);
 
         // Libera slots/bindings de texto desta saída que a cena já não usa (sem alocar).
         self.key_scratch.clear();

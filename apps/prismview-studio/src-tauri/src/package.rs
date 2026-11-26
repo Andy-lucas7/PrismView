@@ -59,6 +59,7 @@ pub(crate) fn collect_layer_import_uuids(
             imports_prefix_lower,
             out,
         );
+        collect_dynamic_tex_import_uuids(layer.pointer("/shader/textures"), imports_prefix_lower, out);
         if let Some(objs) = layer.pointer("/scene3d/objects").and_then(|v| v.as_array()) {
             for obj in objs {
                 if let Some(src) = obj.get("modelSrc").and_then(|v| v.as_str()) {
@@ -251,6 +252,8 @@ pub(crate) fn bundle_layer_files(
             opts,
             bundled,
         )?;
+        // Modo Espectro: imagens das declarações `//@texture` vão junto no `.prism`.
+        bundle_dynamic_textures_array(layer.pointer_mut("/shader/textures"), zip, opts, bundled)?;
 
         if let Some(objs) = layer
             .pointer_mut("/scene3d/objects")
@@ -365,6 +368,7 @@ pub(crate) fn remap_imported_layers(layers: &mut [Value], extract_root: &Path) {
             extract_root,
             &canonical_root,
         );
+        remap_dynamic_textures_array(layer.pointer_mut("/shader/textures"), extract_root, &canonical_root);
         if let Some(objs) = layer
             .pointer_mut("/scene3d/objects")
             .and_then(|v| v.as_array_mut())

@@ -80,6 +80,8 @@ pub(crate) fn allow_layers_media(layers: &[Value]) {
             }
         }
         allow_dynamic_textures_media(layer.pointer("/scene3d/dynamicTextures"));
+        // Modo Espectro: `shader.textures[].customSrc` (mesmo formato das texturas dinâmicas).
+        allow_dynamic_textures_media(layer.pointer("/shader/textures"));
         for obj in layer
             .pointer("/scene3d/objects")
             .and_then(|v| v.as_array())
