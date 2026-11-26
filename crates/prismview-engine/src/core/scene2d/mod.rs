@@ -1008,9 +1008,17 @@ impl SceneRenderer {
         let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
         let mut capture_backdrop = false;
         if has_glass {
-            let mut recreated = canvas.ensure_backdrop(gpu.device(), (w, h), self.compositor.format());
+            // Qualidade do vidro: o quadro que o vidro refrata/desfoca é capturado nessa fração da
+            // resolução (LOW 35% = ~8× menos pixels que MAX). A captura, o downsample e a refração
+            // nítida ficam proporcionalmente mais baratos e mais suaves.
+            let q = self.glass.resolution_scale();
+            let bd_size = (
+                ((w as f32 * q).round() as u32).max(1),
+                ((h as f32 * q).round() as u32).max(1),
+            );
+            let mut recreated = canvas.ensure_backdrop(gpu.device(), bd_size, self.compositor.format());
             if multi_stage {
-                recreated |= canvas.ensure_backdrop_snap(gpu.device(), (w, h), self.compositor.format());
+                recreated |= canvas.ensure_backdrop_snap(gpu.device(), bd_size, self.compositor.format());
             } else {
                 canvas.backdrop_snap = None;
             }
