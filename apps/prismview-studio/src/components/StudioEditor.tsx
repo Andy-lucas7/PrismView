@@ -70,6 +70,7 @@ import {
   ImportConflictDto,
   isImportConflict,
   type EspectroEffect,
+  createEspectroEffect,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
@@ -152,6 +153,7 @@ const ADD_LAYER_BUTTONS: { kind: LayerKind; label: string; Icon: React.Component
   { kind: "GLASS", label: "vidro", Icon: Sparkles },
   { kind: "PROGRESS", label: "barra", Icon: Layers },
   { kind: "SCENE_3D", label: "modelo 3D", Icon: Box },
+  { kind: "SHADER", label: "efeito (Modo Espectro)", Icon: Rainbow },
   { kind: "GROUP", label: "grupo", Icon: FolderPlus },
 ];
 
@@ -965,14 +967,24 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     const bgIndex = layers.findIndex(
       (l) => !l.hidden && (l.kind === "VIDEO" || l.kind === "SCENE_3D" || (l.kind === "IMAGE" && l.width >= 1600))
     );
-    // Sem mídia de fundo: vai para o fundo da pilha (o efeito costuma ser opaco).
-    const at = bgIndex >= 0 ? bgIndex + 1 : 0;
+    // Já há efeitos: o novo entra logo acima do último (empilha e lê o de baixo com sample_input).
+    // Senão, acima da mídia de fundo; sem mídia, no fundo da pilha (o efeito costuma ser opaco).
+    let lastFx = -1;
+    layers.forEach((l, i) => {
+      if (l.kind === "SHADER") lastFx = i;
+    });
+    const at = lastFx >= 0 ? lastFx + 1 : bgIndex >= 0 ? bgIndex + 1 : 0;
     applyDiscreteChange({ ...projectRef.current, layers: [...layers.slice(0, at), created, ...layers.slice(at)] });
     setSelectedIds([created.id]);
     setInspectorMode("LAYER");
   };
 
   const addNewLayer = (kind: LayerKind) => {
+    // Efeito: entra logo acima da mídia de fundo (texto continua por cima); empilha vários.
+    if (kind === "SHADER") {
+      addEspectroLayer(createEspectroEffect("blank"));
+      return;
+    }
     const created = createLayer(kind);
     const nextLayers =
       kind === "VIDEO" || kind === "SCENE_3D"

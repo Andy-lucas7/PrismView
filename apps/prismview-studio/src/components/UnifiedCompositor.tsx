@@ -702,15 +702,18 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     return alive;
   };
 
-  const resolveBackdropForTopIndex = (topIndex: number): BackdropResolution => {
-    const hit = backdropByTopIndex.get(topIndex);
+  // `mediaOnly`: só mídia/3D (o `sample_backdrop` dos efeitos Espectro); senão o vidro também
+  // enxerga o efeito Espectro logo abaixo (canvas WebGPU ao vivo, sem cópia na CPU).
+  const resolveBackdropForTopIndex = (topIndex: number, mediaOnly = false): BackdropResolution => {
+    const memoKey = mediaOnly ? -1 - topIndex : topIndex;
+    const hit = backdropByTopIndex.get(memoKey);
     if (hit) return hit;
-    const res = computeBackdropForTopIndex(topIndex);
-    backdropByTopIndex.set(topIndex, res);
+    const res = computeBackdropForTopIndex(topIndex, mediaOnly);
+    backdropByTopIndex.set(memoKey, res);
     return res;
   };
 
-  const computeBackdropForTopIndex = (topIndex: number): BackdropResolution => {
+  const computeBackdropForTopIndex = (topIndex: number, mediaOnly = false): BackdropResolution => {
     if (lite) return { backdrop: null, hasIntermediateHtml: false };
 
     let hasIntermediateHtml = false;
@@ -718,6 +721,34 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
       const candidate = project.layers[i];
       if (!isBackdropCandidateAlive(i)) continue;
 
+      if (candidate.kind === "SHADER" && !mediaOnly) {
+        const el = mediaElementsRef.current.get(candidate.id) as HTMLCanvasElement | undefined;
+        const full = isLayerFullBleed(candidate, true);
+        const bw = full ? size.w : candidate.width * scale;
+        const bh = full ? size.h : candidate.height * scale;
+        const coversScene = full || (bw >= size.w * 0.6 && bh >= size.h * 0.6);
+        if (coversScene && el && el.width > 1 && el.height > 1) {
+          return {
+            backdrop: {
+              key: `fx|${candidate.id}`,
+              kind: "canvas",
+              live: true,
+              element: el,
+              intrinsicW: el.width,
+              intrinsicH: el.height,
+              drawLeft: full ? 0 : candidate.x * size.w - bw * 0.5,
+              drawTop: full ? 0 : candidate.y * size.h - bh * 0.5,
+              drawW: Math.max(1, bw),
+              drawH: Math.max(1, bh),
+              frameToken: videoFrameTokenRef.current,
+              // Efeito com transparência: o que está embaixo dele aparece por baixo no vidro.
+              underlay: computeBackdropForTopIndex(i).backdrop ?? undefined,
+            },
+            hasIntermediateHtml,
+          };
+        }
+        continue;
+      }
       if (candidate.kind === "SCENE_3D") {
         const el = mediaElementsRef.current.get(candidate.id) as HTMLCanvasElement | undefined;
         const full = isLayerFullBleed(candidate, true);
@@ -931,7 +962,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         : g.borderRadius * containerScale;
 
     const resolvedBackdrop = g.enabled || layer.kind === "SHADER"
-      ? resolveBackdropForTopIndex(topIndex)
+      ? resolveBackdropForTopIndex(topIndex, layer.kind === "SHADER" && !g.enabled)
       : { backdrop: null, hasIntermediateHtml: false };
     const plateUseCssFallback =
       lite || isTransparentWidget || resolvedBackdrop.hasIntermediateHtml || !resolvedBackdrop.backdrop;

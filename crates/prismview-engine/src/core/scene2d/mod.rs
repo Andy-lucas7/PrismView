@@ -992,6 +992,11 @@ impl SceneRenderer {
         }
 
         let has_glass = canvas.glass.as_ref().is_some_and(|l| !l.is_empty());
+        // Efeito Espectro animando: o vidro recaptura o quadro composto abaixo dele (que já inclui
+        // os efeitos), como faz com vídeo. Sem vidro, custo zero.
+        if has_glass && self.espectro.is_active() {
+            self.live_token = self.live_token.wrapping_add(1);
+        }
         let multi_stage = has_glass && canvas.glass_stages.len() >= 2;
         let mut capture_backdrop = false;
         if has_glass {
