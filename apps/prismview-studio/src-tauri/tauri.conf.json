@@ -1,6 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "PrismView",
+  "productName": "PrismView Studio",
+  "mainBinaryName": "prismview-studio",
   "version": "0.1.0",
   "identifier": "app.prismview.studio",
   "build": {
@@ -38,6 +39,8 @@
   "bundle": {
     "active": false,
     "targets": "all",
+    "publisher": "PrismView",
+    "copyright": "© 2026 PrismView",
     "icon": ["icons/icon.ico"]
   }
 }

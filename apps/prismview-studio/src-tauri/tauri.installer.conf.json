@@ -3,7 +3,6 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "publisher": "PrismView",
     "shortDescription": "Wallpapers e widgets animados para o Windows",
     "icon": ["icons/icon.ico"],
     "externalBin": ["binaries/prismview-engine"],
