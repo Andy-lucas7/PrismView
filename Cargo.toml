@@ -34,8 +34,14 @@ windows = { version = "0.58", features = [
 
 # Otimiza dependências pesadas (wgpu, wgpu-hal, glam, cosmic-text, glyphon) mesmo em `dev`,
 # mantendo compilação incremental rápida dos nossos crates e derrubando CPU em dev em ~5-10×.
+# Build de teste: só linha/arquivo nos erros (sem info completa de depuração), e nada nas
+# dependências. Corta GBs de `target/debug` e `target/engine/debug`; backtrace continua com linha.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 [profile.release]
 lto = "thin"
