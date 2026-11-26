@@ -1003,6 +1003,31 @@ fn effect(uv: vec2f) -> vec4f {
 }
 `,
   },
+  {
+    id: "neon-edges",
+    name: "Contorno neon (sobre 3D)",
+    description: "Coloque acima de um modelo 3D ou de outro efeito: realça as bordas do que está embaixo.",
+    code: `//@scale 0.75
+//@param glow: float = 1.5 range(0, 4) label("Brilho")
+//@param color: color = #6ae6ff label("Cor do neon")
+//@param keep: float = 1 range(0, 1) label("Manter a imagem")
+
+// sample_input lê a camada logo abaixo (cena 3D ou outro efeito); sem nenhuma, o fundo.
+fn luma(c: vec3f) -> f32 {
+  return dot(c, vec3f(0.299, 0.587, 0.114));
+}
+
+fn effect(uv: vec2f) -> vec4f {
+  let px = pixel();
+  let c = sample_input(uv);
+  let gx = luma(sample_input(uv + vec2f(px.x, 0.0)).rgb) - luma(sample_input(uv - vec2f(px.x, 0.0)).rgb);
+  let gy = luma(sample_input(uv + vec2f(0.0, px.y)).rgb) - luma(sample_input(uv - vec2f(0.0, px.y)).rgb);
+  let edge = clamp(length(vec2f(gx, gy)) * 4.0, 0.0, 1.0);
+  let base = c.rgb * params.keep;
+  return vec4f(base + params.color.rgb * edge * params.glow, max(c.a * params.keep, edge));
+}
+`,
+  },
 ];
 
 export function createEspectroEffect(templateId = "blank"): EspectroEffect {
