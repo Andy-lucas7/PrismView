@@ -12,6 +12,7 @@ import {
   textureSrc,
   usesPrevious,
   ESPECTRO_STATE_FORMAT,
+  ESPECTRO_PARTICLE_BYTES,
   type EspectroEffect,
   type ReactiveSignal,
 } from "../types/prism";
@@ -104,11 +105,19 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
     let bdKey = "";
     let prevTex: any = null;
     let inputTex: any = null;
+    // Partículas (//@particles): buffer na VRAM, nunca lido de volta pela CPU.
+    const particleCount = compiled.particleCompute ? compiled.parse.particles : 0;
+    let particleBuf: any = null;
+    let particleTex: any = null;
+    let particleRw: any = null;
+    let particleRo: any = null;
+    let particleBindGroup: any = null;
     let inputW = 0;
     let inputH = 0;
     const inputRect = new Float32Array(4);
     let inputRectAge = 999;
     let whiteTex: any = null;
+    let clearTex: any = null;
     const userTex: any[] = Array(ESPECTRO_MAX_TEXTURES).fill(null);
     const userSrc: string[] = Array(ESPECTRO_MAX_TEXTURES).fill("");
     let bindGroup: any = null;
@@ -199,6 +208,8 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       }
       if (!inputTex || inputW !== el.width || inputH !== el.height) {
         inputTex?.destroy();
+      particleTex?.destroy();
+      particleBuf?.destroy();
         inputTex = device.createTexture({ size: [el.width, el.height], format: "rgba8unorm", usage: TEX_USAGE });
         inputW = el.width;
         inputH = el.height;
@@ -282,6 +293,11 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
             prevTex = device.createTexture({ size: [cw, ch], format: gpuCtx.format, usage: TEX_USAGE });
             bindDirty = true;
           }
+          if (particleCount > 0) {
+            particleTex?.destroy();
+            particleTex = device.createTexture({ size: [cw, ch], format: "rgba8unorm", usage: TEX_USAGE });
+            bindDirty = true;
+          }
           if (simulate) {
             stateTex?.destroy();
             statePrev?.destroy();
@@ -298,23 +314,26 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
         if (bindDirty || !bindGroup) {
           bindDirty = false;
           const view = (t: any) => (t ?? whiteTex).createView();
-          const entries = (state: any) => [
+          const entries = (state: any, particles: any = particleTex) => [
               { binding: 0, resource: { buffer: globalsBuf } },
               { binding: 1, resource: bdTex.createView() },
               { binding: 2, resource: gpuCtx.sampler },
               { binding: 3, resource: { buffer: paramsBuf } },
-              { binding: 4, resource: view(feedback ? prevTex : null) },
+              { binding: 4, resource: ((feedback ? prevTex : null) ?? clearTex).createView() },
               { binding: 5, resource: view(userTex[0]) },
               { binding: 6, resource: view(userTex[1]) },
               { binding: 7, resource: view(userTex[2]) },
               { binding: 8, resource: view(userTex[3]) },
               { binding: 9, resource: gpuCtx.repeatSampler },
-              { binding: 10, resource: view(state) },
+              { binding: 10, resource: (state ?? clearTex).createView() },
               { binding: 11, resource: (inputTex ?? bdTex).createView() },
+              { binding: 12, resource: (particles ?? clearTex).createView() },
             ];
           // `effect` lê o estado novo; `simulate` lê o anterior.
           bindGroup = device.createBindGroup({ layout: gpuCtx.layout, entries: entries(stateTex) });
           simBindGroup = simulate ? device.createBindGroup({ layout: gpuCtx.layout, entries: entries(statePrev) }) : null;
+          // O desenho das partículas escreve em particleTex: o grupo 0 dele não pode amostrá-la.
+          particleBindGroup = particleCount > 0 ? device.createBindGroup({ layout: gpuCtx.layout, entries: entries(stateTex, null) }) : null;
         }
         const fw = Math.max(1, p.frameW);
         const fh = Math.max(1, p.frameH);
@@ -383,6 +402,22 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
           sim.end();
           enc.copyTextureToTexture({ texture: stateTex }, { texture: statePrev }, [cw, ch]);
         }
+        if (particleCount > 0 && particleBindGroup) {
+          const cp = enc.beginComputePass();
+          cp.setPipeline(compiled.particleCompute);
+          cp.setBindGroup(0, particleBindGroup);
+          cp.setBindGroup(1, particleRw);
+          cp.dispatchWorkgroups(Math.ceil(particleCount / 64));
+          cp.end();
+          const pp = enc.beginRenderPass({
+            colorAttachments: [{ view: particleTex.createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
+          });
+          pp.setPipeline(compiled.particleRender);
+          pp.setBindGroup(0, particleBindGroup);
+          pp.setBindGroup(1, particleRo);
+          pp.draw(6, particleCount);
+          pp.end();
+        }
         const out = ctx.getCurrentTexture();
         const pass = enc.beginRenderPass({
           colorAttachments: [
@@ -415,9 +450,16 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       if (!ctx) return;
       ctx.configure({ device, format: g.format, alphaMode: "premultiplied", usage: 0x10 | 0x01 }); // RENDER_ATTACHMENT | COPY_SRC
       globalsBuf = device.createBuffer({ size: ESPECTRO_GLOBALS_FLOATS * 4, usage: 0x40 | 0x08 }); // UNIFORM | COPY_DST
+      if (particleCount > 0) {
+        // Zerado na criação: life = 0 faz cada partícula nascer no 1º quadro.
+        particleBuf = device.createBuffer({ size: particleCount * ESPECTRO_PARTICLE_BYTES, usage: 0x80 }); // STORAGE
+        particleRw = device.createBindGroup({ layout: g.particleRwLayout, entries: [{ binding: 0, resource: { buffer: particleBuf } }] });
+        particleRo = device.createBindGroup({ layout: g.particleRoLayout, entries: [{ binding: 1, resource: { buffer: particleBuf } }] });
+      }
       paramsBuf = device.createBuffer({ size: compiled.parse.paramsSize, usage: 0x40 | 0x08 });
       whiteTex = device.createTexture({ size: [1, 1], format: "rgba8unorm", usage: TEX_USAGE });
       device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 255, 255]), { bytesPerRow: 4 }, [1, 1]);
+      clearTex = device.createTexture({ size: [1, 1], format: "rgba8unorm", usage: TEX_USAGE }); // zerada = transparente
       raf = requestAnimationFrame(frame);
     });
 
@@ -436,6 +478,7 @@ const EspectroLayer: React.FC<EspectroLayerProps> = (props) => {
       stateTex?.destroy();
       statePrev?.destroy();
       whiteTex?.destroy();
+      clearTex?.destroy();
       for (const t of userTex) t?.destroy();
       try {
         ctx?.unconfigure();

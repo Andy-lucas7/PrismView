@@ -20,6 +20,9 @@ export interface EspectroCompiled {
   pipeline: GpuPipeline | null;
   /** Passe de estado (`fn simulate`), alvo `ESPECTRO_STATE_FORMAT`. */
   simPipeline: GpuPipeline | null;
+  /** `//@particles`: compute (atualiza o buffer) + desenho instanciado (alvo rgba8unorm). */
+  particleCompute: GpuPipeline | null;
+  particleRender: GpuPipeline | null;
   diagnostics: EspectroDiagnostic[];
   parse: EspectroParseResult;
 }
@@ -31,6 +34,11 @@ interface GpuContext {
   pipelineLayout: any;
   sampler: any;
   repeatSampler: any;
+  /** Grupo 1 das partículas: buffer read_write (compute) e read-only (desenho). */
+  particleRwLayout: any;
+  particleRoLayout: any;
+  computeLayout: any;
+  particleDrawLayout: any;
 }
 
 let ctxPromise: Promise<GpuContext | null> | null = null;
@@ -54,7 +62,7 @@ export function getEspectroGpu(): Promise<GpuContext | null> {
       ctxPromise = null;
       cache.clear();
     });
-    const STAGE = 0x1 | 0x2; // VERTEX | FRAGMENT
+    const STAGE = 0x1 | 0x2 | 0x4; // VERTEX | FRAGMENT | COMPUTE
     const layout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: STAGE, buffer: { type: "uniform" } },
@@ -69,12 +77,32 @@ export function getEspectroGpu(): Promise<GpuContext | null> {
         { binding: 9, visibility: STAGE, sampler: { type: "filtering" } },
         { binding: 10, visibility: STAGE, texture: { sampleType: "float" } },
         { binding: 11, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 12, visibility: STAGE, texture: { sampleType: "float" } },
       ],
     });
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    const particleRwLayout = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: 0x4, buffer: { type: "storage" } }],
+    });
+    const particleRoLayout = device.createBindGroupLayout({
+      entries: [{ binding: 1, visibility: 0x1 | 0x2, buffer: { type: "read-only-storage" } }],
+    });
+    const computeLayout = device.createPipelineLayout({ bindGroupLayouts: [layout, particleRwLayout] });
+    const particleDrawLayout = device.createPipelineLayout({ bindGroupLayouts: [layout, particleRoLayout] });
     const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
     const repeatSampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "repeat", addressModeV: "repeat" });
-    return { device, format: gpu.getPreferredCanvasFormat(), layout, pipelineLayout, sampler, repeatSampler } as GpuContext;
+    return {
+      device,
+      format: gpu.getPreferredCanvasFormat(),
+      layout,
+      pipelineLayout,
+      sampler,
+      repeatSampler,
+      particleRwLayout,
+      particleRoLayout,
+      computeLayout,
+      particleDrawLayout,
+    } as GpuContext;
   })().catch(() => {
     ctxPromise = null;
     return null;
@@ -105,6 +133,36 @@ async function compileUncached(ctx: GpuContext, code: string): Promise<EspectroC
   }
   let pipeline: GpuPipeline | null = null;
   let simPipeline: GpuPipeline | null = null;
+  let particleCompute: GpuPipeline | null = null;
+  let particleRender: GpuPipeline | null = null;
+  if (!diagnostics.some((d) => d.severity === "error") && build.parse.particles > 0) {
+    try {
+      particleCompute = await device.createComputePipelineAsync({
+        layout: ctx.computeLayout,
+        compute: { module, entryPoint: "prism_particles_cs" },
+      });
+      particleRender = await device.createRenderPipelineAsync({
+        layout: ctx.particleDrawLayout,
+        vertex: { module, entryPoint: "prism_particle_vs" },
+        fragment: {
+          module,
+          entryPoint: "prism_particle_fs",
+          targets: [
+            {
+              format: "rgba8unorm",
+              blend: {
+                color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
+            },
+          ],
+        },
+        primitive: { topology: "triangle-list" },
+      });
+    } catch (err: any) {
+      diagnostics.push({ line: 0, column: 1, message: String(err?.message ?? err), severity: "error" });
+    }
+  }
   if (!diagnostics.some((d) => d.severity === "error") && usesSimulation(code)) {
     try {
       simPipeline = await device.createRenderPipelineAsync({
@@ -146,11 +204,13 @@ async function compileUncached(ctx: GpuContext, code: string): Promise<EspectroC
     diagnostics.push({ line: 0, column: 1, message: scopeErr.message, severity: "error" });
     pipeline = null;
     simPipeline = null;
+    particleCompute = null;
+    particleRender = null;
   }
   if (!diagnostics.some((d) => d.message.includes("effect")) && !/\bfn\s+effect\s*\(/.test(code)) {
     diagnostics.unshift({ line: 1, column: 1, message: "Defina fn effect(uv: vec2f) -> vec4f.", severity: "error" });
   }
-  return { pipeline, simPipeline, diagnostics, parse: build.parse };
+  return { pipeline, simPipeline, particleCompute, particleRender, diagnostics, parse: build.parse };
 }
 
 /** Compila (ou devolve do cache) o efeito. Nunca lança; erros vêm em `diagnostics`. */

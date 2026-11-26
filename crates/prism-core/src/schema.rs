@@ -554,6 +554,9 @@ pub struct ShaderEffect {
     /// `//@scale`: fração da resolução da camada (0.25..=1).
     #[serde(default = "default_shader_scale")]
     pub scale: f32,
+    /// `//@particles N`: partículas simuladas em compute na GPU (0 = nenhuma).
+    #[serde(default)]
+    pub particles: u32,
 }
 
 fn default_shader_scale() -> f32 {
@@ -570,6 +573,7 @@ impl Default for ShaderEffect {
             feedback: false,
             simulate: false,
             scale: 1.0,
+            particles: 0,
         }
     }
 }

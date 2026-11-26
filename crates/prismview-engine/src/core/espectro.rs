@@ -33,6 +33,10 @@ const MAX_TARGET_DIM: u32 = 4096;
 const BIND_CACHE: usize = 6;
 /// Limite do uniform `params` (32 parâmetros de até 16 B = 512 B).
 const MAX_PARAMS_BYTES: usize = 512;
+/// Teto de partículas por efeito (`ESPECTRO_MAX_PARTICLES` no Estúdio).
+pub const MAX_PARTICLES: u32 = 200_000;
+/// Tamanho de `Particle` no buffer (bytes).
+const PARTICLE_BYTES: u64 = 48;
 /// `click_age` quando ainda não houve clique.
 const NO_CLICK_AGE: f32 = 1.0e6;
 
@@ -65,6 +69,11 @@ struct Fallback {
 struct Shared {
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
+    /// Grupo 1 das partículas: buffer read_write (compute) e read-only (desenho).
+    particle_rw: wgpu::BindGroupLayout,
+    particle_ro: wgpu::BindGroupLayout,
+    compute_layout: wgpu::PipelineLayout,
+    particle_draw_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
     repeat: wgpu::Sampler,
     /// Fundo ausente (cinza-escuro), textura do usuário ausente (branco), memória ausente (transparente).
@@ -78,8 +87,18 @@ struct Tex {
     view: wgpu::TextureView,
 }
 
+/// Partículas na VRAM: o compute atualiza o buffer, o desenho instanciado lê; nada volta à CPU.
+struct Particles {
+    _buf: wgpu::Buffer,
+    tex: Tex,
+    rw: wgpu::BindGroup,
+    ro: wgpu::BindGroup,
+    count: u32,
+}
+
 struct Target {
     out: Tex,
+    particles: Option<Particles>,
     /// Cópia do quadro anterior (`sample_previous`), só se o efeito usa.
     prev: Option<Tex>,
     /// Estado (atual, anterior) da simulação, só se o efeito define `simulate`.
@@ -90,6 +109,8 @@ struct Target {
 struct Pipelines {
     effect: wgpu::RenderPipeline,
     sim: Option<wgpu::RenderPipeline>,
+    particle_cs: Option<wgpu::ComputePipeline>,
+    particle_draw: Option<wgpu::RenderPipeline>,
 }
 
 struct Slot {
@@ -102,8 +123,9 @@ struct Slot {
     params_dirty: bool,
     target: Option<Target>,
     tex_id: Option<TextureId>,
-    /// (chave das texturas, bind group do efeito, bind group da simulação).
-    binds: Vec<(u64, wgpu::BindGroup, Option<wgpu::BindGroup>)>,
+    /// (chave das texturas, bind group do efeito, da simulação, do desenho/compute das partículas).
+    binds: Vec<(u64, wgpu::BindGroup, Option<wgpu::BindGroup>, Option<wgpu::BindGroup>)>,
+    particles: u32,
     placement: EspectroPlacement,
     /// Tamanho do quadro da saída (px).
     frame_px: (f32, f32),
@@ -340,7 +362,7 @@ impl EspectroRenderer {
         if self.shared.is_some() {
             return;
         }
-        let stage = wgpu::ShaderStages::VERTEX_FRAGMENT;
+        let stage = wgpu::ShaderStages::VERTEX_FRAGMENT | wgpu::ShaderStages::COMPUTE;
         let uniform = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: stage,
@@ -382,7 +404,36 @@ impl EspectroRenderer {
                 sampler(9),
                 texture(10),
                 texture(11),
+                texture(12),
             ],
+        });
+        let storage = |binding, visibility, read_only| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let particle_rw = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("espectro-particles-rw"),
+            entries: &[storage(0, wgpu::ShaderStages::COMPUTE, false)],
+        });
+        let particle_ro = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("espectro-particles-ro"),
+            entries: &[storage(1, wgpu::ShaderStages::VERTEX_FRAGMENT, true)],
+        });
+        let compute_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("espectro-particles-cs"),
+            bind_group_layouts: &[&layout, &particle_rw],
+            push_constant_ranges: &[],
+        });
+        let particle_draw_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("espectro-particles-draw"),
+            bind_group_layouts: &[&layout, &particle_ro],
+            push_constant_ranges: &[],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("espectro-pl"),
@@ -405,6 +456,10 @@ impl EspectroRenderer {
             clear: solid(device, queue, [0, 0, 0, 0], "espectro-clear"),
             layout,
             pipeline_layout,
+            particle_rw,
+            particle_ro,
+            compute_layout,
+            particle_draw_layout,
         });
     }
 
@@ -444,9 +499,52 @@ impl EspectroRenderer {
         };
         let effect = make("prism_fs", TARGET_FORMAT);
         let sim = has_entry(wgsl, "prism_sim").then(|| make("prism_sim", STATE_FORMAT));
+        let particles = has_entry(wgsl, "prism_particles_cs");
+        let particle_cs = particles.then(|| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("espectro-particles-cs"),
+                layout: Some(&shared.compute_layout),
+                module: &module,
+                entry_point: Some("prism_particles_cs"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let premul = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let particle_draw = particles.then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("espectro-particles-draw"),
+                layout: Some(&shared.particle_draw_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("prism_particle_vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("prism_particle_fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: TARGET_FORMAT,
+                        blend: Some(wgpu::BlendState { color: premul, alpha: premul }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        });
         match pollster::block_on(device.pop_error_scope()) {
             Some(err) => Err(err.to_string()),
-            None => Ok(Pipelines { effect, sim }),
+            None => Ok(Pipelines { effect, sim, particle_cs, particle_draw }),
         }
     }
 
@@ -505,6 +603,7 @@ impl EspectroRenderer {
                     target: None,
                     tex_id: None,
                     binds: Vec::new(),
+                    particles: 0,
                     placement,
                     frame_px,
                     frame: 0,
@@ -536,6 +635,11 @@ impl EspectroRenderer {
             slot.feedback = effect.feedback;
             reshape = true;
         }
+        let particles = effect.particles.min(MAX_PARTICLES);
+        if slot.particles != particles {
+            slot.particles = particles;
+            reshape = true;
+        }
         let n = effect.params.len().min(MAX_PARAMS_BYTES / 4);
         if slot.params.as_slice() != &effect.params[..n] {
             slot.params.clear();
@@ -543,11 +647,40 @@ impl EspectroRenderer {
             slot.params_dirty = true;
         }
         let simulate = slot.pipelines.as_ref()?.sim.is_some();
+        let has_particles = slot.pipelines.as_ref()?.particle_cs.is_some() && slot.particles > 0;
         if reshape || slot.target.as_ref().map(|t| t.size) != Some(px) {
             let out = make_tex(device, px, TARGET_FORMAT, "espectro-target");
             slot.tex_id = Some(compositor.bind_owned_view(device, slot.tex_id, out.view.clone()));
+            let count = slot.particles;
+            let particles = has_particles.then(|| {
+                // Zerado na criação: life = 0 faz cada partícula nascer no 1º quadro.
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("espectro-particles"),
+                    size: u64::from(count) * PARTICLE_BYTES,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                let rw = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("espectro-particles-rw"),
+                    layout: &shared.particle_rw,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+                });
+                let ro = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("espectro-particles-ro"),
+                    layout: &shared.particle_ro,
+                    entries: &[wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() }],
+                });
+                Particles {
+                    _buf: buf,
+                    tex: make_tex(device, px, TARGET_FORMAT, "espectro-particles-tex"),
+                    rw,
+                    ro,
+                    count,
+                }
+            });
             slot.target = Some(Target {
                 out,
+                particles,
                 prev: slot.feedback.then(|| make_tex(device, px, TARGET_FORMAT, "espectro-prev")),
                 state: simulate.then(|| {
                     (
@@ -644,7 +777,7 @@ impl EspectroRenderer {
                 key = (key ^ a).wrapping_mul(0x0100_0000_01b3);
                 key = (key ^ b).wrapping_mul(0x0100_0000_01b3);
             }
-            let bind = match slot.binds.iter().position(|(k, _, _)| *k == key) {
+            let bind = match slot.binds.iter().position(|(k, ..)| *k == key) {
                 Some(i) => i,
                 None => {
                     if slot.binds.len() >= BIND_CACHE {
@@ -656,7 +789,8 @@ impl EspectroRenderer {
                     let input_view = input.map_or(bd_view, |(v, _)| v);
                     let globals_buf = &slot.globals_buf;
                     let params_buf = &slot.params_buf;
-                    let make = |state: &wgpu::TextureView| {
+                    let parts = target.particles.as_ref().map_or(&shared.clear.view, |p| &p.tex.view);
+                    let make = |state: &wgpu::TextureView, parts: &wgpu::TextureView| {
                         device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("espectro-bg"),
                             layout: &shared.layout,
@@ -673,15 +807,17 @@ impl EspectroRenderer {
                                 wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::Sampler(&shared.repeat) },
                                 wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(state) },
                                 wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(input_view) },
+                                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(parts) },
                             ],
                         })
                     };
                     // `effect` lê o estado novo; `simulate` lê o anterior.
-                    let (effect_bg, sim_bg) = match target.state.as_ref() {
-                        Some((cur, old)) => (make(&cur.view), Some(make(&old.view))),
-                        None => (make(&shared.clear.view), None),
-                    };
-                    slot.binds.push((key, effect_bg, sim_bg));
+                    let state_now = target.state.as_ref().map_or(&shared.clear.view, |(cur, _)| &cur.view);
+                    let effect_bg = make(state_now, parts);
+                    let sim_bg = target.state.as_ref().map(|(_, old)| make(&old.view, parts));
+                    // O desenho das partículas escreve na textura delas: este grupo não a amostra.
+                    let part_bg = target.particles.as_ref().map(|_| make(state_now, &shared.clear.view));
+                    slot.binds.push((key, effect_bg, sim_bg, part_bg));
                     slot.binds.len() - 1
                 }
             };
@@ -736,10 +872,42 @@ impl EspectroRenderer {
                 }
             }
 
-            let (_, effect_bg, sim_bg) = &slot.binds[bind];
+            let (_, effect_bg, sim_bg, part_bg) = &slot.binds[bind];
             if let (Some(sim), Some(sim_bg), Some((cur, old))) = (pipes.sim.as_ref(), sim_bg.as_ref(), target.state.as_ref()) {
                 draw_pass(encoder, &cur.view, sim, sim_bg, "espectro-sim");
                 copy_tex(encoder, cur, old, target.size);
+            }
+            if let (Some(cs), Some(draw), Some(part_bg), Some(parts)) =
+                (pipes.particle_cs.as_ref(), pipes.particle_draw.as_ref(), part_bg.as_ref(), target.particles.as_ref())
+            {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("espectro-particles-cs"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(cs);
+                    pass.set_bind_group(0, part_bg, &[]);
+                    pass.set_bind_group(1, &parts.rw, &[]);
+                    pass.dispatch_workgroups(parts.count.div_ceil(64), 1, 1);
+                }
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("espectro-particles-draw"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &parts.tex.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(draw);
+                pass.set_bind_group(0, part_bg, &[]);
+                pass.set_bind_group(1, &parts.ro, &[]);
+                pass.draw(0..6, 0..parts.count);
             }
             draw_pass(encoder, &target.out.view, &pipes.effect, effect_bg, "espectro");
             if let Some(prev) = target.prev.as_ref() {
@@ -784,6 +952,8 @@ mod tests {
         assert!(super::has_entry(&water.wgsl, "prism_sim"));
         let rain = cases.iter().find(|c| c.id == "rain-glass").expect("modelo chuva");
         assert!(!super::has_entry(&rain.wgsl, "prism_sim"));
+        let snow = cases.iter().find(|c| c.id == "snow-physics").expect("modelo neve");
+        assert!(super::has_entry(&snow.wgsl, "prism_particles_cs"));
     }
 
     #[test]

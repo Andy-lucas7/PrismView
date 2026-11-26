@@ -49,6 +49,8 @@ export interface EspectroEffect {
   nativeSimulate?: boolean;
   /** `//@scale`: fração da resolução da camada em que o efeito roda (0.25..1). */
   nativeScale?: number;
+  /** `//@particles N`: partículas simuladas em compute na GPU (0 = nenhuma). */
+  nativeParticles?: number;
 }
 
 export interface EspectroTextureRef {
@@ -66,6 +68,10 @@ export interface EspectroTextureDef {
 export const PRISMFX_FORMAT = "prismfx";
 export const PRISMFX_VERSION = 2;
 export const ESPECTRO_MAX_TEXTURES = 4;
+/** Teto de partículas por efeito (48 B cada → 9,6 MB de VRAM no máximo). */
+export const ESPECTRO_MAX_PARTICLES = 200000;
+/** Tamanho de `Particle` no buffer (bytes). */
+export const ESPECTRO_PARTICLE_BYTES = 48;
 export const ESPECTRO_MAX_PARAMS = 32;
 export const ESPECTRO_MAX_CODE_CHARS = 64 * 1024;
 
@@ -80,7 +86,9 @@ export const ESPECTRO_GLOBALS_FLOATS = 40;
  * · 112 input (mouse_down, key_pulse, typing_energy, idle_s) · 128 media (playing, progress, has_session, 0)
  * · 144 input_rect (área da camada de entrada no quadro, 0..1) → 160.
  * Bindings: 0 prism · 1 backdrop · 2 sampler (clamp) · 3 params · 4 quadro anterior · 5..8 texturas
- * · 9 sampler (repeat) · 10 estado da simulação · 11 entrada (camada de efeito/3D logo abaixo, ou o fundo).
+ * · 9 sampler (repeat) · 10 estado da simulação · 11 entrada (camada de efeito/3D logo abaixo, ou o fundo)
+ * · 12 partículas já desenhadas. Grupo 1 (só com //@particles): 0 = buffer de partículas
+ * (read_write, compute) · 1 = o mesmo buffer (read, desenho).
  */
 export const ESPECTRO_PRELUDE = `// ── Prelúdio Espectro (PrismView) ──
 struct PrismGlobals {
@@ -114,6 +122,7 @@ struct PrismGlobals {
 @group(0) @binding(9) var prism_repeat: sampler;
 @group(0) @binding(10) var prism_state: texture_2d<f32>;
 @group(0) @binding(11) var prism_input: texture_2d<f32>;
+@group(0) @binding(12) var prism_particles_tex: texture_2d<f32>;
 
 fn frame_uv(uv: vec2f) -> vec2f {
   return prism.layer_rect.xy + uv * prism.layer_rect.zw;
@@ -137,6 +146,10 @@ fn sample_input(uv: vec2f) -> vec4f {
   let f = frame_uv(uv);
   let b = (f - prism.input_rect.xy) / max(prism.input_rect.zw, vec2f(1e-5));
   return textureSampleLevel(prism_input, prism_sampler, clamp(b, vec2f(0.0), vec2f(1.0)), 0.0);
+}
+// Partículas desta camada já desenhadas neste quadro (transparente sem //@particles).
+fn sample_particles(uv: vec2f) -> vec4f {
+  return textureSampleLevel(prism_particles_tex, prism_sampler, uv, 0.0);
 }
 // Estado da simulação (anterior dentro de \`simulate\`, atual dentro de \`effect\`).
 fn sample_state(uv: vec2f) -> vec4f {
@@ -179,6 +192,100 @@ struct PrismVsOut {
 }
 `;
 
+/** Partículas + física simples (só entra no WGSL com //@particles). Unidades: uv da camada por segundo. */
+const ESPECTRO_PARTICLE_PRELUDE = `
+// ── Partículas (//@particles) ──
+struct Particle {
+  pos: vec2f,
+  vel: vec2f,
+  life: f32,
+  age: f32,
+  size: f32,
+  seed: f32,
+  color: vec4f,
+};
+@group(1) @binding(0) var<storage, read_write> prism_particles_rw: array<Particle>;
+@group(1) @binding(1) var<storage, read> prism_particles_ro: array<Particle>;
+
+fn prism_aspect() -> f32 {
+  return prism.resolution.x / max(prism.resolution.y, 1.0);
+}
+// Aleatório por partícula e por quadro (0..1).
+fn prand(i: u32, salt: f32) -> f32 {
+  return hash21(vec2f(f32(i % 65536u) * 0.0137 + salt, prism.frame * 0.731 + f32(i / 65536u) * 3.1));
+}
+// Gravidade + arrasto + integração (dt do quadro). Também avança age e consome life.
+fn physics_step(p: Particle, gravity: vec2f, drag: f32) -> Particle {
+  var o = p;
+  let dt = prism.delta;
+  o.vel = (o.vel + gravity * dt) * max(0.0, 1.0 - drag * dt);
+  o.pos += o.vel * dt;
+  o.age += dt;
+  o.life -= dt;
+  return o;
+}
+// Quica nas bordas da camada (restitution 0 = gruda, 1 = quique perfeito).
+fn bounce_edges(p: Particle, restitution: f32) -> Particle {
+  var o = p;
+  if (o.pos.x < 0.0) { o.pos.x = 0.0; o.vel.x = abs(o.vel.x) * restitution; }
+  if (o.pos.x > 1.0) { o.pos.x = 1.0; o.vel.x = -abs(o.vel.x) * restitution; }
+  if (o.pos.y < 0.0) { o.pos.y = 0.0; o.vel.y = abs(o.vel.y) * restitution; }
+  if (o.pos.y > 1.0) { o.pos.y = 1.0; o.vel.y = -abs(o.vel.y) * restitution; }
+  return o;
+}
+// Força do mouse: positiva empurra, negativa atrai (raio em altura da camada).
+fn mouse_force(p: Particle, radius: f32, strength: f32) -> vec2f {
+  let a = prism_aspect();
+  let d = (p.pos - prism.cursor) * vec2f(a, 1.0);
+  let r = length(d);
+  if (r >= radius || r < 1e-5) {
+    return vec2f(0.0);
+  }
+  return d / r / vec2f(a, 1.0) * strength * (1.0 - r / radius);
+}
+// Vento com turbulência suave (ruído no espaço e no tempo).
+fn wind_force(p: Particle, dir: vec2f, turbulence: f32) -> vec2f {
+  let n = vec2f(noise2(p.pos * 3.0 + prism.time * 0.3), noise2(p.pos * 3.0 - prism.time * 0.27)) - 0.5;
+  return dir + n * turbulence;
+}
+`;
+
+const ESPECTRO_PARTICLE_ENTRY = `@compute @workgroup_size(64) fn prism_particles_cs(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= arrayLength(&prism_particles_rw)) {
+    return;
+  }
+  var p = prism_particles_rw[i];
+  if (prism.frame < 1.0 || p.life <= 0.0) {
+    p = particle_spawn(i);
+  } else {
+    p = particle_update(p, i);
+  }
+  prism_particles_rw[i] = p;
+}
+struct PrismParticleOut {
+  @builtin(position) pos: vec4f,
+  @location(0) q: vec2f,
+  @location(1) @interpolate(flat) id: u32,
+};
+@vertex fn prism_particle_vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> PrismParticleOut {
+  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                                vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  let p = prism_particles_ro[i];
+  let q = corners[v];
+  let c = p.pos + q * vec2f(p.size / prism_aspect(), p.size);
+  var o: PrismParticleOut;
+  o.pos = select(vec4f(2.0, 2.0, 2.0, 1.0), vec4f(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0), p.life > 0.0);
+  o.q = q;
+  o.id = i;
+  return o;
+}
+@fragment fn prism_particle_fs(v: PrismParticleOut) -> @location(0) vec4f {
+  let c = clamp(particle_color(prism_particles_ro[v.id], v.q), vec4f(0.0), vec4f(1.0));
+  return vec4f(c.rgb * c.a, c.a);
+}
+`;
+
 const ESPECTRO_SIM_ENTRY = `@fragment fn prism_sim(v: PrismVsOut) -> @location(0) vec4f {
   return simulate(v.uv);
 }
@@ -196,6 +303,8 @@ export interface EspectroParseResult {
   paramsSize: number;
   /** `//@scale 0.5`: o efeito roda nessa fração da resolução (economia; o compositor amplia). */
   scale: number;
+  /** `//@particles N` (0 = sem partículas). */
+  particles: number;
 }
 
 function parseOptNumber(rest: string, key: string): number | undefined {
@@ -248,9 +357,17 @@ export function parseEspectroParams(code: string): EspectroParseResult {
   const seen = new Set<string>();
   let offset = 0;
   let scale = 1;
+  let particles = 0;
   const lines = code.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    const pc = line.match(/^\s*\/\/@particles\s+([0-9]+)\s*$/);
+    if (pc) {
+      const v = Number(pc[1]);
+      if (v >= 1 && v <= ESPECTRO_MAX_PARTICLES) particles = v;
+      else errors.push({ line: i + 1, message: `Use //@particles entre 1 e ${ESPECTRO_MAX_PARTICLES}.` });
+      continue;
+    }
     const sc = line.match(/^\s*\/\/@scale\s+([0-9.]+)\s*$/);
     if (sc) {
       const v = Number(sc[1]);
@@ -308,7 +425,14 @@ export function parseEspectroParams(code: string): EspectroParseResult {
     offset += size;
   }
   const paramsSize = Math.max(16, Math.ceil(offset / 16) * 16);
-  return { params, textures, errors, paramsSize, scale };
+  if (particles > 0) {
+    for (const fn of ["particle_spawn", "particle_update", "particle_color"]) {
+      if (!new RegExp(`\\bfn\\s+${fn}\\s*\\(`).test(code)) {
+        errors.push({ line: 1, message: `Com //@particles, defina fn ${fn}(...) (veja "Referência").` });
+      }
+    }
+  }
+  return { params, textures, errors, paramsSize, scale, particles };
 }
 
 const TEXTURE_RE = /^\s*\/\/@texture\s+([A-Za-z][A-Za-z0-9_]*)\b(.*)$/;
@@ -353,11 +477,12 @@ export function buildEspectroShader(code: string, parse = parseEspectroParams(co
     )
     .join("");
   const head =
-    `${ESPECTRO_PRELUDE}\nstruct PrismParams {\n${fields}\n};\n` +
+    `${ESPECTRO_PRELUDE}${parse.particles > 0 ? ESPECTRO_PARTICLE_PRELUDE : ""}\nstruct PrismParams {\n${fields}\n};\n` +
     `@group(0) @binding(3) var<uniform> params: PrismParams;\n${texFns}// ── Código do usuário ──\n`;
   const userLineStart = head.split("\n").length;
   const sim = usesSimulation(code) ? ESPECTRO_SIM_ENTRY : "";
-  return { wgsl: head + code + "\n" + ESPECTRO_ENTRY + sim, userLineStart, parse };
+  const particles = parse.particles > 0 ? ESPECTRO_PARTICLE_ENTRY : "";
+  return { wgsl: head + code + "\n" + ESPECTRO_ENTRY + sim + particles, userLineStart, parse };
 }
 
 function clampNum(v: number, def: EspectroParamDef): number {
@@ -426,6 +551,7 @@ export function withNativeEspectro(effect: EspectroEffect): EspectroEffect {
     nativeFeedback: usesPrevious(effect.code),
     nativeSimulate: usesSimulation(effect.code),
     nativeScale: build.parse.scale,
+    nativeParticles: build.parse.particles,
   };
 }
 
@@ -825,6 +951,55 @@ fn effect(uv: vec2f) -> vec4f {
   let t = tex_padrao(uv * params.scale + n * params.flow + vec2f(0.0, prism.time * 0.02));
   let bg = sample_backdrop(uv + n * 0.01);
   return vec4f(mix(bg.rgb, t.rgb, t.a * params.amount), 1.0);
+}
+`,
+  },
+  {
+    id: "snow-physics",
+    name: "Neve com física",
+    description: "20 mil flocos na GPU: gravidade, vento com turbulência e o mouse empurrando.",
+    code: `//@particles 20000
+//@param fall: float = 0.08 range(0, 0.4) label("Queda")
+//@param wind: float = 0.03 range(-0.2, 0.2) label("Vento")
+//@param gust: float = 0.15 range(0, 0.6) label("Turbulência")
+//@param push: float = 1.2 range(0, 4) label("Força do mouse")
+//@param flake: float = 4 range(1, 15) label("Tamanho do floco")
+
+// Nasce acima da camada, em x aleatório. Tudo roda na GPU (compute), nada passa pela CPU.
+fn particle_spawn(i: u32) -> Particle {
+  var p: Particle;
+  p.pos = vec2f(prand(i, 1.0), -0.05 - prand(i, 2.0) * 1.1);
+  p.vel = vec2f(0.0, params.fall * (0.5 + prand(i, 3.0)));
+  p.life = 30.0;
+  p.age = 0.0;
+  p.size = params.flake * 0.001 * (0.4 + prand(i, 4.0));
+  p.seed = prand(i, 5.0);
+  p.color = vec4f(1.0, 1.0, 1.0, 0.5 + 0.5 * prand(i, 6.0));
+  return p;
+}
+
+fn particle_update(p: Particle, i: u32) -> Particle {
+  var o = p;
+  let goal = vec2f(0.0, params.fall * (0.5 + p.seed));
+  let force = wind_force(p, vec2f(params.wind, 0.0), params.gust) + mouse_force(p, 0.12, params.push);
+  o.vel += (goal - o.vel) * min(1.0, prism.delta * 1.5) + force * prism.delta;
+  o = physics_step(o, vec2f(0.0), 0.0);
+  if (o.pos.y > 1.05 || o.pos.x < -0.1 || o.pos.x > 1.1) {
+    o.life = 0.0;
+  }
+  return o;
+}
+
+// q vai de -1 a 1 no quadradinho do floco: um disco macio.
+fn particle_color(p: Particle, q: vec2f) -> vec4f {
+  let d = length(q);
+  return vec4f(p.color.rgb, p.color.a * smoothstep(1.0, 0.2, d));
+}
+
+fn effect(uv: vec2f) -> vec4f {
+  let bg = sample_input(uv);
+  let flakes = sample_particles(uv);
+  return vec4f(bg.rgb * (1.0 - flakes.a) + flakes.rgb, 1.0);
 }
 `,
   },
