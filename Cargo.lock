@@ -3464,6 +3464,7 @@ dependencies = [
  "glyphon",
  "image",
  "meshopt",
+ "naga",
  "pollster",
  "prism-core",
  "raw-window-handle",

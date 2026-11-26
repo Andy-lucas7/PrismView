@@ -41,6 +41,7 @@ use prism_core::schema::{
     TouchActionType, VisibilityCondition,
 };
 
+use super::espectro::{EspectroPlacement, EspectroRenderer};
 use super::bindings::{LayerBindingSolver, LayerFx};
 use super::compositor::{
     BlendKind, BoundSubtree, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind,
@@ -218,6 +219,8 @@ pub struct SceneRenderer {
     layer_bindings: LayerBindingSolver,
     /// Textura final da cena 3D (camada `Scene3d`), se o chamador já renderizou uma.
     scene3d_out: Option<Scene3dOutput>,
+    /// Efeitos WGSL do Modo Espectro (camadas `Shader`), um alvo por saída e camada.
+    espectro: EspectroRenderer,
 }
 
 impl SceneRenderer {
@@ -244,6 +247,7 @@ impl SceneRenderer {
             asset_root: None,
             layer_bindings: LayerBindingSolver::new(),
             scene3d_out: None,
+            espectro: EspectroRenderer::new(),
         }
     }
 
@@ -296,8 +300,13 @@ impl SceneRenderer {
     /// Avança os bindings 2D/vidro com o snapshot do quadro. `true` se a lista precisa ser refeita
     /// (algum delta mudou). Cena sem bindings = custo zero.
     pub fn apply_signals(&mut self, snap: &SignalSnapshot, dt: f32) -> bool {
+        // Efeitos Espectro animam por tempo/áudio: todo quadro é redesenho (sem rebuild da lista).
+        let espectro = self.espectro.is_active();
+        if espectro {
+            self.espectro.observe(snap);
+        }
         if self.scene.is_none() || !self.layer_bindings.solve(snap, dt) {
-            return false;
+            return espectro;
         }
         // Não é mudança estrutural: o `render` reaplica o delta nas instâncias (caminho rápido)
         // e só refaz a lista se a subárvore não permitir.
@@ -386,12 +395,21 @@ impl SceneRenderer {
         if self.deps.intersects(DirtyFlags::SYSTEM_METRICS) {
             demand |= SignalKind::TELEMETRY | SignalKind::POWER;
         }
+        // `PrismGlobals`: áudio, cursor e bateria.
+        if self.espectro.is_active() {
+            demand |= SignalKind::AUDIO | SignalKind::MOUSE | SignalKind::POWER;
+        }
         demand
     }
 
     /// Molas 2D ainda em movimento (o loop deve continuar desenhando).
     pub fn bindings_animating(&self) -> bool {
-        self.layer_bindings.is_animating()
+        self.layer_bindings.is_animating() || self.espectro.is_active()
+    }
+
+    /// Erros de compilação de efeitos Espectro desde a última chamada: `(camada, mensagem)`.
+    pub fn take_espectro_issues(&mut self) -> Vec<(String, String)> {
+        self.espectro.take_issues()
     }
 
     fn has_touch_actions(&self) -> bool {
@@ -545,6 +563,9 @@ impl SceneRenderer {
     /// Hibernação de VRAM (Fase 5): solta pirâmide de blur e mapas de glifo do vidro.
     pub fn release_glass_gpu(&mut self) {
         self.glass.release();
+        // Alvos dos efeitos Espectro também: a retomada refaz a lista e os recria.
+        self.espectro.release_gpu(&mut self.compositor);
+        self.version += 1;
     }
 
     /// PowerGovernor: liga/desliga pós-processamento (blur do vidro). `true` se o quadro precisa
@@ -659,6 +680,7 @@ impl SceneRenderer {
                 scratch: &mut self.key_scratch,
                 asset_root: self.asset_root.as_deref(),
                 fx: &empty_fx,
+                espectro: None,
                 ui: scale,
                 vw: w as f32,
                 vh: h as f32,
@@ -802,6 +824,7 @@ impl SceneRenderer {
         }
         self.text.clear();
         self.glass.release();
+        self.espectro.release_gpu(&mut self.compositor);
     }
 
     pub fn set_scene(&mut self, scene: PrismScene, ctx: &EvalContext) {
@@ -984,8 +1007,11 @@ impl SceneRenderer {
         let compositor = &self.compositor;
         let text = &self.text;
         let glass = &mut self.glass;
+        let espectro = &mut self.espectro;
 
         surface.render_with(gpu, |encoder, view| {
+            // Efeitos Espectro primeiro: o passe 2D amostra os alvos deles.
+            espectro.encode(canvas_key, gpu.device(), gpu.queue(), encoder, compositor);
             Self::record_composited_frame(
                 compositor,
                 text,
@@ -1166,6 +1192,7 @@ impl SceneRenderer {
             layer.begin(size.0, size.1);
         }
         self.glass.begin_build();
+        self.espectro.begin_build();
         let serial = self.text.begin_pass();
 
         if let Some(scene) = self.scene.as_ref() {
@@ -1188,6 +1215,7 @@ impl SceneRenderer {
                 scratch: &mut self.key_scratch,
                 asset_root: self.asset_root.as_deref(),
                 fx: &self.layer_bindings,
+                espectro: Some(&mut self.espectro),
                 ui,
                 vw: size.0 as f32,
                 vh: size.1 as f32,
@@ -1195,6 +1223,7 @@ impl SceneRenderer {
             };
             frame.build();
         }
+        self.espectro.end_build(canvas_key, &mut self.compositor);
 
         // Libera slots/bindings de texto desta saída que a cena já não usa (sem alocar).
         self.key_scratch.clear();

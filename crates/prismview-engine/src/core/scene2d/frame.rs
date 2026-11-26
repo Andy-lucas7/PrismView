@@ -40,6 +40,8 @@ pub(super) struct Frame<'a> {
     pub(super) asset_root: Option<&'a Path>,
     /// Deltas dos bindings reativos por camada (somados à base; nunca gravados nela).
     pub(super) fx: &'a LayerBindingSolver,
+    /// Efeitos Espectro (`None` na foto limpa do wallpaper do Windows: efeito não entra).
+    pub(super) espectro: Option<&'a mut EspectroRenderer>,
     pub(super) ui: f32,
     pub(super) vw: f32,
     pub(super) vh: f32,
@@ -498,6 +500,7 @@ impl Frame<'_> {
             LayerKind::Image => self.draw_image(layer, size, &xf, z, blend, opacity),
             LayerKind::Scene3d => self.draw_scene3d(size, &xf, z, blend, opacity, layer.fill_parent),
             LayerKind::Video => self.draw_video(layer, size, &xf, z, blend, opacity),
+            LayerKind::Shader => self.draw_espectro(layer, size, &xf, z, blend, opacity),
             LayerKind::Svg | LayerKind::Icon => self.draw_svg(layer, size, &xf, z, blend, opacity),
             // DepthSubject (segmentação) ainda não tem renderer.
             LayerKind::Stack | LayerKind::Group | LayerKind::DepthSubject => {}
@@ -909,6 +912,67 @@ impl Frame<'_> {
         if fill_parent {
             self.backdrop = Some(self.backdrop_for(out.id, out.size, SCENE3D_BACKDROP_HASH, true, false));
         }
+    }
+
+    /// Camada SHADER (Modo Espectro): o efeito renderiza num alvo do tamanho da caixa (em
+    /// `SceneRenderer::render`, antes deste passe) e aqui entra como textura pré-multiplicada.
+    /// O fundo que `sample_backdrop` lê é a mídia de fundo (o mesmo backdrop do vidro).
+    pub(super) fn draw_espectro(
+        &mut self,
+        layer: &LayerNode,
+        size: Size,
+        xf: &Affine,
+        z: u32,
+        blend: BlendKind,
+        opacity: f32,
+    ) {
+        let Some(effect) = layer.shader.as_ref() else {
+            return;
+        };
+        if size.w <= 0.0 || size.h <= 0.0 || opacity <= 0.0 {
+            return;
+        }
+        let scale = xf.scale();
+        let (vw, vh) = (self.vw.max(1.0), self.vh.max(1.0));
+        let (w, h) = (size.w * scale, size.h * scale);
+        let layer_rect = [(xf.t[0] - w * 0.5) / vw, (xf.t[1] - h * 0.5) / vh, w / vw, h / vh];
+        let (backdrop, backdrop_rect, backdrop_opaque) = match self.backdrop.as_ref() {
+            Some(bd) => {
+                // `uv_rect` = região da textura que cobre a viewport → onde a textura cai no quadro.
+                let [u0, v0, u1, v1] = bd.uv_rect;
+                let du = (u1 - u0).max(1e-6);
+                let dv = (v1 - v0).max(1e-6);
+                (Some(bd.texture), [-u0 / du, -v0 / dv, 1.0 / du, 1.0 / dv], bd.opaque)
+            }
+            None => (None, [0.0, 0.0, 1.0, 1.0], false),
+        };
+        let placement = EspectroPlacement {
+            layer_rect,
+            backdrop_rect,
+            backdrop,
+            backdrop_opaque,
+        };
+        let px = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
+        let Some(espectro) = self.espectro.as_deref_mut() else {
+            return;
+        };
+        let Some(id) = espectro.place(
+            self.device,
+            self.queue,
+            &mut *self.compositor,
+            self.canvas_key,
+            &layer.id,
+            effect,
+            px,
+            placement,
+        ) else {
+            return;
+        };
+        let inst = QuadInstance::new(xf.t, [size.w * 0.5, size.h * 0.5], xf.m, scale)
+            .kind(QuadKind::Texture)
+            .color([1.0, 1.0, 1.0, opacity])
+            .uv([0.0, 0.0, 1.0, 1.0]);
+        self.canvas.push(z, blend, id, inst);
     }
 
     /// Camada de vídeo: frame atual do decoder (zero-copy), cover na caixa, cantos arredondados.

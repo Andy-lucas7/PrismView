@@ -27,6 +27,7 @@ import type { Scene3DEditorApi, Scene3DGizmoMode, Scene3DStats } from "./Scene3D
 
 import { MemoLayerNode, RealVideoLayer, Room3DEditBinding, Scene3DSlot, colorWithAlpha, computeMediaDrawRect, ensureCustomFontLoaded, ensureSystemFontLoaded, hexToRgbTuple, isLayerStatic, layersNeedClockTick, sanitizeSvgMarkup, sceneHasAnyGlass, sceneHasVisibleVideo, supportsCorsUrl } from "./UnifiedCompositorParts";
 import { snapAxisInto, type SnapAxisBuffer } from "../utils/align";
+const LazyEspectroLayer = React.lazy(() => import("./EspectroLayer"));
 
 export type LayerResizePatch = {
   width?: number;
@@ -673,7 +674,8 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
     layer.height >= 900 &&
     (layer.kind === "VIDEO" ||
       layer.kind === "IMAGE" ||
-      layer.kind === "SCENE_3D");
+      layer.kind === "SCENE_3D" ||
+      layer.kind === "SHADER");
 
   // 4.5: per-render memo. Glass layers sharing a topIndex reuse one result, and each candidate's
   // visible/opacity formulas are evaluated at most once per render.
@@ -928,7 +930,7 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
         ? layer.image.borderRadius * containerScale
         : g.borderRadius * containerScale;
 
-    const resolvedBackdrop = g.enabled
+    const resolvedBackdrop = g.enabled || layer.kind === "SHADER"
       ? resolveBackdropForTopIndex(topIndex)
       : { backdrop: null, hasIntermediateHtml: false };
     const plateUseCssFallback =
@@ -1132,6 +1134,26 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               opacity: g.enabled ? opacity : undefined,
             }}
           />
+        )}
+        {layer.kind === "SHADER" && layer.shader && !lite && (
+          <Suspense fallback={<div style={{ width: `${wPx}px`, height: `${hPx}px` }} />}>
+            <LazyEspectroLayer
+              effect={layer.shader}
+              width={wPx}
+              height={hPx}
+              centerX={isFullBleedBackdrop ? size.w / 2 : layerCenterX}
+              centerY={isFullBleedBackdrop ? size.h / 2 : layerCenterY}
+              frameW={size.w}
+              frameH={size.h}
+              backdrop={resolvedBackdrop.backdrop}
+              fallbackColor={project.backgroundColor}
+              paused={paused}
+              isThumbnail={isThumbnail}
+              powerState={powerState}
+              reactiveSignalRef={reactiveSignalRef}
+              batteryPercent={telemetry.battery_percent}
+            />
+          </Suspense>
         )}
         {layer.kind === "SCENE_3D" && !lite && (
           <div

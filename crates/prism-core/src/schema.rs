@@ -528,6 +528,20 @@ pub enum LayerKind {
     /// Vídeo em camada (fora do fundo): `asset` = caminho do arquivo; decodificado por
     /// `HardwareVideoDecoder` (Media Foundation, zero-copy) no motor.
     Video,
+    /// Efeito WGSL do Modo Espectro (camada `SHADER` do Estúdio): `LayerNode::shader`.
+    Shader,
+}
+
+/// Efeito do Modo Espectro já montado pelo Estúdio: WGSL completo (prelúdio + parâmetros +
+/// código do usuário + entradas `prism_vs`/`prism_fs`) e o uniform `params` empacotado.
+/// O layout dos uniforms vive só no Estúdio (`types/prismEspectro.ts`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ShaderEffect {
+    #[serde(default)]
+    pub name: String,
+    pub wgsl: String,
+    #[serde(default)]
+    pub params: Vec<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -626,6 +640,9 @@ pub struct LayerNode {
     /// `width_px`/`height_px` são ignorados.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fill_parent: bool,
+    /// Efeito WGSL quando `kind == Shader`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shader: Option<ShaderEffect>,
     #[serde(default)]
     pub children: Vec<LayerNode>,
 }
@@ -723,6 +740,7 @@ impl Default for LayerNode {
             touch: TouchAction::default(),
             scene3d: None,
             fill_parent: false,
+            shader: None,
             children: Vec::new(),
         }
     }
@@ -1630,5 +1648,24 @@ mod native_widget_tests {
         assert_eq!(again, file);
         let clamp = ActiveWidgetsFile::parse(r#"{"widgets":[{"id":"c","x":0,"y":0,"width":2,"height":99999}]}"#);
         assert_eq!((clamp.widgets[0].width, clamp.widgets[0].height), (NATIVE_WIDGET_MIN_SIDE, NATIVE_WIDGET_MAX_SIDE));
+    }
+}
+
+#[cfg(test)]
+mod espectro_tests {
+    use super::*;
+
+    /// Formato que `native_scene.rs` (src-tauri) grava para uma camada SHADER.
+    #[test]
+    fn shader_layer_deserializes() {
+        let node: LayerNode = serde_json::from_value(serde_json::json!({
+            "id": "rain", "kind": "SHADER", "fill_parent": true,
+            "shader": { "name": "Chuva", "wgsl": "// wgsl", "params": [0.5, 0.0, 0.0, 0.0] }
+        }))
+        .expect("camada SHADER");
+        assert_eq!(node.kind, LayerKind::Shader);
+        let fx = node.shader.expect("shader");
+        assert_eq!(fx.wgsl, "// wgsl");
+        assert_eq!(fx.params.len(), 4);
     }
 }

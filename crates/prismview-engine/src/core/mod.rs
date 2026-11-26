@@ -7,6 +7,7 @@ pub mod assets;
 pub mod audio;
 pub mod bindings;
 pub mod compositor;
+pub mod espectro;
 pub mod glass;
 pub mod governor;
 pub mod gpu;

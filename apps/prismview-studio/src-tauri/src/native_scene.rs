@@ -153,7 +153,7 @@ impl Ctx {
             && (number(layer, "y", 0.5) - 0.5).abs() < 0.02
             && number(layer, "width", 0.0) >= 1600.0
             && number(layer, "height", 0.0) >= 900.0
-            && matches!(kind(layer), "VIDEO" | "IMAGE" | "SCENE_3D")
+            && matches!(kind(layer), "VIDEO" | "IMAGE" | "SCENE_3D" | "SHADER")
     }
 
     /// Uma camada do Estúdio vira 0, 1 ou 2 nós (Play/Pause alternado).
@@ -239,6 +239,24 @@ impl Ctx {
                 };
                 node["kind"] = json!("SCENE3D");
                 node["scene3d"] = scene3d(config);
+            }
+            // Modo Espectro: o Estúdio já manda o WGSL completo e os uniforms empacotados
+            // (`withNativeAssets` → `shader.nativeWgsl`/`nativeParams`).
+            "SHADER" => {
+                let Some(fx) = layer.get("shader") else {
+                    return Vec::new();
+                };
+                let wgsl = text(fx, "nativeWgsl");
+                if wgsl.trim().is_empty() {
+                    return Vec::new();
+                }
+                let params: Vec<f32> = fx
+                    .get("nativeParams")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
+                    .unwrap_or_default();
+                node["kind"] = json!("SHADER");
+                node["shader"] = json!({ "name": text(fx, "name"), "wgsl": wgsl, "params": params });
             }
             // Tipo desconhecido (versão futura do Estúdio): filhos continuam visíveis.
             _ => {
@@ -1272,6 +1290,28 @@ mod tests {
         );
         assert_eq!(local_path("blob:xyz"), None);
         assert_eq!(local_path(r"D:\m.glb").as_deref(), Some(r"D:\m.glb"));
+    }
+
+    #[test]
+    fn espectro_shader_layer() {
+        let project = json!({
+            "id": "p1", "title": "T", "packageType": "WALLPAPER", "dim": 0,
+            "backgroundColor": "#000000", "widget": { "width": 480, "height": 240, "posX": 0, "posY": 0, "locked": false },
+            "layers": [
+                layer("rain", "SHADER", json!({ "width": 1920, "height": 1080,
+                    "shader": { "name": "Chuva", "code": "fn effect(uv: vec2f) -> vec4f { return vec4f(1.0); }",
+                                "params": {}, "nativeWgsl": "// wgsl", "nativeParams": [0.5, 0, 0, 0] } })),
+                layer("sem", "SHADER", json!({ "shader": { "name": "x", "code": "", "params": {} } }))
+            ]
+        });
+        let scene = project_to_scene(&project).expect("convertível");
+        let layers = scene["layers"].as_array().expect("layers");
+        assert!(layers.iter().all(|l| l["id"] != "sem"), "efeito sem WGSL nativo não entra");
+        let rain = layers.iter().find(|l| l["id"] == "rain").expect("camada SHADER");
+        assert_eq!(rain["kind"], "SHADER");
+        assert_eq!(rain["fill_parent"], true);
+        assert_eq!(rain["shader"]["wgsl"], "// wgsl");
+        assert_eq!(rain["shader"]["params"][0], 0.5);
     }
 
     #[test]

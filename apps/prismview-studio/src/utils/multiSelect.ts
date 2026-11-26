@@ -21,6 +21,7 @@ export const LAYER_KIND_LABELS: Readonly<Record<LayerKind, string>> = {
   GROUP: "Grupo",
   PROGRESS: "Barra",
   SCENE_3D: "Modelo 3D",
+  SHADER: "Efeito Espectro",
 };
 
 export function mergeField<T>(

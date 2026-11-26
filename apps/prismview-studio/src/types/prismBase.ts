@@ -2,6 +2,7 @@
 import { evaluateFxTemplate } from "../engine/fx/fxEngine";
 import { SPRING } from "../engine/motion";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import type { EspectroEffect } from "./prismEspectro";
 
 
 export type PackageType = "WALLPAPER" | "WIDGET";
@@ -13,7 +14,9 @@ export type LayerKind =
   | "GLASS"
   | "GROUP"
   | "PROGRESS"
-  | "SCENE_3D";
+  | "SCENE_3D"
+  /** Efeito WGSL do Modo Espectro. */
+  | "SHADER";
 export type Scene3DEnvPreset = "STUDIO_DARK" | "CITY_NIGHT" | "SUNSET" | "DAYLIGHT";
 export type Scene3DShowcaseVariant = "MONOLITH" | "GYROSCOPE" | "KINETIC_SLAB";
 export type Scene3DObjectKind = "GLB" | "SHOWCASE";
@@ -383,6 +386,8 @@ export interface SceneLayer {
   };
   glass: GlassEffect;
   scene3d?: Scene3DConfig;
+  /** SHADER: efeito do Modo Espectro (código WGSL + parâmetros). */
+  shader?: EspectroEffect;
   children?: SceneLayer[];
   fx: Record<string, string>;
 }

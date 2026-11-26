@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { COLLAPSE, POP, ROW } from "./motion/Presence";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -43,6 +43,7 @@ import {
   Unlock,
   Upload,
   X,
+  Rainbow,
 } from "lucide-react";
 import {
   createBindingForPart,
@@ -68,6 +69,7 @@ import {
   SceneLayer,
   ImportConflictDto,
   isImportConflict,
+  type EspectroEffect,
 } from "../types/prism";
 import { useHistory } from "../hooks/useHistory";
 import { type RoomShortcuts, useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts";
@@ -138,6 +140,8 @@ import {
   InspectorMode,
   StudioInspector,
 } from "./StudioInspector";
+
+const LazyEspectroPanel = React.lazy(() => import("./studio/EspectroPanel"));
 
 /** Tipos de camada que a barra do painel cria (ordem de exibição). */
 const ADD_LAYER_BUTTONS: { kind: LayerKind; label: string; Icon: React.ComponentType<{ className?: string }> }[] = [
@@ -256,6 +260,8 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
   const [inspectorMode, setInspectorMode] = useState<InspectorMode>("LAYER");
   const [widgetPickerOpen, setWidgetPickerOpen] = useState(false);
   // Painel único (propriedades + camadas): aberto/recolhido lembrado entre sessões.
+  // Modo Espectro (efeitos WGSL): painel à esquerda do canvas, só monta enquanto aberto.
+  const [espectroOpen, setEspectroOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState<boolean>(() =>
     readPanelOpen(typeof window === "undefined" ? null : window.localStorage)
   );
@@ -951,6 +957,20 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           editorApiRef,
         }
       : null;
+
+  /** Nova camada SHADER logo acima da mídia de fundo, ou no fundo da pilha (texto continua por cima). */
+  const addEspectroLayer = (effect: EspectroEffect) => {
+    const created: SceneLayer = { ...createLayer("SHADER", effect.name), shader: effect };
+    const layers = projectRef.current.layers;
+    const bgIndex = layers.findIndex(
+      (l) => !l.hidden && (l.kind === "VIDEO" || l.kind === "SCENE_3D" || (l.kind === "IMAGE" && l.width >= 1600))
+    );
+    // Sem mídia de fundo: vai para o fundo da pilha (o efeito costuma ser opaco).
+    const at = bgIndex >= 0 ? bgIndex + 1 : 0;
+    applyDiscreteChange({ ...projectRef.current, layers: [...layers.slice(0, at), created, ...layers.slice(at)] });
+    setSelectedIds([created.id]);
+    setInspectorMode("LAYER");
+  };
 
   const addNewLayer = (kind: LayerKind) => {
     const created = createLayer(kind);
@@ -2437,6 +2457,18 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
           )}
           <button
             type="button"
+            onClick={() => setEspectroOpen((v) => !v)}
+            aria-pressed={espectroOpen}
+            aria-label={espectroOpen ? "Fechar o Modo Espectro" : "Abrir o Modo Espectro: efeitos com shaders (avançado)"}
+            title={espectroOpen ? "Fechar o Modo Espectro" : "Modo Espectro: crie efeitos com shaders WGSL (avançado)"}
+            className={`frosted-chrome rounded-full w-9 h-9 flex items-center justify-center transition ${
+              espectroOpen ? "text-white bg-white/15" : "text-[#A1A1AA] hover:text-white"
+            }`}
+          >
+            <Rainbow className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
             onClick={togglePanel}
             aria-label={panelOpen ? "Recolher o painel de propriedades e camadas (Ctrl+\\)" : "Mostrar o painel de propriedades e camadas (Ctrl+\\)"}
             aria-pressed={panelOpen}
@@ -2520,7 +2552,10 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
       {/* CENTER: 1:1 Unified GPU Compositor Canvas (Always 100% visible, never clipped vertically) */}
       <div
         className="absolute inset-0 pt-16 pb-3 pl-3"
-        style={{ paddingRight: stageRightInset(panelOpen, viewportW) }}
+        style={{
+          paddingRight: stageRightInset(panelOpen, viewportW),
+          paddingLeft: espectroOpen ? "calc(min(460px, 42vw) + 24px)" : undefined,
+        }}
       >
         <div ref={stageRef} className="w-full h-full flex items-center justify-center">
           <div
@@ -2916,9 +2951,40 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
         }}
         onRecordStep={() => history.pushSnapshot(projectRef.current)}
         onFlushSave={onFlushSave}
+        onOpenEspectro={() => setEspectroOpen(true)}
       />
         }
       />
+      )}
+
+      {espectroOpen && (
+        <div className="absolute top-16 bottom-3 left-3 z-40">
+          <Suspense fallback={null}>
+            <LazyEspectroPanel
+              effect={selectedLayer?.kind === "SHADER" ? selectedLayer.shader ?? null : null}
+              layerName={selectedLayer?.kind === "SHADER" ? selectedLayer.name : undefined}
+              onChangeEffect={(fn, commit) => {
+                const target = selectedLayer?.kind === "SHADER" ? selectedLayer.id : null;
+                if (!target) return;
+                patchLayer(target, (l) => (l.shader ? { ...l, shader: fn(l.shader) } : l), commit);
+              }}
+              onCreateLayer={addEspectroLayer}
+              onClose={() => setEspectroOpen(false)}
+              notify={flashHint}
+              onBeginTx={() => {
+                onTxStateChange?.(true);
+                history.beginTransaction(projectRef.current);
+              }}
+              onCommitTx={() => {
+                history.commitTransaction(projectRef.current);
+                onTxStateChange?.(false);
+                onFlushSave?.();
+              }}
+              onRecordStep={() => history.pushSnapshot(projectRef.current)}
+              onFlushSave={onFlushSave}
+            />
+          </Suspense>
+        </div>
       )}
 
       {/* Menu de botão direito: só monta quando aberto (Etapa 8) */}

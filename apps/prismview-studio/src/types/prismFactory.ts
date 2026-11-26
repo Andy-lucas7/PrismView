@@ -3,6 +3,7 @@ import { evaluateFxTemplate, type FxWeather } from "../engine/fx/fxEngine";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { BUILTIN_SVG_ICONS, GlobalVar, LayerKind, LiveTelemetry, PrismProject, SceneLayer, defaultGlass } from "./prismBase";
 import { defaultScene3D } from "./prismScene3D";
+import { createEspectroEffect, withNativeEspectro } from "./prismEspectro";
 
 export function createLayer(kind: LayerKind, name?: string): SceneLayer {
   const id = `l-${Math.random().toString(36).slice(2, 9)}`;
@@ -24,12 +25,14 @@ export function createLayer(kind: LayerKind, name?: string): SceneLayer {
         ? "Placa de Vidro"
         : kind === "PROGRESS"
         ? "Barra de Progresso"
+        : kind === "SHADER"
+        ? "Efeito Espectro"
         : "Grupo / Widget"),
     kind,
     x: 0.5,
     y: 0.5,
     width:
-      kind === "VIDEO" || kind === "SCENE_3D"
+      kind === "VIDEO" || kind === "SCENE_3D" || kind === "SHADER"
         ? 1920
         : kind === "GLASS"
         ? 540
@@ -39,7 +42,7 @@ export function createLayer(kind: LayerKind, name?: string): SceneLayer {
         ? 320
         : 160,
     height:
-      kind === "VIDEO" || kind === "SCENE_3D"
+      kind === "VIDEO" || kind === "SCENE_3D" || kind === "SHADER"
         ? 1080
         : kind === "GLASS"
         ? 220
@@ -91,6 +94,8 @@ export function createLayer(kind: LayerKind, name?: string): SceneLayer {
     };
   } else if (kind === "SCENE_3D") {
     base.scene3d = defaultScene3D();
+  } else if (kind === "SHADER") {
+    base.shader = createEspectroEffect();
   } else if (kind === "GROUP") {
     base.width = 520;
     base.height = 240;
@@ -128,6 +133,9 @@ export function withNativeAssets(project: PrismProject): PrismProject {
           resolvedSvgAlt: isToggle ? builtinSvgMarkup("pause", layer.svg.strokeWidth) : undefined,
         },
       };
+    }
+    if (layer.kind === "SHADER" && layer.shader) {
+      next = { ...next, shader: withNativeEspectro(layer.shader) };
     }
     if (layer.children?.length) {
       next = { ...next, children: layer.children.map(mapLayer) };
