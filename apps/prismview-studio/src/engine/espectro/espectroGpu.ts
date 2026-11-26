@@ -1,7 +1,7 @@
 // WebGPU do Modo Espectro no Studio: um device compartilhado + cache de pipelines por código.
 // O TS 5.9 não traz os tipos do WebGPU e o projeto não depende de @webgpu/types, então a API
 // é usada por uma fachada mínima (`Gpu*`) só com o que este módulo toca.
-import { buildEspectroShader, type EspectroParseResult } from "../../types/prismEspectro";
+import { ESPECTRO_STATE_FORMAT, buildEspectroShader, usesSimulation, type EspectroParseResult } from "../../types/prismEspectro";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export type GpuDevice = any;
@@ -18,6 +18,8 @@ export interface EspectroDiagnostic {
 
 export interface EspectroCompiled {
   pipeline: GpuPipeline | null;
+  /** Passe de estado (`fn simulate`), alvo `ESPECTRO_STATE_FORMAT`. */
+  simPipeline: GpuPipeline | null;
   diagnostics: EspectroDiagnostic[];
   parse: EspectroParseResult;
 }
@@ -28,6 +30,7 @@ interface GpuContext {
   layout: GpuBindGroupLayout;
   pipelineLayout: any;
   sampler: any;
+  repeatSampler: any;
 }
 
 let ctxPromise: Promise<GpuContext | null> | null = null;
@@ -58,11 +61,19 @@ export function getEspectroGpu(): Promise<GpuContext | null> {
         { binding: 1, visibility: STAGE, texture: { sampleType: "float" } },
         { binding: 2, visibility: STAGE, sampler: { type: "filtering" } },
         { binding: 3, visibility: STAGE, buffer: { type: "uniform" } },
+        { binding: 4, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 5, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 6, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 7, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 8, visibility: STAGE, texture: { sampleType: "float" } },
+        { binding: 9, visibility: STAGE, sampler: { type: "filtering" } },
+        { binding: 10, visibility: STAGE, texture: { sampleType: "float" } },
       ],
     });
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
     const sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge" });
-    return { device, format: gpu.getPreferredCanvasFormat(), layout, pipelineLayout, sampler } as GpuContext;
+    const repeatSampler = device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "repeat", addressModeV: "repeat" });
+    return { device, format: gpu.getPreferredCanvasFormat(), layout, pipelineLayout, sampler, repeatSampler } as GpuContext;
   })().catch(() => {
     ctxPromise = null;
     return null;
@@ -92,6 +103,19 @@ async function compileUncached(ctx: GpuContext, code: string): Promise<EspectroC
     });
   }
   let pipeline: GpuPipeline | null = null;
+  let simPipeline: GpuPipeline | null = null;
+  if (!diagnostics.some((d) => d.severity === "error") && usesSimulation(code)) {
+    try {
+      simPipeline = await device.createRenderPipelineAsync({
+        layout: ctx.pipelineLayout,
+        vertex: { module, entryPoint: "prism_vs" },
+        fragment: { module, entryPoint: "prism_sim", targets: [{ format: ESPECTRO_STATE_FORMAT }] },
+        primitive: { topology: "triangle-list" },
+      });
+    } catch (err: any) {
+      diagnostics.push({ line: 0, column: 1, message: String(err?.message ?? err), severity: "error" });
+    }
+  }
   if (!diagnostics.some((d) => d.severity === "error")) {
     try {
       pipeline = await device.createRenderPipelineAsync({
@@ -120,11 +144,12 @@ async function compileUncached(ctx: GpuContext, code: string): Promise<EspectroC
   if (scopeErr && !diagnostics.some((d) => d.severity === "error")) {
     diagnostics.push({ line: 0, column: 1, message: scopeErr.message, severity: "error" });
     pipeline = null;
+    simPipeline = null;
   }
   if (!diagnostics.some((d) => d.message.includes("effect")) && !/\bfn\s+effect\s*\(/.test(code)) {
     diagnostics.unshift({ line: 1, column: 1, message: "Defina fn effect(uv: vec2f) -> vec4f.", severity: "error" });
   }
-  return { pipeline, diagnostics, parse: build.parse };
+  return { pipeline, simPipeline, diagnostics, parse: build.parse };
 }
 
 /** Compila (ou devolve do cache) o efeito. Nunca lança; erros vêm em `diagnostics`. */

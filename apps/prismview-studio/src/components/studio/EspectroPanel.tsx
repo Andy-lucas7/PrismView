@@ -1,17 +1,24 @@
 // Painel do Modo Espectro: código WGSL do efeito, erros do compilador, parâmetros gerados,
 // modelos prontos e importar/exportar `.prismfx`. Montado só enquanto o modo está aberto.
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Download, Plus, Rainbow, Upload, X } from "lucide-react";
+import { AlertTriangle, BookOpen, Download, ImagePlus, Plus, Rainbow, Upload, X } from "lucide-react";
 import {
   ESPECTRO_MAX_CODE_CHARS,
   ESPECTRO_TEMPLATES,
+  PRISMFX_MAX_BYTES,
   createEspectroEffect,
   invokeCmd,
   isTauriRuntime,
-  parsePrismFx,
+  parseEspectroParams,
+  parsePrismFxFull,
+  resolveMediaUrl,
   serializePrismFx,
+  setTextureSrc,
+  textureSrc,
   type EspectroEffect,
   type EspectroParamValue,
+  type PickedFileDto,
+  type PrismFxTexture,
 } from "../../types/prism";
 import { compileEspectro, webgpuAvailable, type EspectroDiagnostic } from "../../engine/espectro/espectroGpu";
 import { EspectroParams } from "./EspectroParams";
@@ -31,6 +38,33 @@ export interface EspectroPanelProps {
 }
 
 const CODE_DEBOUNCE_MS = 400;
+
+/** Cola rápida do que o efeito pode usar (o prelúdio do Espectro). */
+const REFERENCE: [string, string][] = [
+  ["fn effect(uv: vec2f) -> vec4f", "obrigatória: cor do pixel em uv (0..1, origem no topo)"],
+  ["sample_backdrop(uv)", "fundo do wallpaper (vídeo, imagem ou 3D)"],
+  ["sample_previous(uv)", "quadro anterior deste efeito (memória: rastros, simulações)"],
+  ["tex_NOME(uv) · tex_NOME_size()", "imagem declarada com //@texture NOME"],
+  ["params.NOME", "valor de //@param (float, vec2, color, bool)"],
+  ["prism.time · prism.delta · prism.frame", "segundos, segundos do quadro, nº do quadro"],
+  ["prism.resolution · pixel()", "tamanho em px do efeito · 1 pixel em uv"],
+  ["prism.cursor", "mouse em uv da camada"],
+  ["prism.click · prism.click_age", "uv do último clique · segundos desde ele"],
+  ["prism.input", "x: mouse apertado · y: tecla · z: digitação · w: ocioso (s)"],
+  ["prism.audio · prism.beat", "x nível, y grave, z médio, w agudo · batida"],
+  ["prism.media", "x tocando · y progresso 0..1 · z há sessão"],
+  ["prism.battery", "bateria 0..1"],
+  ["hash21(p) · noise2(p)", "aleatório e ruído suave"],
+];
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result));
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+}
 
 export const EspectroPanel: React.FC<EspectroPanelProps> = ({
   effect,
@@ -135,12 +169,46 @@ export const EspectroPanel: React.FC<EspectroPanelProps> = ({
   };
 
   const lineCount = useMemo(() => draft.split("\n").length, [draft]);
+  const textureDefs = useMemo(() => parseEspectroParams(draft).textures, [draft]);
+
+  const pickTexture = async (name: string) => {
+    if (!isTauriRuntime()) {
+      notify("Escolher imagem só funciona no app.");
+      return;
+    }
+    try {
+      const picked = await invokeCmd<PickedFileDto | null>("pick_local_file", { kind: "image" });
+      if (picked) onChangeEffect((e) => setTextureSrc(e, name, picked.path), "discrete");
+    } catch (err) {
+      notify(`Não foi possível abrir a imagem: ${String(err)}`);
+    }
+  };
   const errorLines = useMemo(() => new Set(diags.filter((d) => d.severity === "error").map((d) => d.line)), [diags]);
 
   const exportEffect = async () => {
     if (!effect) return;
     const current = { ...effect, code: draft };
-    const contents = serializePrismFx(current);
+    const textures: PrismFxTexture[] = [];
+    for (const def of textureDefs) {
+      const src = textureSrc(current, def.name);
+      if (!src) continue;
+      try {
+        const blob = await (await fetch(resolveMediaUrl(src))).blob();
+        const dataUrl = await blobToDataUrl(blob);
+        if (!/^data:image\/(png|jpeg|webp);base64,/.test(dataUrl)) {
+          notify(`Textura "${def.name}" fora do efeito: use PNG, JPEG ou WebP.`);
+          continue;
+        }
+        textures.push({ name: def.name, fileName: src.split(/[\\/]/).pop() ?? `${def.name}.png`, dataUrl });
+      } catch {
+        notify(`Não foi possível ler a textura "${def.name}".`);
+      }
+    }
+    const contents = serializePrismFx(current, textures);
+    if (contents.length > PRISMFX_MAX_BYTES) {
+      notify("Efeito grande demais para exportar (limite de 24 MB). Use imagens menores.");
+      return;
+    }
     const base = (current.name || "efeito").replace(/[^\p{L}\p{N}_ -]+/gu, "_").trim() || "efeito";
     if (isTauriRuntime()) {
       try {
@@ -161,9 +229,17 @@ export const EspectroPanel: React.FC<EspectroPanelProps> = ({
 
   const importEffect = async (file: File) => {
     try {
-      if (file.size > 2 * 1024 * 1024) throw new Error("Arquivo grande demais (limite de 2 MB).");
-      const parsed = parsePrismFx(await file.text());
-      onCreateLayer(parsed);
+      if (file.size > PRISMFX_MAX_BYTES) throw new Error("Arquivo grande demais (limite de 24 MB).");
+      const { effect: parsed, textures } = parsePrismFxFull(await file.text());
+      let withTex = parsed;
+      for (const t of textures) {
+        // No app as imagens vão para %APPDATA%\PrismView\assets\espectro; no navegador ficam em data URL.
+        const path = isTauriRuntime()
+          ? await invokeCmd<string>("save_espectro_texture", { fileName: t.fileName, dataUrl: t.dataUrl })
+          : t.dataUrl;
+        withTex = setTextureSrc(withTex, t.name, path);
+      }
+      onCreateLayer(withTex);
       notify(`Efeito "${parsed.name}" importado como nova camada.`);
     } catch (err) {
       notify(err instanceof Error ? err.message : "Não foi possível importar o efeito.");
@@ -302,6 +378,20 @@ export const EspectroPanel: React.FC<EspectroPanelProps> = ({
             />
           </div>
 
+          <details className="border-t border-white/10 px-3 py-1.5 group">
+            <summary className="cursor-pointer text-[11px] text-[#A1A1AA] hover:text-white flex items-center gap-1.5 select-none">
+              <BookOpen className="w-3 h-3" /> Referência
+            </summary>
+            <dl className="mt-1.5 max-h-40 overflow-auto space-y-1 text-[11px]">
+              {REFERENCE.map(([k, v]) => (
+                <div key={k}>
+                  <dt className="font-mono text-[#E4E4E7]">{k}</dt>
+                  <dd className="text-[#71717A] pl-2">{v}</dd>
+                </div>
+              ))}
+            </dl>
+          </details>
+
           <div className="border-t border-white/10 px-3 py-2 max-h-28 overflow-auto" aria-live="polite">
             {compiling ? (
               <span className="text-[11px] text-[#71717A]">Compilando…</span>
@@ -329,6 +419,41 @@ export const EspectroPanel: React.FC<EspectroPanelProps> = ({
           </div>
 
           <div className="border-t border-white/10 px-3 py-2 max-h-[38%] overflow-auto">
+            {textureDefs.length > 0 && (
+              <div className="mb-2 space-y-1.5">
+                <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">Texturas</span>
+                {textureDefs.map((def) => {
+                  const src = textureSrc(effect, def.name);
+                  return (
+                    <div key={def.name} className="flex items-center gap-2 frosted-chrome-card px-2 py-1.5">
+                      <span className="text-xs text-[#A1A1AA] shrink-0">{def.label}</span>
+                      <span className="text-[11px] text-[#71717A] truncate flex-1 min-w-0" title={src || undefined}>
+                        {src ? src.split(/[\\/]/).pop() : "nenhuma (branco)"}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void pickTexture(def.name)}
+                        className="prism-pill-idle rounded-md px-2 py-0.5 text-[11px] flex items-center gap-1"
+                        title={`Escolher a imagem de ${def.label}`}
+                      >
+                        <ImagePlus className="w-3 h-3" /> Escolher
+                      </button>
+                      {src && (
+                        <button
+                          type="button"
+                          aria-label={`Remover a imagem de ${def.label}`}
+                          title="Remover"
+                          onClick={() => onChangeEffect((e) => setTextureSrc(e, def.name, ""), "discrete")}
+                          className="w-6 h-6 rounded-full flex items-center justify-center text-[#A1A1AA] hover:text-white hover:bg-white/15"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             <span className="block text-[10px] uppercase tracking-wider text-[#71717A] mb-1.5">Parâmetros</span>
             <EspectroParams
               effect={{ ...effect, code: draft }}

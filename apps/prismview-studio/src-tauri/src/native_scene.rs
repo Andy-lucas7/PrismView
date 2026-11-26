@@ -255,8 +255,20 @@ impl Ctx {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
                     .unwrap_or_default();
+                let textures: Vec<Value> = fx
+                    .get("nativeTextures")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().take(4).map(|v| json!(local_path(v.as_str().unwrap_or("")).unwrap_or_default())).collect())
+                    .unwrap_or_default();
                 node["kind"] = json!("SHADER");
-                node["shader"] = json!({ "name": text(fx, "name"), "wgsl": wgsl, "params": params });
+                node["shader"] = json!({
+                    "name": text(fx, "name"),
+                    "wgsl": wgsl,
+                    "params": params,
+                    "textures": textures,
+                    "feedback": boolean(fx, "nativeFeedback", false),
+                    "simulate": boolean(fx, "nativeSimulate", false),
+                });
             }
             // Tipo desconhecido (versão futura do Estúdio): filhos continuam visíveis.
             _ => {
@@ -874,6 +886,15 @@ impl AssetState {
         }
         if let Some(t) = layer.get_mut("text") {
             self.field(t, "font_path");
+        }
+        if let Some(list) = layer.pointer_mut("/shader/textures").and_then(Value::as_array_mut) {
+            for tex in list.iter_mut() {
+                if let Some(p) = tex.as_str().filter(|s| !s.trim().is_empty()).map(str::to_string) {
+                    if let Some(resolved) = self.resolve(&p) {
+                        *tex = Value::String(resolved);
+                    }
+                }
+            }
         }
         if let Some(cfg) = layer.get_mut("scene3d") {
             self.field(cfg, "modelSrc");

@@ -1733,15 +1733,19 @@ impl NativeApp {
                 .and_then(|s| s.ui_scale(sw as f32, sh as f32))
                 .unwrap_or(output.scale);
             let status = match renderer.as_deref_mut() {
-                Some(r) => r.render(
-                    gpu,
-                    &mut output.surface,
-                    &mut output.canvas,
-                    &output.monitor_id,
-                    ui_scale,
-                    &self.ctx,
-                    color,
-                ),
+                Some(r) => {
+                    // Efeitos Espectro: cursor/clique no monitor desta saída.
+                    r.set_output_origin(&output.monitor_id, output.origin);
+                    r.render(
+                        gpu,
+                        &mut output.surface,
+                        &mut output.canvas,
+                        &output.monitor_id,
+                        ui_scale,
+                        &self.ctx,
+                        color,
+                    )
+                }
                 None => output.surface.clear(gpu, color),
             };
             match status {

@@ -4,6 +4,11 @@
 // prelúdio pré-multiplica). Parâmetros são declarados em comentários e viram controles no Studio:
 //   //@param forca: float = 0.1 range(0, 1) label("Força")   → `params.forca` no WGSL (nome ASCII)
 // Tipos: float (f32) · vec2 (vec2f) · color (vec4f, "#rrggbb[aa]") · bool (f32 0/1).
+// Texturas do usuário (até 4): //@texture ruido label("Ruído") → `tex_ruido(uv)` e `tex_ruido_size()`.
+// Memória entre quadros: `sample_previous(uv)` devolve o quadro anterior do próprio efeito.
+// Simulação: definir `fn simulate(uv: vec2f) -> vec4f` cria um buffer de estado (rgba16float) que
+// roda antes do efeito; `sample_state(uv)` lê o estado anterior dentro de `simulate` e o estado novo
+// dentro de `effect` (água, fluidos, jogo da vida, partículas em grade...).
 // O Studio monta o WGSL completo (`buildEspectroShader`) e o motor nativo recebe esse mesmo texto
 // pronto (`nativeWgsl`) + os parâmetros já empacotados (`nativeParams`), então o layout dos
 // uniforms vive só aqui.
@@ -31,23 +36,48 @@ export interface EspectroEffect {
   code: string;
   /** Valores escolhidos no Studio; parâmetro ausente usa o default do `//@param`. */
   params: Record<string, EspectroParamValue>;
+  /** Imagens das declarações `//@texture` (caminho local em `customSrc`, como as texturas do 3D). */
+  textures?: EspectroTextureRef[];
   /** Preenchidos só ao aplicar no motor nativo (`withNativeAssets`). */
   nativeWgsl?: string;
   nativeParams?: number[];
+  /** Caminho de cada slot `prism_tex0..3` ("" = vazio). */
+  nativeTextures?: string[];
+  /** O código usa `sample_previous`: o motor guarda o quadro anterior. */
+  nativeFeedback?: boolean;
+  /** O código define `simulate`: o motor roda o passe de estado (`prism_sim`). */
+  nativeSimulate?: boolean;
+}
+
+export interface EspectroTextureRef {
+  name: string;
+  customSrc: string;
+}
+
+export interface EspectroTextureDef {
+  name: string;
+  label: string;
+  /** Slot `prism_texN` (0..3). */
+  slot: number;
 }
 
 export const PRISMFX_FORMAT = "prismfx";
-export const PRISMFX_VERSION = 1;
+export const PRISMFX_VERSION = 2;
+export const ESPECTRO_MAX_TEXTURES = 4;
 export const ESPECTRO_MAX_PARAMS = 32;
 export const ESPECTRO_MAX_CODE_CHARS = 64 * 1024;
 
 /** Tamanho do uniform `prism` (PrismGlobals) em floats; o motor Rust usa o mesmo número. */
-export const ESPECTRO_GLOBALS_FLOATS = 24;
+export const ESPECTRO_GLOBALS_FLOATS = 36;
 
 /**
  * Prelúdio comum (Studio WebGPU e motor wgpu). Layout de `PrismGlobals` (bytes):
  * 0 resolution · 8 time · 12 delta · 16 cursor · 24 frame_size · 32 layer_rect · 48 backdrop_rect
- * · 64 audio (level, bass, mid, treble) · 80 beat · 84 battery · 88 has_backdrop · 92 backdrop_opaque → 96.
+ * · 64 audio (level, bass, mid, treble) · 80 beat · 84 battery · 88 has_backdrop · 92 backdrop_opaque
+ * · 96 click (uv do último clique) · 104 click_age (s; 1e6 = nenhum) · 108 frame
+ * · 112 input (mouse_down, key_pulse, typing_energy, idle_s) · 128 media (playing, progress, has_session, 0) → 144.
+ * Bindings: 0 prism · 1 backdrop · 2 sampler (clamp) · 3 params · 4 quadro anterior · 5..8 texturas
+ * · 9 sampler (repeat) · 10 estado da simulação.
  */
 export const ESPECTRO_PRELUDE = `// ── Prelúdio Espectro (PrismView) ──
 struct PrismGlobals {
@@ -63,10 +93,22 @@ struct PrismGlobals {
   battery: f32,
   has_backdrop: f32,
   backdrop_opaque: f32,
+  click: vec2f,
+  click_age: f32,
+  frame: f32,
+  input: vec4f,
+  media: vec4f,
 };
 @group(0) @binding(0) var<uniform> prism: PrismGlobals;
 @group(0) @binding(1) var prism_backdrop: texture_2d<f32>;
 @group(0) @binding(2) var prism_sampler: sampler;
+@group(0) @binding(4) var prism_prev: texture_2d<f32>;
+@group(0) @binding(5) var prism_tex0: texture_2d<f32>;
+@group(0) @binding(6) var prism_tex1: texture_2d<f32>;
+@group(0) @binding(7) var prism_tex2: texture_2d<f32>;
+@group(0) @binding(8) var prism_tex3: texture_2d<f32>;
+@group(0) @binding(9) var prism_repeat: sampler;
+@group(0) @binding(10) var prism_state: texture_2d<f32>;
 
 fn frame_uv(uv: vec2f) -> vec2f {
   return prism.layer_rect.xy + uv * prism.layer_rect.zw;
@@ -79,6 +121,18 @@ fn sample_backdrop(uv: vec2f) -> vec4f {
     c.a = 1.0;
   }
   return c;
+}
+// Quadro anterior deste efeito (cor final pré-multiplicada; transparente no 1º quadro).
+fn sample_previous(uv: vec2f) -> vec4f {
+  return textureSampleLevel(prism_prev, prism_sampler, uv, 0.0);
+}
+// Estado da simulação (anterior dentro de \`simulate\`, atual dentro de \`effect\`).
+fn sample_state(uv: vec2f) -> vec4f {
+  return textureSampleLevel(prism_state, prism_sampler, uv, 0.0);
+}
+// Um pixel do efeito em uv (para vizinhança em simulações).
+fn pixel() -> vec2f {
+  return 1.0 / max(prism.resolution, vec2f(1.0));
 }
 fn hash21(p: vec2f) -> f32 {
   var q = fract(p * vec2f(123.34, 456.21));
@@ -113,11 +167,17 @@ struct PrismVsOut {
 }
 `;
 
+const ESPECTRO_SIM_ENTRY = `@fragment fn prism_sim(v: PrismVsOut) -> @location(0) vec4f {
+  return simulate(v.uv);
+}
+`;
+
 const PARAM_RE =
   /^\s*\/\/@param\s+([A-Za-z][A-Za-z0-9_]*)\s*:\s*(float|vec2|color|bool)\b\s*(?:=\s*("[^"]*"|#[0-9a-fA-F]{6,8}|[-+0-9.eE]+\s*,\s*[-+0-9.eE]+|[-+0-9.eE]+|true|false))?(.*)$/u;
 
 export interface EspectroParseResult {
   params: EspectroParamDef[];
+  textures: EspectroTextureDef[];
   /** Linhas `//@param` com problema (1-based no código do usuário). */
   errors: { line: number; message: string }[];
   /** Bytes do uniform `params` (múltiplo de 16, mínimo 16). */
@@ -169,12 +229,27 @@ const SIZE_ALIGN: Record<EspectroParamType, [number, number]> = {
 /** Lê as declarações `//@param` e calcula o layout do uniform (regras de alinhamento do WGSL). */
 export function parseEspectroParams(code: string): EspectroParseResult {
   const params: EspectroParamDef[] = [];
+  const textures: EspectroTextureDef[] = [];
   const errors: EspectroParseResult["errors"] = [];
   const seen = new Set<string>();
   let offset = 0;
   const lines = code.split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+    if (line.includes("//@texture")) {
+      const t = line.match(TEXTURE_RE);
+      if (!t) {
+        errors.push({ line: i + 1, message: 'Declaração inválida. Use: //@texture ruido label("Ruído")' });
+      } else if (seen.has(t[1])) {
+        errors.push({ line: i + 1, message: `Nome "${t[1]}" repetido.` });
+      } else if (textures.length >= ESPECTRO_MAX_TEXTURES) {
+        errors.push({ line: i + 1, message: `Máximo de ${ESPECTRO_MAX_TEXTURES} texturas.` });
+      } else {
+        seen.add(t[1]);
+        textures.push({ name: t[1], label: t[2]?.match(/\blabel\(\s*"([^"]*)"\s*\)/)?.[1] ?? t[1], slot: textures.length });
+      }
+      continue;
+    }
     if (!line.includes("//@param")) continue;
     const m = line.match(PARAM_RE);
     if (!m) {
@@ -211,7 +286,22 @@ export function parseEspectroParams(code: string): EspectroParseResult {
     offset += size;
   }
   const paramsSize = Math.max(16, Math.ceil(offset / 16) * 16);
-  return { params, errors, paramsSize };
+  return { params, textures, errors, paramsSize };
+}
+
+const TEXTURE_RE = /^\s*\/\/@texture\s+([A-Za-z][A-Za-z0-9_]*)\b(.*)$/;
+
+/** O código define o passe de simulação. */
+export function usesSimulation(code: string): boolean {
+  return /\bfn\s+simulate\s*\(/.test(code);
+}
+
+/** Formato do buffer de estado (motor e Studio). */
+export const ESPECTRO_STATE_FORMAT = "rgba16float";
+
+/** O código lê o quadro anterior (o motor só guarda a cópia quando precisa). */
+export function usesPrevious(code: string): boolean {
+  return /\bsample_previous\s*\(/.test(code);
 }
 
 const WGSL_TYPE: Record<EspectroParamType, string> = {
@@ -233,11 +323,19 @@ export function buildEspectroShader(code: string, parse = parseEspectroParams(co
   const fields = parse.params.length
     ? parse.params.map((p) => `  ${p.name}: ${WGSL_TYPE[p.type]},`).join("\n")
     : "  _unused: vec4f,";
+  const texFns = parse.textures
+    .map(
+      (t) =>
+        `fn tex_${t.name}(uv: vec2f) -> vec4f {\n  return textureSampleLevel(prism_tex${t.slot}, prism_repeat, uv, 0.0);\n}\n` +
+        `fn tex_${t.name}_size() -> vec2f {\n  return vec2f(textureDimensions(prism_tex${t.slot}));\n}\n`
+    )
+    .join("");
   const head =
     `${ESPECTRO_PRELUDE}\nstruct PrismParams {\n${fields}\n};\n` +
-    `@group(0) @binding(3) var<uniform> params: PrismParams;\n// ── Código do usuário ──\n`;
+    `@group(0) @binding(3) var<uniform> params: PrismParams;\n${texFns}// ── Código do usuário ──\n`;
   const userLineStart = head.split("\n").length;
-  return { wgsl: head + code + "\n" + ESPECTRO_ENTRY, userLineStart, parse };
+  const sim = usesSimulation(code) ? ESPECTRO_SIM_ENTRY : "";
+  return { wgsl: head + code + "\n" + ESPECTRO_ENTRY + sim, userLineStart, parse };
 }
 
 function clampNum(v: number, def: EspectroParamDef): number {
@@ -294,18 +392,52 @@ export function withNativeEspectro(effect: EspectroEffect): EspectroEffect {
   const build = buildEspectroShader(effect.code);
   const packed = new Float32Array(build.parse.paramsSize / 4);
   packEspectroParams(build.parse, effect.params, packed);
-  return { ...effect, nativeWgsl: build.wgsl, nativeParams: Array.from(packed) };
+  const nativeTextures = Array.from({ length: ESPECTRO_MAX_TEXTURES }, () => "");
+  for (const t of build.parse.textures) {
+    nativeTextures[t.slot] = effect.textures?.find((x) => x.name === t.name)?.customSrc ?? "";
+  }
+  return {
+    ...effect,
+    nativeWgsl: build.wgsl,
+    nativeParams: Array.from(packed),
+    nativeTextures,
+    nativeFeedback: usesPrevious(effect.code),
+    nativeSimulate: usesSimulation(effect.code),
+  };
+}
+
+/** Caminho da imagem escolhida para a textura `name` ("" = nenhuma). */
+export function textureSrc(effect: EspectroEffect, name: string): string {
+  return effect.textures?.find((t) => t.name === name)?.customSrc ?? "";
+}
+
+export function setTextureSrc(effect: EspectroEffect, name: string, src: string): EspectroEffect {
+  const rest = (effect.textures ?? []).filter((t) => t.name !== name);
+  return { ...effect, textures: src ? [...rest, { name, customSrc: src }] : rest };
 }
 
 // ── Arquivo .prismfx ──
 
+/** Textura embutida no `.prismfx` (o arquivo leva as imagens; importar grava de volta no disco). */
+export interface PrismFxTexture {
+  name: string;
+  fileName: string;
+  /** `data:image/...;base64,...` */
+  dataUrl: string;
+}
+
 export interface PrismFxFile {
   format: typeof PRISMFX_FORMAT;
   version: number;
-  effect: Pick<EspectroEffect, "name" | "author" | "description" | "code" | "params">;
+  effect: Pick<EspectroEffect, "name" | "author" | "description" | "code" | "params"> & {
+    textures?: PrismFxTexture[];
+  };
 }
 
-export function serializePrismFx(effect: EspectroEffect): string {
+/** Limite do `.prismfx` (código + imagens em base64). */
+export const PRISMFX_MAX_BYTES = 24 * 1024 * 1024;
+
+export function serializePrismFx(effect: EspectroEffect, textures: PrismFxTexture[] = []): string {
   const file: PrismFxFile = {
     format: PRISMFX_FORMAT,
     version: PRISMFX_VERSION,
@@ -315,13 +447,24 @@ export function serializePrismFx(effect: EspectroEffect): string {
       description: effect.description,
       code: effect.code,
       params: effect.params,
+      textures: textures.length ? textures : undefined,
     },
   };
   return JSON.stringify(file, null, 2);
 }
 
+export interface ParsedPrismFx {
+  effect: EspectroEffect;
+  /** Imagens a gravar no disco; o chamador preenche `effect.textures` com os caminhos. */
+  textures: PrismFxTexture[];
+}
+
 /** Lê um `.prismfx`; lança `Error` com mensagem para o usuário se o arquivo não servir. */
 export function parsePrismFx(text: string): EspectroEffect {
+  return parsePrismFxFull(text).effect;
+}
+
+export function parsePrismFxFull(text: string): ParsedPrismFx {
   let data: unknown;
   try {
     data = JSON.parse(text);
@@ -346,12 +489,28 @@ export function parsePrismFx(text: string): EspectroEffect {
       }
     }
   }
+  const textures: PrismFxTexture[] = [];
+  for (const t of Array.isArray(e.textures) ? e.textures.slice(0, ESPECTRO_MAX_TEXTURES) : []) {
+    if (
+      t &&
+      typeof t.name === "string" &&
+      /^[A-Za-z][A-Za-z0-9_]*$/.test(t.name) &&
+      typeof t.dataUrl === "string" &&
+      /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(t.dataUrl)
+    ) {
+      const fileName = typeof t.fileName === "string" ? t.fileName.replace(/[^\w.-]+/g, "_").slice(0, 80) : `${t.name}.png`;
+      textures.push({ name: t.name, fileName, dataUrl: t.dataUrl });
+    }
+  }
   return {
-    name: typeof e.name === "string" && e.name.trim() ? e.name.trim().slice(0, 80) : "Efeito importado",
-    author: typeof e.author === "string" ? e.author.slice(0, 80) : undefined,
-    description: typeof e.description === "string" ? e.description.slice(0, 400) : undefined,
-    code: e.code,
-    params,
+    effect: {
+      name: typeof e.name === "string" && e.name.trim() ? e.name.trim().slice(0, 80) : "Efeito importado",
+      author: typeof e.author === "string" ? e.author.slice(0, 80) : undefined,
+      description: typeof e.description === "string" ? e.description.slice(0, 400) : undefined,
+      code: e.code,
+      params,
+    },
+    textures,
   };
 }
 
@@ -444,6 +603,136 @@ fn effect(uv: vec2f) -> vec4f {
   let g = sample_backdrop(uv).g;
   let b = sample_backdrop(uv - dir).b;
   return vec4f(r, g, b, 1.0);
+}
+`,
+  },
+  {
+    id: "light-trail",
+    name: "Rastro de luz",
+    description: "O mouse deixa um rastro brilhante que some devagar (memória entre quadros).",
+    code: `//@param decay: float = 0.94 range(0.8, 0.995) label("Duração do rastro")
+//@param size: float = 0.035 range(0.005, 0.2) label("Tamanho do pincel")
+//@param color: color = #7cc8ff label("Cor")
+
+// O efeito é transparente: o wallpaper continua visível por baixo do rastro.
+fn effect(uv: vec2f) -> vec4f {
+  let aspect = prism.resolution.x / max(prism.resolution.y, 1.0);
+  let d = length((uv - prism.cursor) * vec2f(aspect, 1.0));
+  let brush = smoothstep(params.size, 0.0, d);
+  let trail = sample_previous(uv).a * params.decay;
+  let a = max(trail, brush);
+  let hue = 0.5 + 0.5 * sin(prism.time + uv.x * 3.0);
+  return vec4f(mix(params.color.rgb, vec3f(1.0, 0.6, 0.9), hue * 0.35), a);
+}
+`,
+  },
+  {
+    id: "water",
+    name: "Água interativa",
+    description: "Superfície de água simulada: clique, segure o mouse ou deixe chover.",
+    code: `//@param damping: float = 0.985 range(0.9, 0.999) label("Duração das ondas")
+//@param brush: float = 0.02 range(0.005, 0.08) label("Tamanho do toque")
+//@param rain: float = 0.3 range(0, 1) label("Chuva")
+//@param refraction: float = 0.08 range(0, 0.3) label("Refração")
+
+// Estado: r = altura, g = velocidade. Roda antes de effect() a cada quadro.
+fn simulate(uv: vec2f) -> vec4f {
+  let px = pixel();
+  let s = sample_state(uv);
+  let n = sample_state(uv + vec2f(px.x, 0.0)).r + sample_state(uv - vec2f(px.x, 0.0)).r +
+          sample_state(uv + vec2f(0.0, px.y)).r + sample_state(uv - vec2f(0.0, px.y)).r;
+  var vel = (s.g + (n * 0.25 - s.r) * 1.6) * params.damping;
+  var h = s.r + vel;
+  let aspect = prism.resolution.x / max(prism.resolution.y, 1.0);
+  let touch = smoothstep(params.brush, 0.0, length((uv - prism.cursor) * vec2f(aspect, 1.0)));
+  h += touch * prism.input.x * 0.4;
+  let clicked = select(0.0, 1.0, prism.click_age < 0.05);
+  h += smoothstep(params.brush * 2.0, 0.0, length((uv - prism.click) * vec2f(aspect, 1.0))) * clicked;
+  let cell = floor(uv * 40.0);
+  let t = floor(prism.time * 8.0);
+  let drop = step(1.0 - params.rain * 0.004, hash21(cell + t * 1.37));
+  h += drop * smoothstep(0.012, 0.0, length((fract(uv * 40.0) - 0.5) / 40.0)) * 0.6;
+  return vec4f(clamp(h, -2.0, 2.0), clamp(vel, -2.0, 2.0), 0.0, 1.0);
+}
+
+fn effect(uv: vec2f) -> vec4f {
+  let px = pixel() * 2.0;
+  let hx = sample_state(uv + vec2f(px.x, 0.0)).r - sample_state(uv - vec2f(px.x, 0.0)).r;
+  let hy = sample_state(uv + vec2f(0.0, px.y)).r - sample_state(uv - vec2f(0.0, px.y)).r;
+  let n = vec2f(hx, hy);
+  let col = sample_backdrop(uv + n * params.refraction).rgb;
+  let spec = pow(clamp(dot(normalize(vec3f(-n * 6.0, 1.0)), normalize(vec3f(0.4, -0.6, 1.0))), 0.0, 1.0), 60.0);
+  return vec4f(col + spec * 0.5, 1.0);
+}
+`,
+  },
+  {
+    id: "life",
+    name: "Jogo da vida",
+    description: "Autômato celular de Conway por cima do fundo. Segure o mouse para semear.",
+    code: `//@param cell: float = 8 range(2, 24) label("Tamanho da célula (px)")
+//@param speed: float = 12 range(1, 60) label("Gerações por segundo")
+//@param color: color = #9dffb0 label("Cor das células")
+
+fn grid() -> vec2f {
+  return floor(prism.resolution / params.cell);
+}
+fn cell_center(uv: vec2f) -> vec2f {
+  let g = grid();
+  return (floor(uv * g) + 0.5) / g;
+}
+
+// r = viva (0/1), g = tempo acumulado até a próxima geração.
+fn simulate(uv: vec2f) -> vec4f {
+  let g = grid();
+  let c = cell_center(uv);
+  let s = sample_state(c);
+  if (prism.frame < 2.0) {
+    return vec4f(step(0.78, hash21(floor(uv * g) + 0.37)), 0.0, 0.0, 1.0);
+  }
+  var alive = step(0.5, s.r);
+  let aspect = prism.resolution.x / max(prism.resolution.y, 1.0);
+  let near_mouse = step(length((c - prism.cursor) * vec2f(aspect, 1.0)), 0.03) * prism.input.x;
+  var acc = s.g + prism.delta * params.speed;
+  if (acc >= 1.0) {
+    acc -= 1.0;
+    var count = 0.0;
+    for (var y = -1; y <= 1; y++) {
+      for (var x = -1; x <= 1; x++) {
+        if (x != 0 || y != 0) {
+          count += step(0.5, sample_state(c + vec2f(f32(x), f32(y)) / g).r);
+        }
+      }
+    }
+    alive = select(select(0.0, 1.0, count == 3.0), select(0.0, 1.0, count == 2.0 || count == 3.0), alive > 0.5);
+  }
+  return vec4f(max(alive, near_mouse), min(acc, 1.0), 0.0, 1.0);
+}
+
+fn effect(uv: vec2f) -> vec4f {
+  let alive = step(0.5, sample_state(cell_center(uv)).r);
+  let f = fract(uv * grid());
+  let inner = step(0.08, f.x) * step(0.08, f.y);
+  let bg = sample_backdrop(uv).rgb * 0.55;
+  return vec4f(mix(bg, params.color.rgb, alive * inner), 1.0);
+}
+`,
+  },
+  {
+    id: "living-texture",
+    name: "Textura viva",
+    description: "Uma imagem sua escorrendo por cima do fundo, distorcida por ruído.",
+    code: `//@texture padrao label("Imagem")
+//@param scale: float = 2 range(0.25, 8) label("Repetição")
+//@param flow: float = 0.06 range(0, 0.3) label("Distorção")
+//@param amount: float = 0.6 range(0, 1) label("Mistura")
+
+// Sem imagem escolhida a textura é branca: escolha uma em Texturas, logo abaixo.
+fn effect(uv: vec2f) -> vec4f {
+  let n = vec2f(noise2(uv * 4.0 + prism.time * 0.2), noise2(uv * 4.0 - prism.time * 0.17)) - 0.5;
+  let t = tex_padrao(uv * params.scale + n * params.flow + vec2f(0.0, prism.time * 0.02));
+  let bg = sample_backdrop(uv + n * 0.01);
+  return vec4f(mix(bg.rgb, t.rgb, t.a * params.amount), 1.0);
 }
 `,
   },

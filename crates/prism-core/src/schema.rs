@@ -542,6 +542,15 @@ pub struct ShaderEffect {
     pub wgsl: String,
     #[serde(default)]
     pub params: Vec<f32>,
+    /// Imagens dos slots `prism_tex0..3` (caminho local; "" = vazio → branco).
+    #[serde(default)]
+    pub textures: Vec<String>,
+    /// O efeito lê `sample_previous`: guardar o quadro anterior.
+    #[serde(default)]
+    pub feedback: bool,
+    /// O efeito define `simulate`: passe de estado `prism_sim` antes do efeito.
+    #[serde(default)]
+    pub simulate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

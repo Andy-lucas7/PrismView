@@ -11,7 +11,11 @@ import {
   packEspectroParams,
   parseEspectroParams,
   parsePrismFx,
+  parsePrismFxFull,
   serializePrismFx,
+  setTextureSrc,
+  usesPrevious,
+  usesSimulation,
   withNativeEspectro,
 } from "../src/types/prismEspectro.ts";
 
@@ -89,6 +93,48 @@ test(".prismfx ida e volta", () => {
   assert.throws(() => parsePrismFx("{}"), /não é um efeito/);
   assert.throws(() => parsePrismFx("nope"), /corrompido/);
   assert.throws(() => parsePrismFx(JSON.stringify({ format: "prismfx", version: 99, effect: src })), /mais nova/);
+});
+
+test("texturas viram slots e helpers tex_NOME", () => {
+  const code = [
+    '//@texture ruido label("Ruído")',
+    "//@texture mapa",
+    "fn effect(uv: vec2f) -> vec4f { return tex_ruido(uv) * tex_mapa(uv); }",
+  ].join("\n");
+  const p = parseEspectroParams(code);
+  assert.deepEqual(p.textures.map((t) => [t.name, t.slot, t.label]), [["ruido", 0, "Ruído"], ["mapa", 1, "mapa"]]);
+  assert.match(buildEspectroShader(code).wgsl, /fn tex_mapa\(uv: vec2f\) -> vec4f \{\n {2}return textureSampleLevel\(prism_tex1/);
+  const fx = setTextureSrc({ name: "t", code, params: {} }, "mapa", "C:/a.png");
+  assert.deepEqual(withNativeEspectro(fx).nativeTextures, ["", "C:/a.png", "", ""]);
+  const five = Array.from({ length: 5 }, (_, i) => `//@texture t${i}`).join("\n");
+  assert.equal(parseEspectroParams(five).errors.length, 1, "máximo de 4");
+});
+
+test("memória e simulação só quando o código usa", () => {
+  const plain = "fn effect(uv: vec2f) -> vec4f { return vec4f(1.0); }";
+  const sim =
+    "fn simulate(uv: vec2f) -> vec4f { return sample_state(uv); }\nfn effect(uv: vec2f) -> vec4f { return sample_previous(uv); }";
+  assert.equal(usesPrevious(plain), false);
+  assert.equal(usesSimulation(plain), false);
+  assert.equal(usesPrevious(sim), true);
+  assert.equal(usesSimulation(sim), true);
+  assert.doesNotMatch(buildEspectroShader(plain).wgsl, /prism_sim/);
+  assert.match(buildEspectroShader(sim).wgsl, /@fragment fn prism_sim/);
+  const n = withNativeEspectro({ name: "s", code: sim, params: {} });
+  assert.equal(n.nativeFeedback, true);
+  assert.equal(n.nativeSimulate, true);
+});
+
+test(".prismfx leva texturas embutidas e rejeita data URL estranha", () => {
+  const png = "data:image/png;base64,iVBORw0KGgo=";
+  const text = serializePrismFx({ name: "T", code: "fn effect(uv: vec2f) -> vec4f { return vec4f(1.0); }", params: {} }, [
+    { name: "ruido", fileName: "r.png", dataUrl: png },
+  ]);
+  const back = parsePrismFxFull(text);
+  assert.equal(back.textures.length, 1);
+  assert.equal(back.textures[0].dataUrl, png);
+  const evil = text.replace(png, "data:text/html;base64,PHNjcmlwdD4=");
+  assert.equal(parsePrismFxFull(evil).textures.length, 0);
 });
 
 test("fixture do motor em dia com os modelos", () => {

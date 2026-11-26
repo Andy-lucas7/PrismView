@@ -1152,6 +1152,9 @@ export const UnifiedCompositor: React.FC<UnifiedCompositorProps> = ({
               powerState={powerState}
               reactiveSignalRef={reactiveSignalRef}
               batteryPercent={telemetry.battery_percent}
+              mediaPlaying={Boolean(telemetry.media.playing)}
+              mediaProgress={computeLiveMediaProgress(telemetry.media, now.getTime()).ratio}
+              mediaHasSession={Boolean(telemetry.media.title || telemetry.media.artist)}
             />
           </Suspense>
         )}

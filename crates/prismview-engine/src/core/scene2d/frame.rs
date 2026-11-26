@@ -946,11 +946,26 @@ impl Frame<'_> {
             }
             None => (None, [0.0, 0.0, 1.0, 1.0], false),
         };
+        // Imagens do usuário (`//@texture`): decodificadas em segundo plano pelo cache de imagens;
+        // enquanto carregam o slot fica branco e `poll_images` refaz a lista quando chegam.
+        let mut textures = [None; MAX_TEXTURES];
+        for (slot, raw) in textures.iter_mut().zip(effect.textures.iter()) {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            if let Some(path) = self.resolve_asset(raw) {
+                *slot = self
+                    .images
+                    .get(&path, (self.vw as u32, self.vh as u32), self.compositor, self.device, self.queue)
+                    .map(|img| img.id);
+            }
+        }
         let placement = EspectroPlacement {
             layer_rect,
             backdrop_rect,
             backdrop,
             backdrop_opaque,
+            textures,
         };
         let px = (w.round().max(1.0) as u32, h.round().max(1.0) as u32);
         let Some(espectro) = self.espectro.as_deref_mut() else {
@@ -964,6 +979,7 @@ impl Frame<'_> {
             &layer.id,
             effect,
             px,
+            (vw, vh),
             placement,
         ) else {
             return;

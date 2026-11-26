@@ -41,7 +41,7 @@ use prism_core::schema::{
     TouchActionType, VisibilityCondition,
 };
 
-use super::espectro::{EspectroPlacement, EspectroRenderer};
+use super::espectro::{EspectroPlacement, EspectroRenderer, MAX_TEXTURES};
 use super::bindings::{LayerBindingSolver, LayerFx};
 use super::compositor::{
     BlendKind, BoundSubtree, Canvas, Compositor2D, GradientKind, QuadInstance, QuadKind,
@@ -405,6 +405,12 @@ impl SceneRenderer {
     /// Molas 2D ainda em movimento (o loop deve continuar desenhando).
     pub fn bindings_animating(&self) -> bool {
         self.layer_bindings.is_animating() || self.espectro.is_active()
+    }
+
+    /// Canto do monitor da saída `canvas_key` no desktop virtual: cursor/clique dos efeitos
+    /// Espectro em coordenadas daquele monitor.
+    pub fn set_output_origin(&mut self, canvas_key: &str, origin: (i32, i32)) {
+        self.espectro.set_output_origin(canvas_key, origin);
     }
 
     /// Erros de compilação de efeitos Espectro desde a última chamada: `(camada, mensagem)`.

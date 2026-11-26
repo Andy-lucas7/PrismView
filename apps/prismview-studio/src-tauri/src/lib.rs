@@ -969,6 +969,7 @@ pub fn run() {
             package::import_prism_archive,
             package::pick_local_file,
             espectro::export_prismfx,
+            espectro::save_espectro_texture,
             get_live_telemetry,
             media_control,
             set_studio_reactive_sensors,
