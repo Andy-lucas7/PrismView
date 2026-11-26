@@ -53,8 +53,19 @@ pub struct NativeHandles {
 /// DirectComposition + `DXGI_ALPHA_MODE_PREMULTIPLIED`) copia na GPU para o backbuffer e apresenta.
 /// Nunca há leitura para a CPU.
 pub trait ExternalPresenter {
+    /// Alvo de render do próprio presenter (textura que ele entrega ao compositor, importada no
+    /// wgpu): o quadro é desenhado direto nela e `present` não copia. Chamado após cada `resize`.
+    /// `None` = a superfície cria uma textura própria e `present` copia dela.
+    fn render_target(&mut self, _gpu: &GpuContext) -> Option<wgpu::Texture> {
+        None
+    }
+    /// Antes de gravar/submeter o quadro na fila do wgpu (ordena esperas/barreiras antes do
+    /// submit). `false` = pular este quadro.
+    fn begin_frame(&mut self, _gpu: &GpuContext) -> bool {
+        true
+    }
     /// `texture` acabou de ser renderizada (último uso: color target) e submetida na fila do
-    /// wgpu. Copia para o backbuffer da cadeia e apresenta.
+    /// wgpu. Entrega ao compositor (copiando, se não for o `render_target` do presenter).
     fn present(&mut self, gpu: &GpuContext, texture: &wgpu::Texture) -> FrameStatus;
     /// Novo tamanho dos buffers (px). `false` = cadeia inutilizável (refazer a janela).
     fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) -> bool;
@@ -357,6 +368,15 @@ impl WindowSurface {
                 }
                 *target = None;
                 gpu.take_uncaptured_error();
+                // Alvo do presenter (sem cópia por quadro) quando disponível.
+                if let Some(texture) = presenter.render_target(gpu) {
+                    if !gpu.take_uncaptured_error() {
+                        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        *target = Some((texture, view));
+                        self.stale = false;
+                        return true;
+                    }
+                }
                 let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("prismview_widget_target"),
                     size: wgpu::Extent3d {
@@ -438,6 +458,9 @@ impl WindowSurface {
             let Some((texture, view)) = target.as_ref() else {
                 return FrameStatus::Unavailable;
             };
+            if !presenter.begin_frame(gpu) {
+                return FrameStatus::Retry;
+            }
             let mut encoder = gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {

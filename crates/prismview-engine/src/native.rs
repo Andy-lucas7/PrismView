@@ -59,9 +59,10 @@ use crate::engine_core::scene2d::SceneRenderer;
 use crate::engine_core::scene3d::{Scene3dConfig, Scene3dOptions, Scene3dRenderer, Scene3dShared};
 use crate::engine_core::signals::{MediaText, SignalBus, SignalKind, SignalReader, SignalSnapshot};
 use crate::platform::windows::{
-    acquire_single_instance, log_file, open_studio, parse_tray_enabled, resolve_font_files,
+    acquire_single_instance, compositor_refresh_period, log_file, open_studio, parse_tray_enabled, resolve_font_files,
     run as run_loop, set_windows_desktop_wallpaper, trim_working_set, wallpaper_presenter,
     ControlFlow, HostConfig, LoopHandler, LoopProxy, MfVideoDecoder, SensorsConfig, TrayAction,
+    VideoOutputOptions,
     Win32DesktopHost, Win32SystemSensors,
 };
 use crate::platform::{
@@ -101,6 +102,9 @@ const MAX_SCENE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const SCENE3D_UNBOUND: u64 = u64::MAX;
 /// Intervalo mínimo entre quadros de widgets com molas em movimento (sem bloqueio de VSync).
 const WIDGET_MIN_FRAME: Duration = Duration::from_micros(8_333);
+/// Folga para molas/cursor esperarem o próximo quadro de vídeo/3D em vez de gerar um próprio:
+/// cobre vídeo de 50–60 FPS contra a cadência de 16 ms das molas.
+const FRAME_RIDE_SLACK: Duration = Duration::from_millis(4);
 
 /// Reaberturas de um vídeo com erro (1 s, 5 s, 30 s; depois desiste até a próxima cena).
 const VIDEO_RETRY_DELAYS: [Duration; 3] = [
@@ -112,6 +116,8 @@ const VIDEO_RETRY_DELAYS: [Duration; 3] = [
 /// Decoder de um arquivo de vídeo da cena.
 struct VideoSlot {
     path: PathBuf,
+    /// Resolução/FPS pedidos ao decoder (mudou = reabre).
+    options: VideoOutputOptions,
     decoder: MfVideoDecoder,
     paused: bool,
     /// Erro atual já registrado (log + status): não repetir a cada iteração.
@@ -150,6 +156,8 @@ struct NativeApp {
     scene: Option<PrismScene>,
     ctx: EvalContext,
     outputs: Vec<Output>,
+    /// Altura do monitor mais alto (px físicos): teto automático da decodificação de vídeo.
+    max_monitor_height: Option<u32>,
     clear_color: [f32; 4],
     dirty: bool,
     paused: bool,
@@ -315,6 +323,7 @@ impl NativeApp {
             scene: None,
             ctx: EvalContext::default(),
             outputs: Vec::new(),
+            max_monitor_height: None,
             clear_color: DEFAULT_CLEAR,
             dirty: false,
             paused: false,
@@ -380,6 +389,7 @@ impl NativeApp {
             self.drop_scene3d();
             return;
         };
+        let scale_cap = self.governor.caps().render_scale_cap;
         let Some(shared) = self.ensure_scene3d_infra() else {
             return;
         };
@@ -389,7 +399,7 @@ impl NativeApp {
         let proxy = self.proxy;
         if self.scene3d.is_none() {
             let mut scene3d = Scene3dRenderer::new(shared, gpu, Scene3dOptions::default());
-            scene3d.set_render_scale_cap(self.governor.caps().render_scale_cap);
+            scene3d.set_render_scale_cap(scale_cap);
             scene3d.set_msaa_cap(self.governor.caps().msaa);
             if let Some(proxy) = proxy {
                 scene3d.set_waker(Some(Arc::new(move || {
@@ -1282,8 +1292,23 @@ impl NativeApp {
             .as_ref()
             .map(SceneRenderer::video_sources)
             .unwrap_or_default();
+        // Automático: vídeo maior que o monitor mais alto é decodificado na altura dele.
+        let auto_max_height = self.max_monitor_height;
+        let wanted: Vec<(PathBuf, VideoOutputOptions)> = wanted
+            .into_iter()
+            .map(|(path, _background, playback)| {
+                let options = VideoOutputOptions {
+                    fps_limit: playback.fps_limit,
+                    height: playback.height,
+                    auto_max_height,
+                };
+                (path, options)
+            })
+            .collect();
         let same = wanted.len() == self.videos.len()
-            && wanted.iter().all(|(p, _)| self.videos.iter().any(|v| v.path == *p));
+            && wanted
+                .iter()
+                .all(|(p, o)| self.videos.iter().any(|v| v.path == *p && v.options == *o));
         if same {
             return;
         }
@@ -1291,7 +1316,7 @@ impl NativeApp {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
-        for (path, _background) in wanted {
+        for (path, options) in wanted {
             if !path.is_file() {
                 push_issue(&mut self.issues, None, format!("Vídeo não encontrado: {}", path.display()));
                 continue;
@@ -1302,6 +1327,7 @@ impl NativeApp {
                 continue;
             }
             decoder.set_looping(true);
+            decoder.set_output_options(options);
             if let Some(proxy) = self.proxy {
                 decoder.set_waker(Arc::new(move || {
                     proxy.wake();
@@ -1312,6 +1338,7 @@ impl NativeApp {
             match decoder.open_async(&path) {
                 Ok(()) => self.videos.push(VideoSlot {
                     path,
+                    options,
                     decoder,
                     paused: false,
                     error_reported: false,
@@ -1607,6 +1634,9 @@ impl NativeApp {
     fn rebuild_outputs(&mut self, host: &mut Win32DesktopHost) {
         self.release_gpu_resources(false);
         self.rebuild_at = None;
+        // Monitores/refresh podem ter mudado: teto de FPS = período de composição do DWM.
+        self.governor
+            .set_display_interval(compositor_refresh_period().unwrap_or(Duration::ZERO));
 
         if !self.wallpaper_wanted {
             // Só widgets: nenhuma janela no WorkerW (o fundo do Windows segue visível).
@@ -1629,6 +1659,8 @@ impl NativeApp {
                 (i.id.clone(), i.width, i.height, i.scale_factor, (i.x, i.y))
             })
             .collect();
+        // Antes do `ensure_renderer` (que abre os vídeos): resolução automática do vídeo.
+        self.max_monitor_height = monitors.iter().map(|m| m.2).max();
 
         let mut pending: Vec<(String, f32, (i32, i32), WindowSurface)> = Vec::with_capacity(monitors.len());
         for (monitor_id, width, height, scale, origin) in monitors {
@@ -2276,7 +2308,6 @@ impl LoopHandler for NativeApp {
             .unwrap_or(Duration::from_millis(16))
             .max(frame_interval)
             .max(Duration::from_millis(16));
-        let binding_at = bindings_moving.then(|| now + binding_cadence);
         let governor_at = self.governor.next_deadline(now);
         // Caixa 3D recém-construída por este render e 3D ainda sem quadro: volta já.
         let scene3d_at = scene3d_at.or_else(|| {
@@ -2285,6 +2316,14 @@ impl LoopHandler for NativeApp {
                 && self.scene3d_placement(host).is_some();
             pending.then(Instant::now)
         });
+        // Vídeo/3D já trazem quadros contínuos: se o próximo deles cai até ~1 cadência à frente,
+        // molas e cursor pegam carona nele (o `process_signals` daquela iteração lê o cursor e
+        // marca `dirty`). Sem isso, um quadro próprio do parallax caía entre dois quadros do vídeo
+        // (60 FPS de vídeo + mouse = ~78 quadros/s, cada um com cópia DComp e espera de compositor).
+        let continuous_at = [video_at, scene3d_at].into_iter().flatten().min();
+        let ride_continuous =
+            continuous_at.is_some_and(|at| at <= now + binding_cadence + FRAME_RIDE_SLACK);
+        let binding_at = (bindings_moving && !ride_continuous).then(|| now + binding_cadence);
         // Widgets: relógio, molas 2D, 3D pendente e retentativas (só os visíveis acordam o loop).
         let mut widget_at: Option<Instant> = widget3d_at;
         let mut push = |at: Instant| widget_at = Some(widget_at.map_or(at, |cur| cur.min(at)));
@@ -2319,6 +2358,7 @@ impl LoopHandler for NativeApp {
         // cursor exato continua sendo lido em `process_signals` no instante de cada quadro; ao
         // assentar, `MOUSE` volta imediatamente para `wake_mask` (0% CPU em repouso, <0,1ms wake).
         let frame_scheduled = scene3d_at.is_some()
+            || ride_continuous
             || binding_at.is_some()
             || throttle_at.is_some()
             || widget3d_at.is_some();

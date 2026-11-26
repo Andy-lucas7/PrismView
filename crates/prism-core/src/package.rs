@@ -418,6 +418,7 @@ pub fn import_package(
                 path: p_str,
                 muted: true,
                 loop_video: true,
+                playback: Default::default(),
             }
         } else {
             BackgroundSource::Image { path: p_str }
