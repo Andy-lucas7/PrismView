@@ -815,8 +815,8 @@ impl SceneRenderer {
         self.deps = FxEngine::collect_scene_dependencies(&scene, ctx);
         self.layer_bindings.set_specs(&scene.bindings);
         self.index_scene(&scene);
-        // Qualidade de reflexos: base da pirâmide do vidro relativa à resolução do monitor.
-        self.glass.set_resolution_scale(scene.quality.resolution_scale());
+        // Qualidade do vidro: base da pirâmide de desfoque relativa à resolução do monitor.
+        self.glass.set_resolution_scale(scene.glass_quality.resolution_scale());
         self.scene = Some(scene);
         self.clock_sec = ctx.now.timestamp();
         self.clock_min = self.clock_sec.div_euclid(60);

@@ -821,7 +821,7 @@ impl VideoPlayback {
     }
 }
 
-/// Qualidade de reflexos e luz (vidro e 3D) relativa à resolução do monitor.
+/// Qualidade relativa à resolução do monitor (vidro).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RenderQuality {
@@ -837,7 +837,7 @@ impl RenderQuality {
         *self == Self::Max
     }
 
-    /// Fração da resolução do monitor usada pelos passes de reflexo/luz.
+    /// Fração da resolução do monitor usada pela base do desfoque do vidro.
     pub fn resolution_scale(self) -> f32 {
         match self {
             Self::Low => 0.35,
@@ -983,9 +983,10 @@ pub struct PrismScene {
     /// vez do fator de DPI do monitor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_size: Option<[f32; 2]>,
-    /// Qualidade de reflexos/luz (vidro e 3D). `Max` = resolução cheia do monitor.
+    /// Qualidade do vidro (refração/desfoque) de toda a cena. `Max` = resolução cheia do monitor.
+    /// A qualidade do 3D é a `renderScale` da própria cena 3D.
     #[serde(default, skip_serializing_if = "RenderQuality::is_max")]
-    pub quality: RenderQuality,
+    pub glass_quality: RenderQuality,
 }
 
 fn default_scene_title() -> String {
@@ -1011,7 +1012,7 @@ impl Default for PrismScene {
             layers: Vec::new(),
             bindings: Vec::new(),
             logical_size: None,
-            quality: RenderQuality::Max,
+            glass_quality: RenderQuality::Max,
         }
     }
 }

@@ -184,12 +184,20 @@ export interface StudioInspectorProps {
   onFlushSave?: () => void;
 }
 
-/** Qualidade de reflexos/luz do desktop (`PrismProject.renderQuality`). */
-const RENDER_QUALITY_OPTIONS: { value: RenderQuality; label: string; title: string }[] = [
+/** Qualidade relativa à resolução do monitor (vidro: `PrismProject.glassQuality`; 3D: `renderScale`). */
+const GLASS_QUALITY_OPTIONS: { value: RenderQuality; label: string; title: string }[] = [
   { value: "LOW", label: "Baixa", title: "35% da resolução do monitor" },
   { value: "MEDIUM", label: "Média", title: "50% da resolução do monitor" },
   { value: "HIGH", label: "Alta", title: "75% da resolução do monitor" },
   { value: "MAX", label: "Máxima", title: "Resolução do monitor" },
+];
+
+/** Qualidade da luz/reflexos do 3D = `renderScale` (o motor não desce de 50%). */
+const LIGHT_QUALITY_OPTIONS: { scale: number; label: string; title: string }[] = [
+  { scale: 0.5, label: "Baixa", title: "50% da resolução do monitor" },
+  { scale: 0.7, label: "Média", title: "70% da resolução do monitor" },
+  { scale: 0.85, label: "Alta", title: "85% da resolução do monitor" },
+  { scale: 1, label: "Máxima", title: "Resolução do monitor" },
 ];
 
 export const StudioInspector: React.FC<StudioInspectorProps> = ({
@@ -627,37 +635,6 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
     return (
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
-        <div className="space-y-2 pb-3 border-b border-white/10">
-          <span className="block text-[11px] font-medium uppercase tracking-wider text-[#A1A1AA]">
-            Qualidade de reflexos e luz
-          </span>
-          <div className="grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Qualidade de reflexos e luz">
-            {RENDER_QUALITY_OPTIONS.map((q) => {
-              const active = (project.renderQuality ?? "MAX") === q.value;
-              return (
-                <button
-                  key={q.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  title={q.title}
-                  onClick={() =>
-                    onApplyDiscreteProject({
-                      ...project,
-                      renderQuality: q.value === "MAX" ? undefined : q.value,
-                    })
-                  }
-                  className={`py-1.5 rounded-xl text-[11px] ${active ? "prism-pill-active" : "prism-pill-idle"}`}
-                >
-                  {q.label}
-                </button>
-              );
-            })}
-          </div>
-          <p className="text-[11px] text-[#71717A]">
-            Vidro e 3D no desktop. Máxima = resolução do monitor.
-          </p>
-        </div>
         {isWidget && (
           <div className="space-y-3 pb-3 border-b border-white/10">
             <div className="space-y-2">
@@ -2568,6 +2545,29 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
                           </button>
                         ))}
                       </div>
+                      <div className="space-y-1.5">
+                        <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">
+                          Qualidade da luz e reflexos
+                        </span>
+                        <div className="grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Qualidade da luz e reflexos">
+                          {LIGHT_QUALITY_OPTIONS.map((q) => {
+                            const active = Math.abs(s3d.renderScale - q.scale) < 0.01;
+                            return (
+                              <button
+                                key={q.label}
+                                type="button"
+                                role="radio"
+                                aria-checked={active}
+                                title={q.title}
+                                onClick={() => patch3d((c) => ({ ...c, renderScale: q.scale }), "discrete")}
+                                className={`py-1.5 rounded-xl text-[11px] ${active ? "prism-pill-active" : "prism-pill-idle"}`}
+                              >
+                                {q.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
                       <InspectorSlider
                         label="Intensidade IBL"
                         value={s3d.envIntensity}
@@ -3627,6 +3627,39 @@ export const StudioInspector: React.FC<StudioInspectorProps> = ({
 
               {supportsFullGlass && anyGlassEnabled && (
                 <div className="space-y-3">
+                  {/* Qualidade do vidro no desktop (vale para todo o projeto: o desfoque é compartilhado) */}
+                  <div className="space-y-1.5">
+                    <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">
+                      Qualidade do vidro
+                    </span>
+                    <div className="grid grid-cols-4 gap-1.5" role="radiogroup" aria-label="Qualidade do vidro">
+                      {GLASS_QUALITY_OPTIONS.map((q) => {
+                        const active = (project.glassQuality ?? "MAX") === q.value;
+                        return (
+                          <button
+                            key={q.value}
+                            type="button"
+                            role="radio"
+                            aria-checked={active}
+                            title={q.title}
+                            onClick={() =>
+                              onApplyDiscreteProject({
+                                ...project,
+                                glassQuality: q.value === "MAX" ? undefined : q.value,
+                              })
+                            }
+                            className={`py-1.5 rounded-xl text-[11px] ${active ? "prism-pill-active" : "prism-pill-idle"}`}
+                          >
+                            {q.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-[#71717A]">
+                      Desfoque e refração no desktop, para todo o vidro do projeto. Máxima = resolução do monitor.
+                    </p>
+                  </div>
+
                   {/* 1-Click Optical Glass Presets */}
                   <div className="space-y-1.5">
                     <span className="block text-[10px] uppercase tracking-wider text-[#71717A]">

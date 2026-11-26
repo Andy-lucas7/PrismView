@@ -410,8 +410,8 @@ export interface PrismProject {
   };
   globals: GlobalVar[];
   layers: SceneLayer[];
-  /** Qualidade de reflexos/luz (vidro e 3D) no desktop. Ausente = MAX (resolução do monitor). */
-  renderQuality?: RenderQuality;
+  /** Qualidade do vidro no desktop (todo o projeto). Ausente = MAX (resolução do monitor). */
+  glassQuality?: RenderQuality;
 }
 
 export type RenderQuality = "LOW" | "MEDIUM" | "HIGH" | "MAX";

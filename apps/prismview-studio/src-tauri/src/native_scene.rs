@@ -130,10 +130,11 @@ pub fn project_to_scene(project: &Value) -> Result<Value, String> {
         "layers": out_layers,
         "logical_size": logical,
     });
-    // Qualidade de reflexos/luz (vidro e 3D); ausente = MAX (resolução do monitor).
-    let quality = text(project, "renderQuality").to_ascii_uppercase();
-    if matches!(quality.as_str(), "LOW" | "MEDIUM" | "HIGH") {
-        scene["quality"] = json!(quality);
+    // Qualidade do vidro (base do desfoque); ausente = MAX (resolução do monitor). O 3D usa a
+    // `renderScale` da própria cena 3D.
+    let glass_quality = text(project, "glassQuality").to_ascii_uppercase();
+    if matches!(glass_quality.as_str(), "LOW" | "MEDIUM" | "HIGH") {
+        scene["glass_quality"] = json!(glass_quality);
     }
     if !bindings.is_empty() {
         scene["bindings"] = Value::Array(bindings);
@@ -1381,7 +1382,7 @@ mod tests {
         assert_eq!(layers[0]["asset"], r"C:\c.mp4");
         assert_eq!(layers[0]["video"]["fps_limit"], 0.0);
         assert!(layers[0]["video"].get("height").is_none());
-        assert!(scene.get("quality").is_none());
+        assert!(scene.get("glass_quality").is_none());
         assert_eq!(layers[1]["kind"], "SVG");
         assert_eq!(layers[2]["id"], "play__playing");
         assert_eq!(layers[2]["visible"]["expr"], "$mi(playing)$");

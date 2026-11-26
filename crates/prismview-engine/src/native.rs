@@ -389,7 +389,7 @@ impl NativeApp {
             self.drop_scene3d();
             return;
         };
-        let scale_cap = self.scene3d_scale_cap();
+        let scale_cap = self.governor.caps().render_scale_cap;
         let Some(shared) = self.ensure_scene3d_infra() else {
             return;
         };
@@ -410,7 +410,6 @@ impl NativeApp {
             self.scene3d_bound_gen = SCENE3D_UNBOUND;
         }
         if let (Some(scene3d), Some(loader)) = (self.scene3d.as_mut(), self.loader.as_mut()) {
-            scene3d.set_render_scale_cap(scale_cap);
             scene3d.set_config(gpu, config, loader);
             scene3d.set_media_cover(gpu, &self.ctx.media.cover_path);
         }
@@ -1074,13 +1073,6 @@ impl NativeApp {
         self.scene3d.as_ref().is_some_and(Scene3dRenderer::has_formulas) || self.widgets.iter().any(WidgetRuntime::has_formulas)
     }
 
-    /// Teto da escala de render do 3D: o do governador limitado pela qualidade da cena
-    /// (`Max` = resolução do monitor).
-    fn scene3d_scale_cap(&self) -> f32 {
-        let quality = self.scene.as_ref().map_or(1.0, |s| s.quality.resolution_scale());
-        self.governor.caps().render_scale_cap.min(quality)
-    }
-
     /// Aplica a decisão do governador: pós-processamento, hibernação de VRAM, redesenho.
     fn apply_power(&mut self, update: GovernorUpdate) {
         if update.caps_changed {
@@ -1088,9 +1080,8 @@ impl NativeApp {
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_post_processing(caps.post_processing);
             }
-            let scale_cap = self.scene3d_scale_cap();
             if let Some(scene3d) = self.scene3d.as_mut() {
-                scene3d.set_render_scale_cap(scale_cap);
+                scene3d.set_render_scale_cap(caps.render_scale_cap);
                 scene3d.set_msaa_cap(caps.msaa);
             }
             for w in &mut self.widgets {
