@@ -94,7 +94,4 @@ cargo test -p prismview-engine    # motor nativo
 ## Licença
 
 O PrismView é software livre, sob a **GNU General Public License v3.0 ou posterior** ([LICENSE](LICENSE)).
-
-Em resumo: você pode usar, estudar, mudar e redistribuir. Se distribuir uma versão modificada, ela também precisa ser GPL e com o código aberto.
-
 As fontes incluídas (Outfit, Inter, JetBrains Mono) seguem a SIL Open Font License. Os decodificadores Draco/Basis em `public/decoders` seguem a Apache-2.0.
