@@ -343,6 +343,10 @@ export interface SceneLayer {
     volume: number;
     objectFit: "cover" | "contain";
     clipRadius: number;
+    /** Teto de FPS no desktop (0 = quadro parado). Ausente = o FPS do arquivo. */
+    fpsLimit?: number;
+    /** Altura de decodificação no desktop (px). Ausente = automática (monitor se o vídeo for maior). */
+    decodeHeight?: number;
   };
   image?: {
     src: string;
@@ -411,7 +415,11 @@ export interface PrismProject {
   };
   globals: GlobalVar[];
   layers: SceneLayer[];
+  /** Qualidade do vidro no desktop (todo o projeto). Ausente = MAX (resolução do monitor). */
+  glassQuality?: RenderQuality;
 }
+
+export type RenderQuality = "LOW" | "MEDIUM" | "HIGH" | "MAX";
 
 export interface LiveTelemetry {
   cpu_percent: number;

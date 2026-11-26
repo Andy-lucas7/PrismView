@@ -130,6 +130,12 @@ pub fn project_to_scene(project: &Value) -> Result<Value, String> {
         "layers": out_layers,
         "logical_size": logical,
     });
+    // Qualidade do vidro (base do desfoque); ausente = MAX (resolução do monitor). O 3D usa a
+    // `renderScale` da própria cena 3D.
+    let glass_quality = text(project, "glassQuality").to_ascii_uppercase();
+    if matches!(glass_quality.as_str(), "LOW" | "MEDIUM" | "HIGH") {
+        scene["glass_quality"] = json!(glass_quality);
+    }
     if !bindings.is_empty() {
         scene["bindings"] = Value::Array(bindings);
     }
@@ -216,6 +222,9 @@ impl Ctx {
                 node["kind"] = json!("VIDEO");
                 node["asset"] = json!(path);
                 node["corner_radius_px"] = json!(number(&v, "clipRadius", 0.0).max(0.0));
+                if let Some(playback) = video_playback(&v) {
+                    node["video"] = playback;
+                }
             }
             "PROGRESS" => {
                 let p = layer.get("progress").cloned().unwrap_or(Value::Null);
@@ -683,13 +692,30 @@ fn crystal(g: &Value) -> Value {
     })
 }
 
+/// `VideoPlayback` do motor a partir de `video.fpsLimit` / `video.decodeHeight` do Estúdio.
+/// `None` = tudo automático (FPS do arquivo; altura do monitor se o vídeo for maior).
+fn video_playback(v: &Value) -> Option<Value> {
+    let mut out = serde_json::Map::new();
+    if let Some(fps) = v.get("fpsLimit").and_then(Value::as_f64).filter(|f| f.is_finite() && *f >= 0.0) {
+        out.insert("fps_limit".into(), json!(fps.min(1000.0)));
+    }
+    if let Some(h) = v.get("decodeHeight").and_then(Value::as_u64).filter(|h| (2..=8192).contains(h)) {
+        out.insert("height".into(), json!(h));
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
 /// Fundo de mídia (`BackgroundSource`) de uma camada VIDEO/IMAGE com arquivo local.
 fn media_background(layer: &Value) -> Option<Value> {
     match kind(layer) {
         "VIDEO" => {
             let v = layer.get("video")?;
             let path = local_path(text(v, "src"))?;
-            Some(json!({ "type": "VIDEO", "path": path, "muted": boolean(v, "muted", true), "loop_video": true }))
+            let mut bg = json!({ "type": "VIDEO", "path": path, "muted": boolean(v, "muted", true), "loop_video": true });
+            if let Some(playback) = video_playback(v) {
+                bg["playback"] = playback;
+            }
+            Some(bg)
         }
         "IMAGE" => {
             let img = layer.get("image")?;
@@ -1400,8 +1426,8 @@ mod tests {
     fn video_svg_and_actions_never_block() {
         let project = json!({
             "id": "p", "packageType": "WALLPAPER", "layers": [
-                layer("v", "VIDEO", json!({ "width": 1920, "height": 1080, "video": { "src": r"C:\v.mp4", "muted": true } })),
-                layer("clip", "VIDEO", json!({ "video": { "src": r"C:\c.mp4", "clipRadius": 12 } })),
+                layer("v", "VIDEO", json!({ "width": 1920, "height": 1080, "video": { "src": r"C:\v.mp4", "muted": true, "fpsLimit": 24, "decodeHeight": 720 } })),
+                layer("clip", "VIDEO", json!({ "video": { "src": r"C:\c.mp4", "clipRadius": 12, "fpsLimit": 0 } })),
                 layer("play", "SVG", json!({ "clickAction": "MEDIA_PLAY_PAUSE",
                     "svg": { "iconName": "play", "customSvg": "", "color": "#FF0000", "strokeWidth": 1.6,
                              "resolvedSvg": "<svg viewBox=\"0 0 24 24\" fill=\"currentColor\"><polygon points=\"6 4 20 12 6 20\"/></svg>",
@@ -1412,9 +1438,14 @@ mod tests {
         });
         let scene = project_to_scene(&project).expect("nunca bloqueia");
         assert_eq!(scene["background"]["type"], "VIDEO");
+        assert_eq!(scene["background"]["playback"]["fps_limit"], 24.0);
+        assert_eq!(scene["background"]["playback"]["height"], 720);
         let layers = scene["layers"].as_array().expect("layers");
         assert_eq!(layers[0]["kind"], "VIDEO");
         assert_eq!(layers[0]["asset"], r"C:\c.mp4");
+        assert_eq!(layers[0]["video"]["fps_limit"], 0.0);
+        assert!(layers[0]["video"].get("height").is_none());
+        assert!(scene.get("glass_quality").is_none());
         assert_eq!(layers[1]["kind"], "SVG");
         assert_eq!(layers[2]["id"], "play__playing");
         assert_eq!(layers[2]["visible"]["expr"], "$mi(playing)$");

@@ -36,7 +36,7 @@ use ::windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice2, IDCompositionDesktopDevice, IDCompositionSurface, IDCompositionTarget,
     IDCompositionVisual2,
 };
-use ::windows::Win32::Graphics::Dwm::DwmFlush;
+use ::windows::Win32::Graphics::Dwm::{DwmFlush, DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use ::windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE, DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_SAMPLE_DESC,
@@ -75,6 +75,8 @@ pub struct DCompSurfacePresenter {
     list: ID3D12GraphicsCommandList,
     list_base: ID3D12CommandList,
     allocators: [ID3D12CommandAllocator; SLOTS],
+    /// Barreira de início de quadro (modo direto), um por slot como `allocators`.
+    pre_allocators: [ID3D12CommandAllocator; SLOTS],
     slot_values: [u64; SLOTS],
     frame: usize,
     /// Fence compartilhada: D3D12 sinaliza cópias (`v`), D3D11 sinaliza leituras (`v + 1`).
@@ -85,6 +87,10 @@ pub struct DCompSurfacePresenter {
     /// Última leitura concluída pelo D3D11 (o D3D12 espera antes de sobrescrever).
     read_done: u64,
     shared: Option<SharedTarget>,
+    /// O wgpu desenha direto em `shared` (sem `CopyResource` por quadro).
+    direct: bool,
+    /// `shared` já passou por um quadro do wgpu: ele o considera em `RENDER_TARGET`.
+    direct_used: bool,
     surface: Option<IDCompositionSurface>,
     visual: IDCompositionVisual2,
     _target: IDCompositionTarget,
@@ -197,6 +203,14 @@ impl DCompSurfacePresenter {
             let list: ID3D12GraphicsCommandList = device12
                 .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocators[0], None)
                 .map_err(|e| os_error("CreateCommandList", e))?;
+            let pre_allocators = [
+                device12
+                    .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .map_err(|e| os_error("CreateCommandAllocator", e))?,
+                device12
+                    .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .map_err(|e| os_error("CreateCommandAllocator", e))?,
+            ];
             list.Close().map_err(|e| os_error("CommandList::Close", e))?;
             let list_base: ID3D12CommandList = list.cast().map_err(|e| os_error("ID3D12CommandList", e))?;
             let fence_event = CreateEventW(None, false, false, None).map_err(|e| os_error("CreateEventW", e))?;
@@ -205,6 +219,7 @@ impl DCompSurfacePresenter {
                 list,
                 list_base,
                 allocators,
+                pre_allocators,
                 slot_values: [0; SLOTS],
                 frame: 0,
                 fence12,
@@ -213,6 +228,8 @@ impl DCompSurfacePresenter {
                 next_value: 1,
                 read_done: 0,
                 shared: None,
+                direct: false,
+                direct_used: false,
                 surface: None,
                 visual,
                 _target: target,
@@ -233,6 +250,8 @@ impl DCompSurfacePresenter {
     fn build_targets(&mut self, width: u32, height: u32) -> PlatformResult<()> {
         self.shared = None;
         self.surface = None;
+        self.direct = false;
+        self.direct_used = false;
         // SAFETY: descritores válidos; o handle NT é fechado após abrir no D3D12.
         unsafe {
             let desc = D3D11_TEXTURE2D_DESC {
@@ -296,48 +315,147 @@ impl DCompSurfacePresenter {
     }
 }
 
+impl DCompSurfacePresenter {
+    /// Grava `barriers` na lista com `allocator` e executa na fila do wgpu. `false` = falhou.
+    ///
+    /// SAFETY (chamador): o allocator não está em uso pela GPU (fence do slot concluída) e os
+    /// recursos das barreiras vivem até a fence do quadro concluir.
+    unsafe fn execute_barriers(&self, allocator: &ID3D12CommandAllocator, barriers: &[D3D12_RESOURCE_BARRIER]) -> bool {
+        if allocator.Reset().is_err() || self.list.Reset(allocator, None).is_err() {
+            return false;
+        }
+        self.list.ResourceBarrier(barriers);
+        if self.list.Close().is_err() {
+            return false;
+        }
+        self.queue.ExecuteCommandLists(&[Some(self.list_base.clone())]);
+        true
+    }
+}
+
 impl ExternalPresenter for DCompSurfacePresenter {
+    /// Importa a textura compartilhada no wgpu: o quadro é desenhado direto nela e só sobra a
+    /// cópia D3D11 → superfície DComp (a cópia D3D12 `CopyResource` por quadro some).
+    fn render_target(&mut self, gpu: &GpuContext) -> Option<wgpu::Texture> {
+        let shared = self.shared.as_ref()?;
+        let size = wgpu::Extent3d {
+            width: self.size.0,
+            height: self.size.1,
+            depth_or_array_layers: 1,
+        };
+        let desc = wgpu::TextureDescriptor {
+            label: Some("prismview_dcomp_shared_target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: crate::engine_core::gpu::EXTERNAL_SURFACE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+        // SAFETY: recurso do mesmo device (aberto do handle NT no `device12` do wgpu), criado em
+        // `build_targets` com o formato B8G8R8A8, tamanho, 1 mip e 1 amostra de `desc` e
+        // `BIND_RENDER_TARGET`. Estado inicial COMMON; as transições de/para COMMON em volta de
+        // cada quadro ficam em `begin_frame`/`present`.
+        let texture = unsafe {
+            let hal = wgpu::hal::dx12::Device::texture_from_raw(
+                shared.d3d12.clone(),
+                desc.format,
+                desc.dimension,
+                size,
+                1,
+                1,
+            );
+            gpu.device().create_texture_from_hal::<wgpu::hal::api::Dx12>(hal, &desc)
+        };
+        self.direct = true;
+        self.direct_used = false;
+        Some(texture)
+    }
+
+    fn begin_frame(&mut self, gpu: &GpuContext) -> bool {
+        if !self.direct {
+            return true;
+        }
+        if gpu.is_device_lost() {
+            return false;
+        }
+        let Some(shared) = self.shared.as_ref() else {
+            return false;
+        };
+        let slot = self.frame % SLOTS;
+        if !self.wait_fence(self.slot_values[slot]) {
+            return false;
+        }
+        // SAFETY: allocator livre (fence do slot concluída); `shared` vive até as fences.
+        unsafe {
+            // O wgpu só pode escrever depois que o D3D11 terminou de ler o quadro anterior.
+            if self.read_done > 0 && self.queue.Wait(&self.fence12, self.read_done).is_err() {
+                return false;
+            }
+            // Do 2º quadro em diante o wgpu acredita que a textura está em RENDER_TARGET (último
+            // uso dele); no 1º ela está em COMMON e ele mesmo faz a transição.
+            if self.direct_used {
+                let barrier = transition(&shared.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+                if !self.execute_barriers(&self.pre_allocators[slot], &[barrier]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn present(&mut self, gpu: &GpuContext, texture: &wgpu::Texture) -> FrameStatus {
         if gpu.is_device_lost() {
             return FrameStatus::DeviceLost;
         }
-        // SAFETY: lemos o ID3D12Resource da textura do wgpu (AddRef, sem alocação de heap).
-        let source: Option<ID3D12Resource> = unsafe {
-            texture.as_hal::<wgpu::hal::api::Dx12, _, _>(|t| t.map(|t| t.raw_resource().clone()))
-        };
-        let (Some(source), Some(shared), Some(surface)) = (source, self.shared.as_ref(), self.surface.as_ref())
-        else {
-            return FrameStatus::Unavailable;
-        };
         let slot = self.frame % SLOTS;
         if !self.wait_fence(self.slot_values[slot]) {
             return FrameStatus::Retry;
         }
+        let (Some(shared), Some(surface)) = (self.shared.as_ref(), self.surface.as_ref()) else {
+            return FrameStatus::Unavailable;
+        };
         // SAFETY: recursos vivos até as fences concluírem; barreiras emprestam os ponteiros.
         unsafe {
-            // 1) D3D12: textura do wgpu → textura compartilhada.
-            let allocator = &self.allocators[slot];
-            if allocator.Reset().is_err() || self.list.Reset(allocator, None).is_err() {
-                return FrameStatus::Retry;
+            if self.direct {
+                // 1) D3D12: o wgpu já desenhou em `shared`; só devolve a COMMON para o D3D11 ler.
+                let barrier = transition(&shared.d3d12, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+                if !self.execute_barriers(&self.allocators[slot], &[barrier]) {
+                    return FrameStatus::Retry;
+                }
+                self.direct_used = true;
+            } else {
+                // 1) D3D12: textura do wgpu → textura compartilhada.
+                // SAFETY: lemos o ID3D12Resource da textura do wgpu (AddRef, sem alocação de heap).
+                let source: Option<ID3D12Resource> =
+                    texture.as_hal::<wgpu::hal::api::Dx12, _, _>(|t| t.map(|t| t.raw_resource().clone()));
+                let Some(source) = source else {
+                    return FrameStatus::Unavailable;
+                };
+                let allocator = &self.allocators[slot];
+                if allocator.Reset().is_err() || self.list.Reset(allocator, None).is_err() {
+                    return FrameStatus::Retry;
+                }
+                // O wgpu deixou a textura em RENDER_TARGET e continua acreditando nisso: voltamos no fim.
+                self.list.ResourceBarrier(&[
+                    transition(&source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(&shared.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+                ]);
+                self.list.CopyResource(&shared.d3d12, &source);
+                self.list.ResourceBarrier(&[
+                    transition(&source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+                    transition(&shared.d3d12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+                ]);
+                if self.list.Close().is_err() {
+                    return FrameStatus::Retry;
+                }
+                // Não sobrescrever enquanto o D3D11 ainda lê o quadro anterior (espera na GPU).
+                if self.read_done > 0 && self.queue.Wait(&self.fence12, self.read_done).is_err() {
+                    return FrameStatus::DeviceLost;
+                }
+                self.queue.ExecuteCommandLists(&[Some(self.list_base.clone())]);
             }
-            // O wgpu deixou a textura em RENDER_TARGET e continua acreditando nisso: voltamos no fim.
-            self.list.ResourceBarrier(&[
-                transition(&source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(&shared.d3d12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
-            ]);
-            self.list.CopyResource(&shared.d3d12, &source);
-            self.list.ResourceBarrier(&[
-                transition(&source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
-                transition(&shared.d3d12, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
-            ]);
-            if self.list.Close().is_err() {
-                return FrameStatus::Retry;
-            }
-            // Não sobrescrever enquanto o D3D11 ainda lê o quadro anterior (espera na GPU).
-            if self.read_done > 0 && self.queue.Wait(&self.fence12, self.read_done).is_err() {
-                return FrameStatus::DeviceLost;
-            }
-            self.queue.ExecuteCommandLists(&[Some(self.list_base.clone())]);
             let copied = self.next_value;
             if self.queue.Signal(&self.fence12, copied).is_err() {
                 return FrameStatus::DeviceLost;
@@ -419,6 +537,26 @@ impl Drop for DCompSurfacePresenter {
             let _ = CloseHandle(self.fence_event);
         }
     }
+}
+
+/// Período de composição do DWM (= refresh do monitor que ele segue). Quadros mais rápidos que
+/// isto nunca chegam à tela: o motor usa como teto de FPS no modo Normal. `None` se indisponível.
+pub fn compositor_refresh_period() -> Option<std::time::Duration> {
+    let mut info = DWM_TIMING_INFO {
+        cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: estrutura com `cbSize` correto; HWND nulo = composição global do desktop.
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.ok()?;
+    let (num, den) = (info.rateRefresh.uiNumerator, info.rateRefresh.uiDenominator);
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let period = std::time::Duration::from_nanos(1_000_000_000 * u64::from(den) / u64::from(num));
+    // Valores absurdos (driver/VM): ignora em vez de travar ou soltar o FPS.
+    (std::time::Duration::from_micros(2_000)..=std::time::Duration::from_millis(50))
+        .contains(&period)
+        .then_some(period)
 }
 
 /// Apresentador do wallpaper para a janela `window` (ver doc do módulo).

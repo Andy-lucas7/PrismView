@@ -50,7 +50,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GetCursorPos, GetForegroundWindow, IsWindow, KillTimer, RegisterWindowMessageW,
 };
 
-pub use dcomp_surface::wallpaper_presenter;
+pub use dcomp_surface::{compositor_refresh_period, wallpaper_presenter};
 pub use event_loop::{run, ControlFlow, LoopHandler, LoopProxy};
 pub use fonts::resolve_font_files;
 pub use monitors::Win32Monitor;
@@ -58,7 +58,7 @@ pub use sensors::{SensorsConfig, Win32SystemSensors};
 pub use shell::{acquire_single_instance, open_studio, set_windows_desktop_wallpaper, shell_open};
 pub use tray::{parse_tray_enabled, TrayAction};
 #[allow(unused_imports)]
-pub use video::{MfVideoDecoder, VIDEO_TEXTURE_FORMAT};
+pub use video::{MfVideoDecoder, VideoOutputOptions, VIDEO_TEXTURE_FORMAT};
 pub use widget::{WidgetWindow, WidgetWindowConfig};
 pub use workerw::{DesktopLayer, ShellLayout};
 

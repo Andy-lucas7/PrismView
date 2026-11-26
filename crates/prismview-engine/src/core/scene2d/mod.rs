@@ -38,7 +38,7 @@ use prism_core::fx::{EvalContext, FxEngine};
 use prism_core::schema::{
     Anchor, BackgroundSource, BlendMode, DirtyFlags, FillMode, GradientKind as SchemaGradient,
     LayerKind, LayerNode, PrismScene, ShapeKind, StackDir, StaticOrFx, TextAlign, TouchAction,
-    TouchActionType, VisibilityCondition,
+    TouchActionType, VideoPlayback, VisibilityCondition,
 };
 
 use super::espectro::{EspectroPlacement, EspectroRenderer, MAX_TEXTURES};
@@ -439,8 +439,14 @@ impl SceneRenderer {
     }
 
     /// Vídeos que a cena usa: `(caminho resolvido, é_fundo)`. Raro (troca de cena).
-    pub fn video_sources(&self) -> Vec<(PathBuf, bool)> {
-        fn walk(layers: &[LayerNode], scene: &PrismScene, root: Option<&Path>, out: &mut Vec<(PathBuf, bool)>) {
+    /// Vídeos da cena: (caminho, é o fundo, reprodução).
+    pub fn video_sources(&self) -> Vec<(PathBuf, bool, VideoPlayback)> {
+        fn walk(
+            layers: &[LayerNode],
+            scene: &PrismScene,
+            root: Option<&Path>,
+            out: &mut Vec<(PathBuf, bool, VideoPlayback)>,
+        ) {
             for l in layers {
                 if l.kind == LayerKind::Video && !l.hidden {
                     let raw = match &l.asset {
@@ -448,8 +454,8 @@ impl SceneRenderer {
                         StaticOrFx::Fx { fallback, .. } => fallback.as_str(),
                     };
                     if let Some(p) = resolve_asset_path(scene, root, raw) {
-                        if !out.iter().any(|(q, _)| *q == p) {
-                            out.push((p, false));
+                        if !out.iter().any(|(q, _, _)| *q == p) {
+                            out.push((p, false, l.video));
                         }
                     }
                 }
@@ -461,9 +467,9 @@ impl SceneRenderer {
             return out;
         };
         let root = self.asset_root.as_deref();
-        if let BackgroundSource::Video { path, .. } = &scene.background {
+        if let BackgroundSource::Video { path, playback, .. } = &scene.background {
             if let Some(p) = resolve_asset_path(scene, root, path) {
-                out.push((p, true));
+                out.push((p, true, *playback));
             }
         }
         walk(&scene.layers, scene, root, &mut out);
@@ -624,7 +630,7 @@ impl SceneRenderer {
         if !self.images.pending.is_empty() {
             return true;
         }
-        for (path, _) in self.video_sources() {
+        for (path, _, _) in self.video_sources() {
             let key = path.to_string_lossy();
             let ready = self.videos.get(&*key).is_some_and(|v| v.alias.is_some());
             if !ready {
@@ -839,6 +845,8 @@ impl SceneRenderer {
         self.deps = FxEngine::collect_scene_dependencies(&scene, ctx);
         self.layer_bindings.set_specs(&scene.bindings);
         self.index_scene(&scene);
+        // Qualidade do vidro: base da pirâmide de desfoque relativa à resolução do monitor.
+        self.glass.set_resolution_scale(scene.glass_quality.resolution_scale());
         self.scene = Some(scene);
         self.clock_sec = ctx.now.timestamp();
         self.clock_min = self.clock_sec.div_euclid(60);

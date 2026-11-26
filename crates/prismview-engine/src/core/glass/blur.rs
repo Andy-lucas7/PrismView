@@ -1,4 +1,4 @@
-//! Pirâmide de blur do backdrop do vidro: downsample 2× anti-aliased (base ≤ 1080px, 4 níveis)
+//! Pirâmide de blur do backdrop do vidro: downsample 2× anti-aliased (base = saída × qualidade, 4 níveis)
 //! + Gaussiana separável densa de 15 taps (passo 1,0 texel), em paridade 1:1 com
 //! `opticalGlassWebGL.ts` (zero ghosting, zero artefatos de caixa, cache LRU).
 
@@ -7,8 +7,6 @@ use super::*;
 
 // ───────────────────────── Pirâmide de blur ─────────────────────────
 
-/// Largura máxima do mip 0 (FHD budget): mantém 4K ultra-rápido e nítido em blurs baixos.
-const MIP0_MAX_W: u32 = 1080;
 const MIN_MIP0_DIM: u32 = 64;
 const MIN_MIP_DIM: u32 = 16;
 
@@ -56,6 +54,7 @@ pub(super) struct ResultSlot {
 
 pub(super) struct Targets {
     pub(super) src_size: (u32, u32),
+    pub(super) res_scale: f32,
     pub(super) sizes: [(u32, u32); MAX_LEVELS],
     /// Mips de downsample (níveis 0..MAX_LEVELS).
     pub(super) down: Vec<Tex>,
@@ -72,14 +71,11 @@ pub(super) struct Targets {
     pub(super) down_depth: usize,
 }
 
-pub(super) fn mip_sizes(src: (u32, u32)) -> [(u32, u32); MAX_LEVELS] {
+/// Tamanhos da pirâmide. `res_scale` = qualidade (1,0 = mip 0 na resolução da saída).
+pub(super) fn mip_sizes(src: (u32, u32), res_scale: f32) -> [(u32, u32); MAX_LEVELS] {
     let sw = src.0.max(1);
     let sh = src.1.max(1);
-    let scale = if sw > MIP0_MAX_W {
-        MIP0_MAX_W as f32 / sw as f32
-    } else {
-        1.0
-    };
+    let scale = if res_scale.is_finite() { res_scale.clamp(0.1, 1.0) } else { 1.0 };
     let mut w = ((sw as f32 * scale).round() as u32).max(MIN_MIP0_DIM.min(sw));
     let mut h = ((sh as f32 * scale).round() as u32).max(MIN_MIP0_DIM.min(sh));
     let mut sizes = [(1, 1); MAX_LEVELS];
@@ -126,6 +122,8 @@ pub(super) struct BlurPyramid {
     pub(super) clock: u64,
     /// Slots com `stamp >= frame_floor` já foram usados neste frame e não podem ser reciclados.
     pub(super) frame_floor: u64,
+    /// Qualidade: fração da resolução da saída no mip 0 (`RenderQuality`).
+    pub(super) res_scale: f32,
 }
 
 impl BlurPyramid {
@@ -172,6 +170,7 @@ impl BlurPyramid {
             epoch: 0,
             clock: 1,
             frame_floor: 1,
+            res_scale: 1.0,
         }
     }
 
@@ -207,10 +206,10 @@ impl BlurPyramid {
 
     /// (Re)cria os alvos **somente** se o tamanho da fonte mudou.
     pub(super) fn ensure_targets(&mut self, device: &wgpu::Device, ring: &ParamRing, src: (u32, u32)) {
-        if self.targets.as_ref().is_some_and(|t| t.src_size == src) {
+        if self.targets.as_ref().is_some_and(|t| t.src_size == src && t.res_scale == self.res_scale) {
             return;
         }
-        let sizes = mip_sizes(src);
+        let sizes = mip_sizes(src, self.res_scale);
         let down: Vec<Tex> = sizes
             .iter()
             .map(|&s| make_target(device, "prismview_glass_down", s, PYRAMID_FORMAT))
@@ -227,6 +226,7 @@ impl BlurPyramid {
         self.epoch = self.epoch.wrapping_add(1);
         self.targets = Some(Targets {
             src_size: src,
+            res_scale: self.res_scale,
             sizes,
             down,
             horiz,

@@ -246,6 +246,8 @@ pub struct PowerGovernor {
     /// Em `Frozen`: o quadro estático ainda não foi entregue.
     frozen_pending: bool,
     last_frame: Option<Instant>,
+    /// Período de composição da tela (`set_display_interval`): piso do intervalo entre quadros.
+    display_interval: Duration,
 }
 
 impl Default for PowerGovernor {
@@ -266,7 +268,19 @@ impl PowerGovernor {
             hibernated: false,
             frozen_pending: false,
             last_frame: None,
+            display_interval: Duration::ZERO,
         }
+    }
+
+    /// Período de composição da tela: quadros mais rápidos que isso o compositor descarta, então
+    /// nenhum nível (nem o Normal, sem teto próprio) passa dele. `ZERO` = desconhecido.
+    pub fn set_display_interval(&mut self, interval: Duration) {
+        self.display_interval = interval;
+    }
+
+    /// Teto do nível combinado com o período da tela.
+    fn min_interval(&self) -> Duration {
+        self.caps.min_frame_interval().max(self.display_interval)
     }
 
     pub fn state(&self) -> PowerState {
@@ -430,7 +444,7 @@ impl PowerGovernor {
             PowerState::Frozen if !self.frozen_pending => return FrameGate::Blocked,
             _ => {}
         }
-        let interval = self.caps.min_frame_interval();
+        let interval = self.min_interval();
         if interval.is_zero() {
             return FrameGate::Now;
         }
@@ -455,7 +469,7 @@ impl PowerGovernor {
 
     /// Cadência para animações do loop (molas, vídeo): intervalo mínimo entre quadros.
     pub fn frame_interval(&self) -> Duration {
-        self.caps.min_frame_interval()
+        self.min_interval()
     }
 
     /// Animações contínuas (relógio, molas, vídeo) devem rodar? `false` em `Paused`/`Frozen`.
@@ -473,6 +487,21 @@ mod tests {
             any_visible: true,
             ..GovernorInputs::default()
         }
+    }
+
+    #[test]
+    fn display_interval_floors_normal_frame_gate() {
+        let t0 = Instant::now();
+        let mut g = PowerGovernor::new();
+        // Normal sem teto próprio: sem período de tela, nunca espera.
+        g.frame_presented(t0);
+        assert_eq!(g.frame_gate(t0 + Duration::from_millis(1)), FrameGate::Now);
+        // 120 Hz: um quadro 3 ms depois do anterior espera o próximo ciclo do compositor.
+        let period = Duration::from_nanos(8_333_333);
+        g.set_display_interval(period);
+        assert_eq!(g.frame_interval(), period);
+        assert_eq!(g.frame_gate(t0 + Duration::from_millis(3)), FrameGate::At(t0 + period));
+        assert_eq!(g.frame_gate(t0 + period), FrameGate::Now);
     }
 
     #[test]
